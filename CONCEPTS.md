@@ -71,6 +71,9 @@ Canonical locations within a FV-managed project. Skills cite these; do not inven
 - `<project>/.fv/classifications/` — failure-classifier reports (`fv-verify`)
 - `<project>/.fv/evidence/` — typed G1 evidence records, one JSON per claim ID (`fv-compose`, Gate B)
 - `<project>/.fv/scripts/` — project-local copies of dispatch + CI-gate scripts
+- `<project>/.fv/verified-inputs.txt` — the verified-input **exclusion** list that defines the content snapshot (below)
+- `<project>/.fv/verification-plan.json` — optional `fv-verification-plan/v1` layer configuration read by `pyramid_run.py --plan`
+- `<project>/.fv/history/colosseum/` — quarantined pre-FV artifacts, byte-for-byte, written by `scripts/fv_migrate.py`; history, never live evidence
 - `<fv>/agents/` — static OMP agents loaded from the extension package
 
 ## The trust ledger
@@ -82,6 +85,84 @@ A project's `.fv/ledger.md` records every cross-component trust claim with:
 - axiom inventory (which axioms each theorem's closure depends on)
 
 `fv-compose` maintains it. CI gates fail when a link drifts from executable code.
+
+## The verified-input content snapshot
+
+What a G1 evidence record binds its verdict to. A *verified input* is a file
+whose content could change what a verification run concludes; the snapshot is a
+single hash over all of them, so a record names the exact tree state it was
+earned against rather than a commit plus a dirty flag.
+
+- **The input set is an exclusion list.** `.fv/verified-inputs.txt` holds
+  path prefixes to *exclude* (blank and `#` lines ignored, directory entries
+  end in `/`). The built-in defaults are `.fv/evidence/`, `.fv/verify/`,
+  `.fv/panels/`, and `.colosseum/`; a project's file only ever *adds* prefixes
+  to them (a migrated project gets `.fv/history/` added, so quarantined history
+  cannot perturb the snapshot). Everything else that
+  `git ls-files --cached --others --exclude-standard` reports is a verified
+  input. Exclusion, not inclusion, is the safe default: a newly added source
+  file is in scope automatically, and only FV's own generated output and
+  quarantined history sit outside it.
+- **The snapshot is content, not identity.** `sha256:<hex>` over, for each
+  input in sorted repo-relative POSIX-path order, the path, a NUL byte, the
+  file's content SHA-256 in hex, and a newline. Symlinks and paths resolving
+  outside the project root are rejected rather than hashed.
+- **It is checked around every execution, not once per run.** The producer
+  recomputes the snapshot, the intent hash, and the obligation-manifest hash
+  after each command. A command that edits a verified input therefore cannot
+  ship as PASS evidence — not for itself, and not for an earlier command in the
+  same record.
+- **A moving tree is recorded, not tolerated.** If git reports a verified input
+  as modified, or if the snapshot, intent hash, or manifest hash moves between
+  two executions of one run, the record's snapshot is written as
+  `sha256:<hex>+dirty` and its result is FAIL. Evidence earned against a moving
+  tree is unusable by construction rather than quietly weaker.
+- **The gate recomputes it.** Gate B computes the current snapshot and, by
+  default, requires an exact match; `--expect-snapshot` and `--allow-unbound`
+  are the explicit, visible ways to validate a record against something else.
+- **It is portable.** Two clones or worktrees with the same content produce the
+  same snapshot, so evidence earned in one is checkable in another. This is
+  what makes a G1 record a transferable artifact instead of a claim about one
+  machine.
+
+`scripts/fv_project.py` (`content_snapshot`, `is_content_snapshot`,
+`load_exclusions`) is the rule's Python implementation; the gates and the
+doctor call it rather than reimplementing it, and the TypeScript producer
+(`tools/evidence-run.ts`) mirrors the same byte-for-byte rule so producer and
+gate bind identically.
+
+## System claims and evidence cohorts
+
+A **system claim** is an obligation no single tool discharges. It lives in
+`obligations.json` beside `invariants` and `witnesses`, and carries:
+
+- `id` — its stable obligation ID
+- `depends_on` — the declared invariants/witnesses it rests on
+- `required_evidence` — the tool/layer IDs whose evidence it needs
+
+An **evidence cohort** is what discharges one: an `fv-evidence-run/v3` record
+whose `bindings.executions` array holds one entry per command, each with its
+tool, evidence class, argv, repo-relative cwd, toolchain digests, raw-output
+path and hash, result, and run ID. A single-command record is a cohort of one.
+
+Two rules make a cohort a real conjunction rather than a bag of results:
+
+1. **A cohort's verdict is atomic.** The record PASSes only when *every*
+   execution PASSes and every binding — snapshot, intent hash, manifest hash —
+   held still across the whole run. A partially-passing cohort is a FAIL
+   record, not a partial credit.
+2. **A system claim PASSes only under full tool coverage.** Every ID in
+   `required_evidence` must appear among the cohort's PASS executions. The
+   coverage dashboard names the two ways this fails: `coverage-gap` (a required
+   tool never PASSed, or carries no cohort at all, or some other execution in
+   the cohort did not PASS) and `dependency-gap` (the cohort fully PASSes but a
+   `depends_on` obligation is itself uncovered).
+
+Because the claim is a conjunction, **anything that invalidates one member
+invalidates the claim.** A content-snapshot change, a re-run of a single tool
+that now FAILs, a dropped tool from the cohort, or a `depends_on` obligation
+losing its own evidence each take the system claim out of PASS; it is re-earned
+by re-running the cohort, not by patching the one execution that moved.
 
 ## Trust-assumption categories
 

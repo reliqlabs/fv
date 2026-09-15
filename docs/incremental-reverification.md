@@ -42,12 +42,43 @@ under the wrong assumptions.
 
 ## What a change invalidates
 
-A G1 record binds its evidence to a `source_snapshot` (commit plus dirty-tree
-content hash), an `intent_hash`, an `obligation_manifest_hash`, a `profile`, a
-toolchain digest set, and the exact command, configuration, and seeds. Any of
-these drifting makes the record stale. For a single component the rule is: if the
-component's `source_snapshot` no longer matches the tree, its records must be
-re-earned.
+A G1 record binds its evidence to a `source_snapshot`, an `intent_hash`, an
+`obligation_manifest_hash`, a `profile`, a toolchain digest set, and the exact
+command, configuration, and seeds. A `fv-evidence-run/v3` record additionally
+binds `intent_path` (the canonical target, repo-relative) and an `executions`
+cohort. Any of these drifting makes the record stale. For a single component the
+rule is: if the component's `source_snapshot` no longer matches the tree, its
+records must be re-earned.
+
+`source_snapshot` is a **verified-input content snapshot**: `sha256:<hex>` over
+every file `git ls-files --cached --others --exclude-standard` reports that does
+not fall under a `.fv/verified-inputs.txt` exclusion prefix, hashed as
+path + NUL + content-hash per input in sorted path order (CONCEPTS.md, "The
+verified-input content snapshot"). Four consequences for reuse:
+
+- **Reuse is decided by content, not by commit identity.** A commit that
+  rewrites history, a rebase, a fresh clone, or a second worktree does not
+  invalidate anything as long as the verified inputs' bytes are unchanged.
+  Conversely a purely uncommitted edit *does* invalidate, so a dirty tree cannot
+  reuse evidence earned before the edit: the edit is already inside the hash.
+- **A dirty-earned record is never reusable.** When git reports a verified
+  input as modified, or when the snapshot / intent hash / manifest hash moves
+  between two executions of one run, the producer records the snapshot as
+  `sha256:<hex>+dirty` and the record's result is FAIL. A `+dirty` binding is
+  therefore not a weaker PASS to reuse; it is an unusable record, and the run
+  has to be repeated on a settled tree.
+- **The exclusion list is part of the binding's meaning.** FV's own generated
+  output (`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`) and quarantined
+  pre-FV history (`.fv/history/`, `.colosseum/`) are excluded, so writing
+  evidence never invalidates the evidence being written and migrated history
+  never perturbs a fresh run. Changing the exclusion list changes which files
+  the snapshot covers, which changes the snapshot: it is a binding change, and
+  every record bound to the old input set is stale.
+- **The snapshot is whole-tree, so per-component reuse needs the boundary.**
+  One project-wide hash cannot say *which* component moved. That is exactly what
+  decomposition supplies: the per-component source set below is what makes the
+  snapshot's movement attributable, rather than invalidating every record in the
+  system on any edit anywhere.
 
 Decomposition (via `fv-boundary`) turns that per-component rule into a
 bounded re-verification strategy for the whole system. When a system changes,
@@ -72,6 +103,45 @@ hold:
 Everything else re-runs. The `ledger_schema_version` is checked first: a schema
 migration invalidates the reuse computation itself (the record shape changed), so
 a version bump forces a full re-verification pass regardless of source snapshots.
+
+### System claim cohorts do not partially reuse
+
+A `system_claim` obligation names a `depends_on` set of declared
+invariants/witnesses and a `required_evidence` set of tool/layer IDs. It is
+discharged by an **evidence cohort**: a v3 record whose `bindings.executions`
+array carries one entry per command (tool, evidence class, argv, repo-relative
+cwd, toolchain digests, raw-output path and hash, result, run ID). The claim
+PASSes only when every `required_evidence` tool appears among PASS executions,
+and the record itself PASSes only when every execution PASSed and every binding
+held still across the whole run.
+
+That conjunction fixes the reuse rule for system claims:
+
+- **The cohort is the unit of reuse, not the execution.** A cohort record is
+  reusable when its bindings still hold, and stale otherwise. There is no
+  reusing the Quint execution while re-running the Kani one: the two shared one
+  snapshot, one intent hash, and one manifest hash, and the record's verdict is
+  the conjunction. Re-earning a system claim means re-running its whole cohort
+  and writing a new record.
+- **Any member's invalidation invalidates the claim.** A verified-input content
+  change, a tool whose re-run now FAILs, a tool dropped from `required_evidence`
+  coverage, or a `depends_on` obligation that lost its own evidence each take
+  the claim out of PASS. The coverage dashboard distinguishes the shapes:
+  `coverage-gap` (a required tool never PASSed, its cohort is absent, or some
+  other execution in the cohort did not PASS) from `dependency-gap` (a fully
+  PASSing cohort whose dependency is uncovered).
+- **A cross-component system claim is reusable only when every contributing
+  component is.** The claim's inputs span components, so its cohort's
+  whole-tree `source_snapshot` moves whenever any contributor's source moves.
+  In blast-radius terms: a system claim re-runs whenever any component named in
+  its `depends_on` closure re-runs, even when the component that changed is one
+  its own guarantee does not mention. This is the cost of a claim no single tool
+  makes; it is also why claims should be scoped to the components that actually
+  compose, not to the whole system by default.
+- **A manifest edit is a binding change.** `depends_on` and `required_evidence`
+  live in the obligation manifest, so adding or removing either moves
+  `obligation_manifest_hash` and stales every record bound to it — including the
+  cohorts of claims the edit did not mention.
 
 ### Worked shape
 

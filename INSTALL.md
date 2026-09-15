@@ -115,6 +115,36 @@ stages reading the old target.
 
 It does not copy package agents, skills, tools, or MCP definitions. Existing extension entries are preserved. Use `--force` only to replace FV-owned project state.
 
+## Migrate a legacy Colosseum project
+
+A project that already has a `.colosseum/` tree is shadow-migrated into `.fv/`
+before initialization. Dry run first; it is the default:
+
+```bash
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project --json
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project --apply
+```
+
+Exit 0 is `status: ok`, 1 is `status: blocked`, 2 a usage error or an unresolvable
+project root. `--apply` writes only under `.fv/`, refuses a blocked report, and is
+byte-idempotent on re-run. `.colosseum/` is only ever read: the migration never
+deletes legacy state and never copies a legacy evidence record into
+`.fv/evidence/`, so nothing migrated counts as live `fv-evidence-run/v3` evidence.
+Legacy verification layers without a built-in pyramid step, `quint` among them,
+become `fv-verification-plan/v1` custom layers instead of being dropped.
+
+Run `fv_init.py` after `--apply` for the OMP-side settings. Without
+`--target-spec` it preserves the migrated `target_spec` and only appends missing
+exclusion defaults to `.fv/verified-inputs.txt`. Do not pass `--force` after a
+migration: it replaces FV-owned project state, including the migrated dispatch
+target and the `.fv/history/` exclusion prefix.
+
+Keep `.colosseum/` until parity is explicitly accepted: the required evidence
+cohorts re-run through `fv_evidence_run` and Gate A plus Gate B passing without
+`--expect-snapshot` or `--allow-unbound`. The full operator sequence, including
+how to read the report's `unsupported` and `conflicts` entries, is in
+[QUICKSTART.md](./QUICKSTART.md#migrating-a-legacy-colosseum-project).
+
 ## Verify discovery
 
 Start OMP in the initialized project:

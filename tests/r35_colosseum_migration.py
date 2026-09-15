@@ -19,6 +19,10 @@ only record of past verification is that it cannot lose or rewrite anything:
   * every layer the legacy run manifest recorded reaches the plan, custom
     layer ids included, and a layer no plan execution can carry blocks the run
     instead of being quietly left out of a partial plan;
+  * every synthesized obligation id is directly usable as an
+    `fv_evidence_run` `claim_id`, so no obligation needs renaming by hand
+    after the migration, and two legacy ids that would share one record path
+    block the run instead of being silently merged or suffixed;
   * re-applying is byte-idempotent, and a destination that already exists with
     different content fails instead of being overwritten.
 
@@ -35,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,6 +53,7 @@ import fv_project  # noqa: E402  the exclusion parser the new list must satisfy
 import pyramid_run  # noqa: E402  the runner the migrated plan must satisfy
 
 MIGRATE = REPO / "scripts" / "fv_migrate.py"
+EVIDENCE_RUN = REPO / "tools" / "evidence-run.ts"
 FAILURES: list[str] = []
 
 MAPPED = "mapped"
@@ -61,6 +67,32 @@ def check(label: str, ok: bool, detail: str = "") -> None:
     else:
         print(f"  [FAIL] {label}" + (f" ({detail})" if detail else ""))
         FAILURES.append(label)
+
+
+def evidence_claim_id_pattern() -> re.Pattern[str]:
+    """The `claim_id` shape the real evidence producer accepts.
+
+    Read out of `tools/evidence-run.ts` instead of restated here: that guard
+    is what decides whether a migrated obligation can be discharged at all, so
+    a copy of it in this test would keep passing after the producer moved.
+    """
+    source = EVIDENCE_RUN.read_text()
+    match = re.search(r"/(\^\[[^/]+\$)/\.test\(params\.claim_id\)", source)
+    if match is None:
+        raise AssertionError(f"no claim_id guard found in {EVIDENCE_RUN}")
+    return re.compile(match.group(1))
+
+
+def migrated_id(target: str) -> str:
+    """The id a `<layer>:<name>` legacy target migrates to, for a target whose
+    two parts already carry only characters an evidence claim id allows: the
+    colon separator becomes a dot. Spelled out rather than imported from
+    `fv_migrate` so the expectation does not restate the implementation."""
+    layer, separator, name = target.partition(":")
+    if not separator:
+        raise AssertionError(f"{target!r} carries no '<layer>:<name>' prefix")
+    return f"{layer}.{name}"
+
 
 
 # --------------------------------------------------------------------------
@@ -488,9 +520,17 @@ def check_obligations(tmp: Path) -> None:
     claims = {claim["id"]: claim for claim in manifest["system_claims"]}
     check("every legacy claim becomes a system claim",
           sorted(claims) == ["C-01", "C-02", "C-03"], str(sorted(claims)))
-    check("depends_on is the legacy required_targets, in order",
-          claims["C-01"]["depends_on"] == G1_CLAIMS["claims"][0]["required_targets"],
+    check("depends_on is the migrated required_targets, in legacy order",
+          claims["C-01"]["depends_on"]
+          == [migrated_id(target) for target in G1_CLAIMS["claims"][0]["required_targets"]],
           str(claims["C-01"]["depends_on"]))
+    check("depends_on carries no legacy colon-bearing target",
+          not any(":" in dependency for claim in manifest["system_claims"]
+                  for dependency in claim["depends_on"]),
+          str([claim["depends_on"] for claim in manifest["system_claims"]]))
+    check("an already-safe legacy claim id gets no synthesized legacy_id",
+          all("legacy_id" not in claim for claim in manifest["system_claims"]),
+          str([claim.get("legacy_id") for claim in manifest["system_claims"]]))
     check("required_evidence is the legacy layer list, not the target prefixes",
           claims["C-01"]["required_evidence"] == ["quint", "kani", "proptest"],
           str(claims["C-01"]["required_evidence"]))
@@ -509,20 +549,35 @@ def check_obligations(tmp: Path) -> None:
     invariants = {item["id"] for item in manifest["invariants"]}
     witnesses = {item["id"] for item in manifest["witnesses"]}
     check("a proptest target becomes a witness",
-          witnesses == {"proptest:op_sequences_preserve_invariants"}, str(witnesses))
+          witnesses == {"proptest.op_sequences_preserve_invariants"}, str(witnesses))
     check("every non-test target becomes an invariant",
-          invariants == {"quint:invS7", "quint:invB18",
-                         "kani:merkle_promotion_not_duplication",
-                         "lean:Dossier.KeyLineage.admitted_key_survives",
-                         "verus:key_lineage_contract"},
+          invariants == {"quint.invS7", "quint.invB18",
+                         "kani.merkle_promotion_not_duplication",
+                         "lean.Dossier.KeyLineage.admitted_key_survives",
+                         "verus.key_lineage_contract"},
           str(invariants))
     check("a target shared by two claims is synthesized once",
           len(manifest["witnesses"]) == 1
           and "C-01" in manifest["witnesses"][0]["statement"]
           and "C-02" in manifest["witnesses"][0]["statement"],
           str(manifest["witnesses"]))
-    check("a witness carries the bare target name",
+    check("a witness carries the bare legacy target name",
           manifest["witnesses"][0]["name"] == "op_sequences_preserve_invariants")
+
+    synthesized = manifest["invariants"] + manifest["witnesses"]
+    legacy_targets = [target for claim in G1_CLAIMS["claims"]
+                      for target in claim["required_targets"]]
+    check("every synthesized obligation retains its exact legacy target",
+          sorted(item["legacy_id"] for item in synthesized) == sorted(set(legacy_targets)),
+          str([item.get("legacy_id") for item in synthesized]))
+    check("each legacy_id is the target the migrated id came from",
+          all(item["id"] == migrated_id(item["legacy_id"]) for item in synthesized),
+          str([(item["id"], item.get("legacy_id")) for item in synthesized]))
+    safe = evidence_claim_id_pattern()
+    every_id = [item["id"] for item in synthesized + manifest["system_claims"]]
+    check("every migrated id is a claim_id the evidence producer accepts",
+          all(safe.fullmatch(identifier) for identifier in every_id),
+          str([identifier for identifier in every_id if not safe.fullmatch(identifier)]))
 
     prefixes = tmp / "obligations-prefixes"
     scaffold(prefixes)
@@ -538,8 +593,8 @@ def check_obligations(tmp: Path) -> None:
     check("every test-family prefix becomes a witness and the rest invariants",
           code == 0
           and {item["id"] for item in converted["witnesses"]}
-          >= {"test:roundtrip", "tests:decode", "proptests:sequences"}
-          and "kani:bounded" in {item["id"] for item in converted["invariants"]},
+          >= {"test.roundtrip", "tests.decode", "proptests.sequences"}
+          and "kani.bounded" in {item["id"] for item in converted["invariants"]},
           f"exit={code} witnesses="
           f"{[i['id'] for i in converted['witnesses']]} {err[-120:]}")
     check("legacy profile and environment policy are retained",
@@ -558,8 +613,8 @@ def check_obligations(tmp: Path) -> None:
           str(required))
     check("the gate agrees on the obligation kinds",
           kinds["C-01"] == "system_claim"
-          and kinds["quint:invS7"] == "invariant"
-          and kinds["proptest:op_sequences_preserve_invariants"] == "witness",
+          and kinds["quint.invS7"] == "invariant"
+          and kinds["proptest.op_sequences_preserve_invariants"] == "witness",
           str(kinds))
     check("the gate reads each claim's required evidence tools",
           evidence == {"C-01": ["quint", "kani", "proptest"],
@@ -576,6 +631,107 @@ def check_obligations(tmp: Path) -> None:
           all(claim in artifact_of(report, ".colosseum/g1-claims.json")["detail"]
               for claim in ("C-01", "C-02", "C-03")),
           artifact_of(report, ".colosseum/g1-claims.json")["detail"])
+
+
+# --------------------------------------------------------------------------
+# obligation ids: dischargeable as written, traceable to the legacy target
+# --------------------------------------------------------------------------
+
+def with_claims(root: Path, claims: list[dict]) -> None:
+    """Replace both legacy manifests with one claim set, all required."""
+    write_json(root / ".colosseum/g1-claims.json", {**G1_CLAIMS, "claims": claims})
+    write_json(root / ".colosseum/obligations.json",
+               {**OBLIGATIONS,
+                "claims": [{"claim_id": claim["claim_id"], "required": True}
+                           for claim in claims]})
+
+
+def check_obligation_ids(tmp: Path) -> None:
+    """Every migrated id is one `fv_evidence_run` can discharge unchanged.
+
+    The producer writes `.fv/evidence/records/<claim_id>.json`, so a legacy
+    `<layer>:<name>` target is a path and not an id at all. The migration maps
+    it into the producer's alphabet, keeps the exact legacy spelling in
+    `legacy_id`, and refuses -- rather than suffixes -- a normalization that
+    would put two legacy obligations on one record path.
+    """
+    safe = evidence_claim_id_pattern()
+
+    rust = tmp / "ids-rust"
+    scaffold(rust)
+    rust_targets = ["verus:dossier::state::Machine::key_lineage",
+                    "lean:Dossier.KeyLineage.admitted_key_survives"]
+    with_claims(rust, [{**G1_CLAIMS["claims"][2],
+                        "required_targets": rust_targets,
+                        "layers": ["verus", "lean"]}])
+    code, _, err = report_of(rust, "--apply")
+    manifest = json.loads((rust / ".fv/obligations.json").read_text())
+    ids = {item["legacy_id"]: item["id"] for item in manifest["invariants"]}
+    check("a Rust `::` path target normalizes into the producer's alphabet",
+          code == 0
+          and ids.get("verus:dossier::state::Machine::key_lineage")
+          == "verus.dossier-state-Machine-key_lineage",
+          f"exit={code} {ids} {err[-120:]}")
+    check("a dotted dossier target keeps its dots",
+          ids.get("lean:Dossier.KeyLineage.admitted_key_survives")
+          == "lean.Dossier.KeyLineage.admitted_key_survives", str(ids))
+    check("depends_on names the normalized ids in legacy target order",
+          manifest["system_claims"][0]["depends_on"]
+          == [ids[target] for target in rust_targets],
+          str(manifest["system_claims"][0]["depends_on"]))
+
+    every_id = [item["id"] for item in
+                manifest["invariants"] + manifest["witnesses"] + manifest["system_claims"]]
+    records = rust / ".fv/evidence/records"
+    records.mkdir(parents=True, exist_ok=True)
+    for identifier in every_id:
+        record = records / f"{identifier}.json"
+        check(f"{identifier} is one filename, not a path",
+              record.parent == records and safe.fullmatch(identifier), str(record))
+        record.write_text(json.dumps({"claim_id": identifier, "required": True,
+                                      "evidence_class": "proved", "result": "PASS"}) + "\n")
+    loaded = {record["claim_id"] for record in check_evidence_records.load_records(records)}
+    check("a record written at <id>.json is the record the gate reads back",
+          loaded == set(every_id), str(sorted(loaded ^ set(every_id))))
+
+    def refuses(name: str, claims: list[dict], *expected: str) -> None:
+        root = tmp / f"ids-{name}"
+        scaffold(root)
+        with_claims(root, claims)
+        dry_code, dry_report, _ = report_of(root)
+        code, report, _ = report_of(root, "--apply")
+        check(f"{name}: the run is blocked and exits 1",
+              dry_code == 1 and dry_report.get("status") == "blocked" and code == 1,
+              f"dry={dry_code} apply={code} status={dry_report.get('status')}")
+        check(f"{name}: no .fv tree is written", not (root / ".fv").exists())
+        check(f"{name}: one refusal names every id the migration refused to guess",
+              any(all(fragment in entry for fragment in expected)
+                  for entry in report["unsupported"]),
+              str(report["unsupported"]))
+
+    refuses("colliding-targets-one-claim",
+            [{**G1_CLAIMS["claims"][0],
+              "required_targets": ["quint:inv-S7", "quint:inv:S7"],
+              "layers": ["quint"]}],
+            "quint.inv-S7", "quint:inv-S7", "quint:inv:S7")
+    refuses("colliding-targets-two-claims",
+            [{**G1_CLAIMS["claims"][0], "required_targets": ["quint:inv-S7"],
+              "layers": ["quint"]},
+             {**G1_CLAIMS["claims"][1], "required_targets": ["quint:inv:S7"],
+              "layers": ["quint"]}],
+            "quint.inv-S7", "quint:inv-S7", "quint:inv:S7")
+    refuses("colliding-claim-ids",
+            [{**G1_CLAIMS["claims"][0], "claim_id": "C.01"},
+             {**G1_CLAIMS["claims"][1], "claim_id": "C:01"}],
+            "C.01", "C:01")
+    refuses("target-normalizing-to-nothing",
+            [{**G1_CLAIMS["claims"][0],
+              "required_targets": ["quint:", "kani:bounded"],
+              "layers": ["quint", "kani"]}],
+            "quint:", "empty evidence record id")
+    refuses("claim-id-normalizing-to-nothing",
+            [{**G1_CLAIMS["claims"][0], "claim_id": "C:"}],
+            "C:", "empty evidence record id")
 
 
 # --------------------------------------------------------------------------
@@ -1102,6 +1258,8 @@ def main() -> int:
         check_verified_inputs(tmp)
         print("obligations")
         check_obligations(tmp)
+        print("obligation ids")
+        check_obligation_ids(tmp)
         print("verification plan")
         check_plan(tmp)
         print("unsupported artifacts")

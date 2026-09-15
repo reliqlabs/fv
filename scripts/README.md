@@ -5,10 +5,72 @@ All live orchestration is OMP-native. Historical calibration artifacts retain th
 ## Project setup and diagnostics
 
 - `fv_init.py`: creates project `.fv/` state, merges the FV checkout into `.omp/config.yml` `extensions:`, and installs `fv-canonical` under OMP's `panel.roles` settings.
+- `fv_migrate.py`: shadow-migrates a legacy `.colosseum` project into `.fv/`. Dry run by default; `--apply` writes only under `.fv/` and `--json` emits the deterministic report.
 - `fv_doctor.py`: checks exact proof-tool pins, the required OMP capability contract (recording OMP semver as provenance), extension discovery, MCP wiring, dispatch state, static frontmatter, OMP panel-role ownership, and live model candidates.
 - `validate_frontmatter.py`: validates `skills/*/SKILL.md` and static `agents/*.md` against the OMP contract.
 - `check_dispatch_config.py`: validates the OMP-only `dispatch.json` schema and route hash.
 - `gen_roster_docs.py`: regenerates OMP roster blocks and dispatch routes from `registry/voices.json`.
+
+### Legacy migration reports
+
+```bash
+uv run --script scripts/fv_migrate.py /absolute/path/to/project --json
+uv run --script scripts/fv_migrate.py /absolute/path/to/project --apply
+```
+
+`fv_migrate.py` reports in `fv-migration-report/v1`. Dry run is the default;
+`--apply` writes only under `.fv/` and never touches `.colosseum/`.
+
+Exit 0 is `status: ok`, 1 is `status: blocked` or an uninventoriable legacy tree,
+2 a usage error or an unresolvable project root.
+
+- Every legacy file is classified once: `mapped`, `preserved-history`, or
+  `unsupported`. A `<file>#layers.<name>` or `<file>#claims.<id>` row names an
+  item inside a mapped file that the translation did not carry.
+- `unsupported[]` (unknown or malformed legacy schema, malformed claim,
+  untranslatable verification layer, colliding or empty normalized obligation
+  id, unreadable or non-regular file) and `conflicts[]` (a `.fv/` destination
+  existing with different content, or a symlink, directory, or non-directory
+  parent) each make `status` `blocked`.
+  `--apply` refuses a blocked migration and writes nothing.
+- `writes[]` lists each intended `.fv/` path with `action` `create`, `identical`,
+  or `conflict` and the SHA-256 of the bytes. Re-running `--apply` is
+  byte-idempotent.
+- Mapped: `ledger.md` verbatim, `intent.md` to the dispatch target,
+  `obligations.json` + `g1-claims.json` to `.fv/obligations.json` `system_claims`,
+  `evidence/runs/layer-runs.json` to `.fv/verification-plan.json`. Everything else
+  is preserved byte-for-byte under `.fv/history/colosseum/`, which the migrated
+  `.fv/verified-inputs.txt` excludes from the snapshot.
+- Legacy per-claim evidence is history, never live evidence: a v1/v2 record is
+  copied under `.fv/history/colosseum/` and never into `.fv/evidence/`, so Gate B
+  cannot see it and every migrated obligation stays uncovered until an
+  `fv-evidence-run/v3` record binds it. `.colosseum/` is read-only to the tool and
+  is never deleted.
+- Legacy layers with a pyramid equivalent are renamed (`proptest` to `proptests`);
+  every other layer, `quint` included, becomes an `fv-verification-plan/v1` custom
+  layer that runs after the built-in layers in lexical order. A layer named by a
+  legacy claim the manifest marked `required` gets `required: true` and joins the
+  G2 gating set. An untranslatable layer blocks the migration rather than yielding
+  a partial plan.
+- Obligation and claim ids are normalized deterministically: the legacy target
+  splits at its first colon, each part collapses every run of characters outside
+  `[A-Za-z0-9._-]` to a single `-` and drops leading/trailing `.`, `_`, `-`, and
+  the id is `<layer>.<name>` (`quint:invS7` to `quint.invS7`). Every migrated id
+  is therefore directly usable as an `fv_evidence_run` `claim_id`, so no manual
+  rename stands between `--apply` and producing evidence. Each rewritten
+  obligation carries `legacy_id` with the exact legacy string (a witness also
+  keeps the unnormalized target name as its `name`), and `system_claims.depends_on`
+  names the normalized ids. Ids are never disambiguated by suffix: two legacy
+  targets normalizing to one id, or a target normalizing to nothing, are
+  `unsupported` rows that block the run.
+
+Operator sequence after `--apply` (full version in
+[QUICKSTART.md](../QUICKSTART.md#migrating-a-legacy-colosseum-project)):
+`fv_init.py` without `--force` for the OMP settings, review the converted claims
+with `coverage_dashboard.py` and the plan with `pyramid_run.py --plan`, re-run
+every required cohort through `fv_evidence_run`, then Gate A and Gate B without
+`--expect-snapshot` or `--allow-unbound`. Keep `.colosseum/` until that parity is
+explicitly accepted.
 
 ## Verification gates
 

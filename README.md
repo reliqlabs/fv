@@ -14,6 +14,18 @@ See **[ROADMAP.md](./ROADMAP.md)** — where the methodology stands against its 
 
 See **[QUICKSTART.md](./QUICKSTART.md)** — the front door for anyone bringing a new project into the methodology. It traces the minimal install, the project directory setup, and the ten-stage workflow as concrete skill invocations.
 
+## Migrating a legacy Colosseum project
+
+`scripts/fv_migrate.py` shadow-migrates a legacy tree into `.fv/`: dry run by
+default, `--apply` writes only under `.fv/`, and `.colosseum/` is only ever read.
+Legacy per-claim evidence is imported as history under `.fv/history/colosseum/`
+and never as live `fv-evidence-run/v3` evidence, so every migrated obligation
+stays uncovered until its evidence cohort is re-run and Gate A and Gate B pass.
+Nothing legacy is deleted; keep `.colosseum/` until parity is explicitly
+accepted. Commands and report semantics are in
+[QUICKSTART.md](./QUICKSTART.md#migrating-a-legacy-colosseum-project) and
+[scripts/README.md](./scripts/README.md#legacy-migration-reports).
+
 ## Installing
 
 See **[INSTALL.md](./INSTALL.md)** for the OMP extension-package setup. FV composes Kani, Verus, Aeneas/Charon, Quint/Apalache, Lean, and local proof utilities through package MCP definitions. Each proof layer is optional and reports missing tools without claiming verification.

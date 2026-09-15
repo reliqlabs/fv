@@ -55,12 +55,24 @@ OBLIGATIONS
     Legacy `obligations.json` carries only `{claim_id, required}`; the
     dependency structure lives in `g1-claims.json`. The two are joined into one
     FV manifest: each legacy claim becomes a `system_claims` entry whose
-    `depends_on` is its `required_targets` verbatim (a colon-bearing target is
-    already a legal obligation id) and whose `required_evidence` is its
+    `depends_on` is its `required_targets` and whose `required_evidence` is its
     `layers`. Each distinct target is synthesized as its own obligation:
     `proptest:`/`test`-prefixed targets are witnesses, every other prefix is an
     invariant. `scope`, `waiver`, `evidence_class`, `profile`, and
     `environment_policy` are retained rather than summarized.
+
+    Every synthesized id is the id `fv_evidence_run` will discharge it under.
+    That tool writes `.fv/evidence/records/<claim_id>.json`, so a legacy
+    `<layer>:<name>` target is not usable as an id: it becomes
+    `<layer>.<name>` with every character outside `[A-Za-z0-9._-]` collapsed
+    to a single `-` (`quint:invS7` -> `quint.invS7`,
+    `verus:contract::state::Machine` -> `verus.contract-state-Machine`), and
+    the exact legacy target is kept in `legacy_id`. `depends_on` names the
+    migrated ids, so the manifest is dischargeable as written and nothing has
+    to be renamed after the migration. A legacy id that normalizes to nothing,
+    and any two legacy ids that normalize to the same id, are unsupported: one
+    record path cannot stand for two obligations, and a disambiguating suffix
+    no legacy artifact names would have to be invented.
 
 VERIFICATION PLAN
     `colosseum-layer-runs/v2` records one shell string per layer. Only a simple
@@ -139,6 +151,14 @@ MIGRATED_TIMEOUT_SECONDS = 3600
 # evidence tool id the gate will accept.
 OBLIGATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 EVIDENCE_TOOL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]*")
+# tools/evidence-run.ts: the only claim_id shape the evidence producer accepts.
+# It writes `.fv/evidence/records/<claim_id>.json` and
+# `.fv/evidence/raw/<claim_id>-<run_id>.log`, so a `:` or a `/` in an id is not
+# a name but a path: an obligation id outside this alphabet cannot be
+# discharged at all. Every id this migration synthesizes matches it.
+EVIDENCE_CLAIM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# One maximal run of characters no evidence claim id may carry.
+UNSAFE_ID_RUN = re.compile(r"[^A-Za-z0-9._-]+")
 # A required target the legacy manifest discharged with a test rather than a
 # checked invariant becomes a witness.
 WITNESS_PREFIXES = frozenset({"proptest", "proptests"})
@@ -165,8 +185,11 @@ OBLIGATIONS_NOTE = (
     "Migrated by scripts/fv_migrate.py. Each system claim is a legacy "
     "colosseum-g1-claims claim: depends_on is its required_targets, "
     "required_evidence is its layers. Invariants and witnesses are the "
-    "synthesized required targets; no evidence record is migrated, so every "
-    "obligation here is uncovered until a fv-evidence-run/v3 record binds it."
+    "synthesized required targets, each keyed by the evidence-run-safe id its "
+    "legacy `<layer>:<name>` target maps to (`quint:invS7` -> `quint.invS7`), "
+    "with the exact legacy spelling kept in `legacy_id`; no evidence record "
+    "is migrated, so every obligation here is uncovered until an "
+    "fv-evidence-run/v3 record binds it."
 )
 
 
@@ -222,6 +245,59 @@ def _id_strings(value: object, pattern: re.Pattern[str]) -> list[str] | None:
             return None
     ids = _dedup(value)
     return ids or None
+
+
+def _safe_id_part(raw: str) -> str:
+    """One id part with every unsafe run collapsed to a single `-`.
+
+    Separators are stripped from both ends so a part can only start and end on
+    an alphanumeric: `EVIDENCE_CLAIM_ID` requires it of the first character,
+    and a trailing `-` or `.` would otherwise make two legacy names that
+    differ only in punctuation look like distinct ids while resolving to the
+    same record file.
+    """
+    return UNSAFE_ID_RUN.sub("-", raw).strip("._-")
+
+
+def evidence_claim_id(legacy: str) -> str | None:
+    """The evidence-run-safe obligation id `legacy` migrates to, or None.
+
+    A legacy `<layer>:<name>` target becomes `<layer>.<name>`, and every
+    character outside the evidence-run alphabet collapses to a single `-`, so
+    `quint:invS7` -> `quint.invS7`, `kani:proof_harness` ->
+    `kani.proof_harness`, `verus:contract::state::Machine` ->
+    `verus.contract-state-Machine`. The mapping is total and deterministic:
+    the migrated manifest is directly dischargeable by `fv_evidence_run` with
+    no post-migration rename.
+
+    It is deliberately not injective -- `quint:inv/S7` and `quint:inv-S7` both
+    land on `quint.inv-S7` -- because the alternative is an invented
+    disambiguating suffix that no legacy artifact, ledger citation, or
+    operator expectation names. The caller blocks on the collision instead.
+
+    None means the legacy id carries no alphanumeric in some part (`quint:` or
+    `:invS7` or `::`): there is no id to synthesize and nothing is guessed.
+    """
+    layer, separator, name = legacy.partition(":")
+    parts = [_safe_id_part(layer)]
+    if separator:
+        parts.append(_safe_id_part(name))
+    if not all(parts):
+        return None
+    migrated = ".".join(parts)
+    return migrated if EVIDENCE_CLAIM_ID.fullmatch(migrated) else None
+
+
+def _own(owners: dict[str, list[str]], migrated: str, legacy: str) -> None:
+    """Record that `legacy` migrates to `migrated`, in first-seen order.
+
+    An id with more than one owner is a collision the migration refuses: the
+    two legacy obligations would share one evidence record path.
+    """
+    legacies = owners.setdefault(migrated, [])
+    if legacy not in legacies:
+        legacies.append(legacy)
+
 
 
 def split_command(command: str) -> tuple[list[list[str]] | None, str]:
@@ -542,6 +618,11 @@ class Migration:
         ordered_ids = _dedup([*detail_index, *obligations_order])
         invariants: dict[str, set[str]] = {}
         witnesses: dict[str, set[str]] = {}
+        # legacy target -> the evidence-run-safe id it migrates to, and the
+        # reverse map every migrated id is registered in so a normalization
+        # that would put two legacy ids on one record path can be refused.
+        target_ids: dict[str, str] = {}
+        owners: dict[str, list[str]] = {}
         system_claims: list[dict] = []
         required_layers: set[str] = set()
 
@@ -552,6 +633,14 @@ class Migration:
                     f"{obligations_rel}#claims.{claim_id}",
                     f"required by {LEGACY_OBLIGATIONS} with no {LEGACY_CLAIMS} entry: its "
                     "depends_on and required_evidence cannot be derived",
+                )
+                continue
+            migrated_claim = evidence_claim_id(claim_id)
+            if migrated_claim is None:
+                self._unsupported(
+                    f"{claims_rel}#claims.{claim_id}",
+                    f"claim_id {claim_id!r} normalizes to an empty evidence record id: no "
+                    ".fv/evidence/records/<id>.json path could discharge it",
                 )
                 continue
             targets = _id_strings(claim.get("required_targets"), OBLIGATION_ID)
@@ -577,23 +666,45 @@ class Migration:
                     "invariant cannot be told apart",
                 )
                 continue
-            if claim_id in targets:
+            migrated_targets: list[tuple[str, str]] = []
+            unmappable: list[str] = []
+            for target in targets:
+                migrated = evidence_claim_id(target)
+                if migrated is None:
+                    unmappable.append(target)
+                else:
+                    migrated_targets.append((target, migrated))
+            if unmappable:
+                self._unsupported(
+                    f"{claims_rel}#claims.{claim_id}",
+                    f"required_target(s) {unmappable} normalize to an empty evidence record id: no "
+                    ".fv/evidence/records/<id>.json path could discharge them",
+                )
+                continue
+            depends_on = _dedup([migrated for _, migrated in migrated_targets])
+            if migrated_claim in depends_on:
                 self._unsupported(
                     f"{claims_rel}#claims.{claim_id}",
                     "required_targets names the claim itself: a system claim cannot depend on a claim",
                 )
                 continue
-            for target in targets:
+            for target, migrated in migrated_targets:
                 prefix = target.split(":", 1)[0]
                 bucket = witnesses if prefix in WITNESS_PREFIXES or prefix.startswith("test") else invariants
                 bucket.setdefault(target, set()).add(claim_id)
-            entry: dict = {"id": claim_id, "required": required_flags.get(claim_id, False)}
+                target_ids[target] = migrated
+                _own(owners, migrated, target)
+            _own(owners, migrated_claim, claim_id)
+            entry: dict = {"id": migrated_claim}
+            if migrated_claim != claim_id:
+                entry["legacy_id"] = claim_id
+            entry["required"] = required_flags.get(claim_id, False)
             scope = claim.get("scope")
             if isinstance(scope, dict) and isinstance(scope.get("statement"), str):
                 entry["statement"] = scope["statement"]
             if isinstance(claim.get("evidence_class"), str):
                 entry["evidence_class"] = claim["evidence_class"]
-            entry["depends_on"] = targets
+            entry["depends_on"] = depends_on
             entry["required_evidence"] = layers
             if isinstance(scope, dict):
                 entry["scope"] = scope
@@ -610,6 +721,15 @@ class Migration:
                 f"{claims_rel}#claims",
                 f"required target(s) {collision} classify as both invariant and witness",
             )
+        for migrated, legacies in sorted(owners.items()):
+            if len(legacies) > 1:
+                self._unsupported(
+                    f"{claims_rel}#ids.{migrated}",
+                    f"legacy ids {legacies} all normalize to the obligation id {migrated!r}: one "
+                    ".fv/evidence/records/<id>.json record cannot discharge two obligations, and a "
+                    "disambiguating suffix no legacy artifact names would be invented, so the "
+                    "colliding names must be resolved in the legacy manifest first",
+                )
         if not system_claims:
             for relative, present in ((obligations_rel, has_obligations), (claims_rel, has_claims)):
                 if present:
@@ -629,29 +749,31 @@ class Migration:
         manifest = {
             "version": 1,
             "invariants": [
-                {"id": target, "statement": self._target_statement(target, claim_ids)}
-                for target, claim_ids in sorted(invariants.items())
+                self._obligation(target, target_ids[target], claim_ids, witness=False)
+                for target, claim_ids in sorted(invariants.items(),
+                                                key=lambda item: target_ids[item[0]])
             ],
             "witnesses": [
-                {
-                    "id": target,
-                    "name": target.split(":", 1)[1],
-                    "statement": self._target_statement(target, claim_ids),
-                }
-                for target, claim_ids in sorted(witnesses.items())
+                self._obligation(target, target_ids[target], claim_ids, witness=True)
+                for target, claim_ids in sorted(witnesses.items(),
+                                                key=lambda item: target_ids[item[0]])
             ],
             "system_claims": system_claims,
             "migration": migration,
         }
         self._plan_write(".fv/obligations.json", canonical_json(manifest))
-        converted = ", ".join(entry["id"] for entry in system_claims)
+        converted = ", ".join(
+            entry["id"] if "legacy_id" not in entry else f"{entry['legacy_id']} -> {entry['id']}"
+            for entry in system_claims
+        )
         if has_claims:
             self._mapped(
                 claims_rel,
                 ".fv/obligations.json",
                 f"{len(system_claims)} legacy claim(s) converted to system_claims ({converted}); "
                 f"{len(invariants)} invariant(s) and {len(witnesses)} witness(es) synthesized from "
-                "required_targets",
+                "required_targets, each keyed by the evidence-run-safe id its legacy target maps "
+                "to and carrying that target in legacy_id",
             )
         if has_obligations:
             self._mapped(
@@ -659,6 +781,19 @@ class Migration:
                 ".fv/obligations.json",
                 "legacy required-claim set: contributes the `required` flag of each system claim",
             )
+
+    def _obligation(self, target: str, migrated: str, claim_ids: set[str],
+                    *, witness: bool) -> dict:
+        """One synthesized obligation: the migrated id, the legacy target it
+        came from, and a witness's bare legacy name (which `obligation_check`
+        resolves against the specification, so it is never normalized)."""
+        entry: dict = {"id": migrated}
+        if migrated != target:
+            entry["legacy_id"] = target
+        if witness:
+            entry["name"] = target.split(":", 1)[1]
+        entry["statement"] = self._target_statement(target, claim_ids)
+        return entry
 
     @staticmethod
     def _target_statement(target: str, claim_ids: set[str]) -> str:

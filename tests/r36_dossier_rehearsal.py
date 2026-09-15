@@ -11,7 +11,8 @@ intent (`docs/intent.md`) with a pointer stub at `.colosseum/intent.md`, a
 ledger whose trust-chain links are bold `**Depends on:**` blocks carrying
 backticked `code:`/`kani:` citations bound to 12-hex line hashes, a
 `colosseum-obligations` claim list of C-01..C-09, a `colosseum-g1-claims`
-map with per-claim layers and `<layer>:<target>` required targets, an
+map with per-claim layers and `<layer>:<target>` required targets (one of
+them a Rust `::` path, as the real project spells its Verus targets), an
 include-list `verified-inputs.txt` (semantically inverted from FV's
 exclusion list), a `colosseum-layer-runs` v2 manifest whose commands are
 semicolon-joined shell strings, and the historical attacks / changes /
@@ -40,6 +41,10 @@ What this suite holds the migration to:
   * a required legacy layer that cannot be translated blocks the run:
     dry-run reports it unsupported and writes nothing instead of
     downgrading it to history;
+  * every obligation the manifest declares is keyed by an id
+    `fv_evidence_run` accepts, so a migrated claim is dischargeable with no
+    post-migration rename, while the exact legacy `<layer>:<name>` target
+    survives in `legacy_id`;
   * legacy G1 records are history, never live v3 records, and imported
     bytes are never verified inputs;
   * re-apply is byte-idempotent;
@@ -56,6 +61,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -74,6 +80,7 @@ GATE_A = REPO / "scripts" / "check_ledger_references.py"
 GATE_B = REPO / "scripts" / "check_evidence_records.py"
 INIT = REPO / "scripts" / "fv_init.py"
 RESOLVER = REPO / "scripts" / "fv_project.py"
+EVIDENCE_RUN = REPO / "tools" / "evidence-run.ts"
 
 FAILURES: list[str] = []
 
@@ -94,6 +101,14 @@ ENVIRONMENT_POLICY = (
     "locally on one machine and no run pins its host toolchain beyond the "
     "digests recorded here"
 )
+# The id each legacy target must be keyed under in the migrated manifest. A
+# `<layer>:<name>` target becomes `<layer>.<name>`; a name carrying anything
+# the evidence producer's id alphabet excludes is spelled out here rather than
+# computed, so the expectation never restates the migration's normalization.
+MIGRATED_ID_OVERRIDES = {
+    "verus:dossier::key_lineage::preserved": "verus.dossier-key_lineage-preserved",
+}
+SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def check(label: str, condition: bool, detail: object = "") -> None:
@@ -247,7 +262,7 @@ CLAIMS: list[dict] = [
         "id": "C-05", "anchor": "K3", "title": "K3 key lineage across accepted transitions",
         "layers": ["lean", "verus", "quint", "proptest"],
         "targets": ["lean:Dossier.KeyLineage.admitted_key_survives_accepted_transitions",
-                    "verus:key_lineage_preserved", "quint:invKeyLineage",
+                    "verus:dossier::key_lineage::preserved", "quint:invKeyLineage",
                     "proptest:op_sequences_preserve_invariants"],
         "statement": ("An admitted key survives every accepted transition and no accepted "
                       "transition rebinds a live key"),
@@ -360,6 +375,31 @@ def target_layer(target: str) -> str:
 
 def target_name(target: str) -> str:
     return target.split(":", 1)[1]
+
+
+def migrated_id(target: str) -> str:
+    """The evidence-run-safe id the migrated manifest must key `target` under."""
+    if target in MIGRATED_ID_OVERRIDES:
+        return MIGRATED_ID_OVERRIDES[target]
+    name = target_name(target)
+    if SAFE_NAME.fullmatch(name) is None:
+        raise AssertionError(
+            f"{target!r} carries a name outside the evidence id alphabet and has no "
+            "spelled-out expectation in MIGRATED_ID_OVERRIDES")
+    return f"{target_layer(target)}.{name}"
+
+
+def evidence_claim_id_pattern() -> re.Pattern[str]:
+    """The `claim_id` shape the real evidence producer accepts.
+
+    Read out of `tools/evidence-run.ts` instead of restated here: that guard
+    decides whether a migrated obligation can be discharged at all, so a copy
+    of it in this test would keep passing after the producer moved.
+    """
+    match = re.search(r"/(\^\[[^/]+\$)/\.test\(params\.claim_id\)", EVIDENCE_RUN.read_text())
+    if match is None:
+        raise AssertionError(f"no claim_id guard found in {EVIDENCE_RUN}")
+    return re.compile(match.group(1))
 
 
 def target_file(target: str) -> str:
@@ -794,14 +834,26 @@ def expected_plan_order(names: object) -> list[str]:
 
 
 def expected_obligation_ids() -> tuple[list[str], list[str]]:
-    """Synthesized (invariant ids, witness ids): every distinct target, deduped."""
+    """Synthesized (invariant ids, witness ids): the migrated id of every
+    distinct required target, deduped and sorted as the manifest declares
+    them."""
     invariants: set[str] = set()
     witnesses: set[str] = set()
     for claim in CLAIMS:
         for target in claim["targets"]:
             (witnesses if target_layer(target) in ("proptest", "test")
-             else invariants).add(target)
+             else invariants).add(migrated_id(target))
     return sorted(invariants), sorted(witnesses)
+
+
+def expected_legacy_targets() -> list[str]:
+    """Every distinct legacy required target, in first-seen order."""
+    seen: list[str] = []
+    for claim in CLAIMS:
+        for target in claim["targets"]:
+            if target not in seen:
+                seen.append(target)
+    return seen
 
 
 def claims_requiring(target: str) -> list[str]:
@@ -1021,18 +1073,22 @@ def check_manifest(project: Path) -> None:
     depends_ok, evidence_ok, retained_ok = True, True, True
     for claim in CLAIMS:
         entry = claims.get(claim["id"], {})
-        depends_ok &= entry.get("depends_on") == claim["targets"]
+        depends_ok &= entry.get("depends_on") == [migrated_id(target)
+                                                 for target in claim["targets"]]
         evidence_ok &= entry.get("required_evidence") == claim["layers"]
         retained_ok &= (entry.get("required") is True
                         and entry.get("evidence_class") == "bounded-checked"
                         and entry.get("scope", {}).get("statement") == claim["statement"]
                         and entry.get("waiver", {}).get("excluded") == [claim["boundary"]])
-    check("depends_on preserves each claim's required targets in source order", depends_ok,
+    check("depends_on names each claim's migrated targets in source order", depends_ok,
           claims.get("C-07", {}).get("depends_on"))
     check("required_evidence is the claim's layer list, not its target prefixes", evidence_ok,
           claims.get("C-01", {}).get("required_evidence"))
     check("scope, waiver, evidence_class and required survive the conversion", retained_ok,
           claims.get("C-01", {}))
+    check("an already-safe legacy claim id is kept, not restated in legacy_id",
+          all("legacy_id" not in entry for entry in manifest.get("system_claims", [])),
+          [entry.get("legacy_id") for entry in manifest.get("system_claims", [])])
 
     invariants, witnesses = expected_obligation_ids()
     declared_invariants = [entry["id"] for entry in manifest.get("invariants", [])]
@@ -1044,21 +1100,74 @@ def check_manifest(project: Path) -> None:
     check("no obligation id is declared twice across collections",
           len(set(declared_invariants) | set(declared_witnesses))
           == len(declared_invariants) + len(declared_witnesses))
-    statements = {entry["id"]: entry.get("statement", "")
-                  for entry in manifest.get("invariants", []) + manifest.get("witnesses", [])}
+
+    synthesized = manifest.get("invariants", []) + manifest.get("witnesses", [])
+    by_legacy = {entry.get("legacy_id"): entry for entry in synthesized}
+    check("every synthesized obligation retains the exact legacy target it came from",
+          sorted(by_legacy) == sorted(expected_legacy_targets()),
+          sorted(set(by_legacy) ^ set(expected_legacy_targets())))
+    check("each legacy target is keyed under the id its migration produces",
+          all(by_legacy[target]["id"] == migrated_id(target)
+              for target in expected_legacy_targets() if target in by_legacy),
+          [(target, by_legacy.get(target, {}).get("id"))
+           for target in expected_legacy_targets()
+           if by_legacy.get(target, {}).get("id") != migrated_id(target)])
+    check("a witness keeps the unnormalized legacy target name",
+          all(entry["name"] == target_name(entry["legacy_id"])
+              for entry in manifest.get("witnesses", [])),
+          [(entry.get("name"), entry.get("legacy_id"))
+           for entry in manifest.get("witnesses", [])])
+    safe = evidence_claim_id_pattern()
+    every_id = [entry["id"] for entry in synthesized + manifest.get("system_claims", [])]
+    check("every migrated id is a claim_id the evidence producer accepts",
+          bool(every_id) and all(safe.fullmatch(identifier) for identifier in every_id),
+          [identifier for identifier in every_id if not safe.fullmatch(identifier)])
+
     grounded = all(
-        target_name(target) in statements.get(target, "")
-        and target_layer(target) in statements.get(target, "")
-        and all(claim_id in statements.get(target, "") for claim_id in claims_requiring(target))
-        for target in invariants + witnesses
+        target_name(entry["legacy_id"]) in entry.get("statement", "")
+        and target_layer(entry["legacy_id"]) in entry.get("statement", "")
+        and all(claim_id in entry.get("statement", "")
+                for claim_id in claims_requiring(entry["legacy_id"]))
+        for entry in synthesized
     )
-    check("each synthesized statement names its layer, target and requiring claims",
-          grounded, statements.get("kani:derivation_path_prefix_and_injectivity"))
+    check("each synthesized statement names its layer, legacy target and requiring claims",
+          grounded,
+          by_legacy.get("kani:derivation_path_prefix_and_injectivity", {}).get("statement"))
+    check_record_filenames(project, every_id)
     provenance = json.dumps(manifest.get("migration", {}))
     check("the migration block retains the legacy profile, policy and sources",
           PROFILE in provenance and ENVIRONMENT_POLICY in provenance
           and ".colosseum/g1-claims.json" in provenance
           and ".colosseum/obligations.json" in provenance, provenance[:300])
+
+
+def check_record_filenames(project: Path, every_id: list[str]) -> None:
+    """Each migrated id is usable as the record filename the producer derives.
+
+    `tools/evidence-run.ts` joins the id straight onto
+    `.fv/evidence/records/` and `.fv/evidence/raw/`, so an id carrying a path
+    separator would write outside the directory it is supposed to land in, and
+    one carrying a colon is not a portable filename at all. The records are
+    written into a scratch tree beside the project: the rehearsed project's
+    own records directory has to stay empty for the Gate B stage.
+    """
+    records = project.parent / "record-filenames" / ".fv" / "evidence" / "records"
+    records.mkdir(parents=True, exist_ok=True)
+    for identifier in every_id:
+        record = records / f"{identifier}.json"
+        if record.parent != records:
+            check("every migrated id is one filename, not a path", False, identifier)
+            return
+        record.write_text(json.dumps({"claim_id": identifier, "result": "PASS"}) + "\n")
+        raw = records.parent.parent / "raw" / f"{identifier}-run-1.log"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_text("PASS\n")
+    written = sorted(path.name for path in records.iterdir())
+    check("every migrated id is one filename, not a path",
+          written == sorted(f"{identifier}.json" for identifier in every_id), written[:4])
+    read_back = {json.loads(path.read_text())["claim_id"] for path in records.glob("*.json")}
+    check("a record written at <id>.json is the record a records glob reads back",
+          read_back == set(every_id), sorted(read_back ^ set(every_id))[:4])
 
 
 def check_plan(project: Path, report: dict, probe_log: Path) -> None:

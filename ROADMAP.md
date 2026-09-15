@@ -1,6 +1,6 @@
 # Roadmap: status and remaining work
 
-Last updated: 2026-07-28. This is the handoff document. It records where the
+Last updated: 2026-09-15. This is the handoff document. It records where the
 2026-07-11 remediation plan of record stands, what remains before the repo may
 call itself dependable by its own exit criteria, and who each remaining item
 waits on. A new maintainer or session should be able to resume from this file
@@ -20,6 +20,7 @@ committed on `main`, one commit per item:
 | M3 live calibration | `calibration/2026-07-13-r1`: blinded seeded-defect run, six scoreable voices | done |
 | OMP-native integration | ModelRegistry-backed adversary fan-out, generated routes, fail-closed session-root gate, live-tree preflight, process-local fallback suppression, failure-isolated evidence, initializer/doctor support (R29/R30/R33) | implemented on `feature/omp-integration`; the canonical 4-voice run is recorded at `calibration/2026-07-28-r3/`. Native calibration remains pending at the route level: one voice is attested and cited; two are unattested and one degraded. |
 | OMP-native deliberation panel | Three-wave `fv-panel` skill (drafts → blinded cross-review → synthesis): family/coverage quorum, randomized-label blinding + deferred identity, brief + git target-drift gating (binary-safe, full-digest, `.fv`-excluded), harness-aware doctor, `project-plan` + `milestone-review` modes (R31, ~50 assertions incl. a real Gate B end-to-end; R32 resolver dispatch-identity contract executed under Bun) | committed on `feature/omp-integration`; **`project-plan` live-verified** project-rooted (`calibration/2026-07-23-omp-panel-e2e/`, 3-family COMPLETE) but uncalibrated; **`milestone-review` EXPERIMENTAL** — evidence-bound fail-closed guard + Gate B `--expect-intent`/`--snapshot-exact`/dup-rejection are correct and deterministically tested, but not yet run against a real project's itf_replay G1 records + live panel; roster-resolver extension live-verified in a real OMP session (`calibration/2026-07-24-resolver-live/`: `ctx.models.family` distinctness positive + negative, canonical `provider/id` dispatch identity, both active seats serving real inference at `:max`); active roster is Sol+GLM (min_families=2) with Fable/Kimi-k3 pending; full three-wave run on that roster and calibration pending |
+| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | implemented 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`); focused suites PASS, full `ci.py` not yet run, and no real legacy project has been migrated |
 
 Gate: `./scripts/ci.py` validates frontmatter, agent policy, roster drift,
 documentation links, dispatch configuration, fixture tracking, and the full
@@ -242,6 +243,92 @@ shared, since `git ls-files --others --exclude-standard` never lists
 ignored files. Real build/run artifacts (a `target/` next to a Cargo.toml,
 `.fv/verify/`) stay tolerated. Verified off a fresh clone and on
 the live runner; both workflow jobs green.
+
+### Migration readiness — DELIVERED 2026-09-15 (commits f2d0556, 9eb3709, b1003a3)
+
+Authority for this work is the user-authorized migration requirements given in
+the session that produced these commits, not an intent revision: this repository
+declares no `.fv/intent.md`. Those requirements are restated in the committed
+change record `.fv/changes/2026-09-15-colosseum-shadow-migration.md`, which is
+the durable statement `f2d0556`, `9eb3709`, and `b1003a3` were checked against.
+
+Delivered:
+
+- **Canonical target.** `.fv/dispatch.json` → `omp_native.target_spec` is the
+  one intent/target declaration, resolved against the project root by
+  `scripts/fv_project.py` (`resolve_target`). Missing spec defaults to
+  `.fv/intent.md`; an absolute spec is valid only inside the project root; a
+  missing, directory, symlink, or escaping target is an error. The initializer
+  writes `project_root: "."` and a repo-relative spec. The old "root
+  `intent.md` as recognized alternative" fallback is gone — declare it.
+- **Verified-input content snapshot.** `.fv/verified-inputs.txt` is an
+  exclusion-prefix list over `git ls-files --cached --others
+  --exclude-standard`; the snapshot is `sha256:<hex>` over sorted
+  path + NUL + content-hash lines. `tools/evidence-run.ts` recomputes it (plus
+  the intent and manifest hashes) around every execution; Gate B recomputes and
+  demands an exact match unless `--expect-snapshot` / `--allow-unbound` are
+  passed. Evidence no longer binds to a commit id plus a dirty flag.
+- **Gate A citation grammar.** `scripts/check_ledger_references.py` parses four
+  citation forms explicitly instead of one ambiguous alternation: a `code:`
+  value that looks like a citation but does not parse now fails loudly, a
+  broken `@sha256:` binding is drift rather than prose, and `**Depends on:**` /
+  `### Depends on:` blocks are recognized, so per-link Kani coverage fires on
+  real ledgers it previously skipped entirely.
+- **System claims and evidence cohorts.** `obligations.json` accepts
+  `system_claims` (`depends_on` over declared obligations, `required_evidence`
+  over tool IDs). `fv-evidence-run/v3` adds `intent_path` and a nonempty
+  `executions` array; a cohort's verdict is atomic — every execution PASSes and
+  every binding holds still, or the record is FAIL. A system claim PASSes only
+  when every required tool appears among PASS executions;
+  `coverage_dashboard.py` distinguishes `coverage-gap` from `dependency-gap`.
+  v2 records remain accepted.
+- **Configurable and custom verification layers.** `pyramid_run.py --plan`
+  reads `fv-verification-plan/v1`: per-layer `required` plus argv/cwd/timeout/env
+  executions, no shell strings, escapes and ambient env mutation rejected.
+  Non-reserved layer ids are accepted as custom layers, run after the known
+  `LAYER_ORDER` in lexical order, join `required_layers` when `required: true`,
+  and go `not_run` under a types failure like any other layer. A malformed plan
+  is exit 2 before any layer runs.
+- **Portability.** Target declarations, execution `cwd`s, and `intent_path`
+  are repo-relative and containment-checked; evidence binds to content, not to
+  a commit. A record earned in one clone is checkable in another with the same
+  content, and absolute paths cannot leak into a persisted trust artifact.
+- **Shadow migration.** `scripts/fv_migrate.py PROJECT [--apply] [--json]`
+  defaults to dry run, writes only under `.fv/` on `--apply`, and leaves
+  `.colosseum/` byte-identical. Ledger, intent (including an external canonical
+  intent reached through a legacy pointer stub), joined
+  `obligations.json` + `g1-claims.json` → `system_claims`, and recorded layer
+  runs → a verification plan are mapped; everything else is preserved history;
+  anything untranslatable is `unsupported` and blocks the run before any write.
+  A legacy layer named in a `system_claim.required_evidence` — `quint` included
+  — migrates as a custom layer rather than being dropped. Obligation and claim
+  ids are normalized deterministically (`quint:invS7` to `quint.invS7`) so every
+  migrated id is directly usable as an `fv_evidence_run` `claim_id`, each
+  rewritten obligation carries `legacy_id` for traceability, and colliding or
+  empty normalized ids block the run instead of being suffixed apart. `--apply`
+  is byte-idempotent; `--json` emits a deterministic `fv-migration-report/v1`.
+- **Old-evidence quarantine.** Legacy `.colosseum/evidence/` records are never
+  copied into `.fv/evidence/`: a v1/v2 record cannot satisfy v3 bindings, so it
+  is preserved byte-for-byte under `.fv/history/colosseum/` and classified
+  `preserved-history`. `.fv/history/` is excluded from the verified-input
+  snapshot so quarantined history cannot perturb fresh evidence. The legacy
+  *include*-shaped `verified-inputs.txt` is preserved as history rather than
+  inverted, and FV's conservative exclusion defaults are written instead.
+
+Focused verification (orchestrator-run, all PASS; enumerated per phase in the
+change record): `py_compile` over changed Python modules plus
+`r1_r21_r27_ledger_gates`, `r2_r5_concurrency_containment`,
+`r6_manifest_failclosed`, `r29_omp_integration`, `r30_omp_native_dispatch`,
+`r31_omp_panel`, `r34_evidence_run`, `m1_coverage`, `r14_cli_contracts`,
+`r28_baseline_floors`, `r20_verdict_truth_table`, `r35_colosseum_migration`,
+`r36_dossier_rehearsal`, with `git diff --check` clean.
+
+Not claimed, and the next steps for this item: a full `./scripts/ci.py` run
+over these commits; a code-adversarial pass over `fv_migrate.py`, the
+`pyramid_run.py` plan path, and the `evidence-run.ts` cohort path; and a real
+legacy-project dry run. **No real legacy project has been cut over.** `r36` is
+a dossier-*shaped* fixture rehearsal, not a migration of the dossier project;
+no `.colosseum` tree outside `tests/fixtures/` has been read by the migrator.
 
 ## Suggested sequence
 
