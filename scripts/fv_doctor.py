@@ -188,19 +188,28 @@ def check_mcp(report: Report) -> None:
     report.add("mcp", "manifest", "fail" if missing else "ok", f"missing={missing}" if missing else "six package servers configured")
     fv_root = os.environ.get("FV_ROOT")
     root_ok = bool(fv_root) and Path(fv_root).expanduser().resolve() == REPO.resolve()
+    report.add(
+        "mcp", "FV_ROOT-paths", "ok" if root_ok else "fail",
+        "FV_ROOT resolves to this package" if root_ok else "FV_ROOT does not resolve to this package",
+    )
     bad_paths = []
-    for name, config in servers.items():
-        command = str(config.get("command", ""))
-        if "${FV_ROOT}" not in command or not root_ok:
+    for name, server in servers.items():
+        command = server.get("command") if isinstance(server, dict) else None
+        if not isinstance(command, str) or not command.startswith("./"):
             bad_paths.append(name)
             continue
-        expanded = Path(command.replace("${FV_ROOT}", str(REPO)))
-        if not expanded.is_file():
+        resolved = (REPO / command).resolve()
+        try:
+            resolved.relative_to(REPO.resolve())
+        except ValueError:
+            bad_paths.append(name)
+            continue
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
             bad_paths.append(name)
     report.add(
-        "mcp", "FV_ROOT-paths", "fail" if bad_paths else "ok",
-        f"invalid FV_ROOT or commands={bad_paths}" if bad_paths
-        else "FV_ROOT resolves to this package and all commands exist",
+        "mcp", "extension-relative-paths", "fail" if bad_paths else "ok",
+        f"invalid extension-relative commands={bad_paths}" if bad_paths
+        else "all commands resolve inside the extension root and are executable",
     )
 
 

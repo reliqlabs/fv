@@ -3,22 +3,22 @@
   "mcpServers": {
     "kani": {
       "type": "stdio",
-      "command": "${FV_ROOT}/mcp/kani-mcp/kani_mcp.py"
+      "command": "./mcp/kani-mcp/kani_mcp.py"
     },
     "quint": {
       "type": "stdio",
-      "command": "${FV_ROOT}/mcp/quint-mcp/quint_mcp.py"
+      "command": "./mcp/quint-mcp/quint_mcp.py"
     },
     "verus": {
       "type": "stdio",
-      "command": "${FV_ROOT}/mcp/verus-mcp/verus_mcp.py",
+      "command": "./mcp/verus-mcp/verus_mcp.py",
       "env": {
         "VERUS_BIN": "${VERUS_BIN}"
       }
     },
     "aeneas": {
       "type": "stdio",
-      "command": "${FV_ROOT}/mcp/aeneas-mcp/aeneas_mcp.py",
+      "command": "./mcp/aeneas-mcp/aeneas_mcp.py",
       "env": {
         "CHARON_BIN": "${CHARON_BIN}",
         "AENEAS_BIN": "${AENEAS_BIN}"
@@ -26,11 +26,11 @@
     },
     "goedel": {
       "type": "stdio",
-      "command": "${FV_ROOT}/mcp/goedel-mcp/goedel_mcp.py"
+      "command": "./mcp/goedel-mcp/goedel_mcp.py"
     },
     "lm-studio": {
       "type": "stdio",
-      "command": "${FV_ROOT}/mcp/lm-studio-mcp/lm_studio_mcp.py"
+      "command": "./mcp/lm-studio-mcp/lm_studio_mcp.py"
     }
   }
 }

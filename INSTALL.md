@@ -48,7 +48,12 @@ scripts/      gates, initializer, doctor, and CI
 
 ## Configure proof-tool binaries
 
-The package `.mcp.json` keeps environment indirection so one checkout works across machines:
+MCP executables in the package `.mcp.json` use `./mcp/...` paths. OMP resolves
+those paths against the discovered extension root, so reloading an extension
+does not depend on the parent OMP process having inherited `FV_ROOT`.
+
+`FV_ROOT` remains the operator-facing path used by scripts and skill commands.
+Optional proof-tool binary locations stay in the environment:
 
 ```bash
 export FV_ROOT=/absolute/path/to/fv

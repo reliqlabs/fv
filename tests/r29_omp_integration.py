@@ -61,6 +61,17 @@ def main() -> int:
 
     check("package panel resolver exists", (REPO / "tools" / "panel-resolver.ts").is_file())
     check("package MCP manifest exists", (REPO / ".mcp.json").is_file())
+    mcp_manifest = json.loads((REPO / ".mcp.json").read_text())
+    check(
+        "MCP executables are extension-relative and independent of FV_ROOT inheritance",
+        all(
+            isinstance(server.get("command"), str)
+            and server["command"].startswith("./mcp/")
+            and "${FV_ROOT}" not in server["command"]
+            for server in mcp_manifest.get("mcpServers", {}).values()
+        ),
+        mcp_manifest,
+    )
     help_run = subprocess.run(
         ["uv", "run", "--script", str(REPO / "scripts" / "fv_init.py"), "--help"],
         capture_output=True,
