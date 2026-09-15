@@ -262,19 +262,18 @@ def install_panel_config(
         return []
     if not isinstance(panel, dict) or not isinstance(panel.get("roles"), dict):
         return [f"{destination}: panel.roles must be a mapping"]
-    missing = []
-    drifted = []
-    for role_id, role in expected["roles"].items():
-        current = panel["roles"].get(role_id)
-        if current is None:
-            missing.append(role_id)
-        elif current != role:
-            drifted.append(role_id)
-    if missing or drifted:
-        return [
-            f"{destination}: configure FV roles in OMP panel settings; "
-            f"missing={missing}, drifted={drifted}"
-        ]
+    role = panel["roles"].get("fv-canonical")
+    if not isinstance(role, dict):
+        return [f"{destination}: configure panel.roles.fv-canonical in OMP settings"]
+    members = role.get("members")
+    floor = role.get("minFamilies")
+    if role.get("strategy") != "independent" or not isinstance(members, list) or len(members) < 2:
+        return [f"{destination}: panel.roles.fv-canonical must be independent with at least two members"]
+    if not isinstance(floor, int) or floor < 1 or floor > len(members):
+        return [f"{destination}: panel.roles.fv-canonical has an invalid minFamilies floor"]
+    # OMP owns an existing role. Candidate and thinking customization is valid;
+    # the FV tool and doctor use the effective role rather than repinning it to
+    # this initializer seed.
     results.append(("skip", destination))
     return []
 

@@ -189,10 +189,6 @@ roster = roster_lib["normalize_roster"](raw)
 seats, synthesizer_seat = roster["seats"], roster["synthesizer"]
 min_families = roster.get("min_families", 2)
 seat_timeout_seconds = roster.get("seat_timeout_seconds", 1800)
-profile_mode = roster.get("mode")
-if profile_mode != mode:
-    raise ValueError(f"requested mode {mode!r} does not match resolver mode {profile_mode!r}")
-
 # 2. Freeze the brief to a file inside the project.
 ts = pc["_iso_now"]() if "_iso_now" in pc else __import__("datetime").datetime.utcnow().isoformat()
 brief_rel = f".fv/panels/briefs/{mode}-{ts}.md"
@@ -238,7 +234,7 @@ summary = panel["run_panel"](
     draft_prompt_builder=db, review_prompt_builder=rb, synthesis_prompt_builder=sb,
     draft_schema=S["draft"], review_schema=S["review"], synthesis_schema=S["synthesis"],
     min_families=min_families, seat_timeout_seconds=seat_timeout_seconds,
-    profile_mode=profile_mode,
+    profile_mode=mode,
     metadata={"role": roster.get("role", role)},
     allow_unverified_isolation=True, **ms_kwargs)
 

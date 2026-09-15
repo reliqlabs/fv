@@ -9,6 +9,7 @@ interface RegistryVoice {
 	id: string;
 	omp_model?: string;
 	omp_calibration?: string;
+	omp_thinking_level?: string;
 }
 
 interface ResolvedSeat {
@@ -82,15 +83,18 @@ const factory: CustomToolFactory = pi => ({
 			if (!provider) throw new Error(`resolved an unqualified selector "${member.selector}"`);
 			return {
 				seat_id: seatId ?? voice?.id ?? `seat-${index + 1}`,
-				// FV's declared-family quorum now comes from OMP's resolved identity,
-				// so a human label cannot disagree with the mechanical family gate.
+				// Calibration is route and effort specific; a fallback or customized
+				// thinking level never inherits the primary route's accepted evidence.
+				calibration:
+					voice && member.requestedSelector === voice.omp_model && member.thinking === voice.omp_thinking_level
+						? (voice.omp_calibration ?? "pending")
+						: "pending",
 				declared_family: member.family,
 				requested_selector: member.requestedSelector,
 				resolved_provider: provider,
 				resolved_model: member.selector,
 				resolved_family: member.family,
 				thinking_level: member.thinking ?? "",
-				calibration: voice?.omp_calibration ?? "pending",
 			};
 		};
 		const synthMember = synthesizer.members[0];

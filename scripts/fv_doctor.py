@@ -152,6 +152,7 @@ def check_package(report: Report) -> None:
         panel = json.loads((REPO / "templates" / "omp-panel.json").read_text())
         role = panel.get("roles", {}).get("fv-canonical", {})
         expected_voices = {voice["model"]: voice for voice in expected_route["voices"]}
+        registry_voices = {voice.get("omp_model"): voice for voice in registry["voices"] if voice.get("omp_model")}
         panel_errors = []
         members = role.get("members")
         if role.get("strategy") != "independent" or not isinstance(members, list):
@@ -173,6 +174,21 @@ def check_package(report: Report) -> None:
                 continue
             if member.get("thinking") != expected.get("thinking_level"):
                 panel_errors.append(f"fv-canonical member {index}: thinking level drift")
+            registry_voice = registry_voices.get(primary)
+            ladder = registry_voice.get("omp_thinking_ladder") if registry_voice else None
+            if not isinstance(ladder, list) or not ladder:
+                panel_errors.append(f"fv-canonical member {index}: missing recorded thinking ladder")
+                continue
+            if "max" in ladder:
+                max_index = ladder.index("max")
+                policy_level = ladder[max_index - 1] if max_index > 0 else "max"
+            else:
+                policy_level = ladder[-1]
+            if registry_voice.get("omp_thinking_level") != policy_level:
+                panel_errors.append(
+                    f"fv-canonical member {index}: registry thinking policy drift "
+                    f"level={registry_voice.get('omp_thinking_level')!r}, expected={policy_level!r}"
+                )
         route_current = generated_route == expected_route and not panel_errors
         report.add(
             "package", "registry-routes", "ok" if route_current else "fail",

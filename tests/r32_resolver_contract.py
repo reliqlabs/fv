@@ -49,6 +49,7 @@ const MODELS = [
   { id: "m1", provider: "pb", identity: { class: "pb", family: "two" } },
   { id: "m2", provider: "pb", identity: { class: "pb", family: "two" } },
   { id: "m3", provider: "pa", identity: { class: "pa", family: "one" } },
+  { id: "kimi-k3", provider: "fireworks", identity: { class: "kimi", family: "k3" } },
 ];
 const api: any = { cwd: process.cwd(), zod, pi: panel };
 const settings = settingsModule.Settings.isolated({ panel: panelSettings, modelRoles: { plan: "pa/m1" } });
@@ -90,6 +91,13 @@ PANEL_SETTINGS = {
         "none": {
             "strategy": "independent", "minFamilies": 2,
             "members": [{"model": "pa/m1"}, {"model": "nope/nothing"}],
+        },
+        "calibration-fallback": {
+            "strategy": "independent", "minFamilies": 2,
+            "members": [
+                {"model": "pa/m1"},
+                {"model": "synthetic/hf:moonshotai/Kimi-K3", "fallbacks": ["fireworks/kimi-k3"]},
+            ],
         },
     },
     "personas": {},
@@ -161,6 +169,13 @@ def main() -> int:
               hidden.get("ok")
               and hidden["roster"]["seats"][0]["requested_selector"] == "pa/m3",
               hidden)
+
+        calibration_fallback = run("calibration-fallback")
+        check("fallback routes never inherit primary-route calibration",
+              calibration_fallback.get("ok")
+              and calibration_fallback["roster"]["seats"][1]["requested_selector"] == "fireworks/kimi-k3"
+              and calibration_fallback["roster"]["seats"][1]["calibration"] == "pending",
+              calibration_fallback)
 
         bare = run("bare")
         check("bare OMP model ids resolve to provider-qualified selectors",

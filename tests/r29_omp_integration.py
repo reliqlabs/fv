@@ -276,6 +276,13 @@ def main() -> int:
               preserved_mode.returncode == 0
               and preserved_config["task"]["isolation"]["mode"] == "rcopy",
               config_path.read_text())
+        customized = config_path.read_text().replace(
+            "model: openai-codex/gpt-5.6-sol", "model: custom/provider-model", 1)
+        config_path.write_text(customized)
+        customized_run = subprocess.run(command, capture_output=True, text=True)
+        check("initializer accepts a structurally valid customized OMP panel role",
+              customized_run.returncode == 0 and config_path.read_text() == customized,
+              customized_run.stdout + customized_run.stderr)
         config_path.write_text(config_path.read_text().replace("mode: rcopy", "mode: bogus"))
         invalid_mode = subprocess.run(command, capture_output=True, text=True)
         check("initializer rejects an invalid isolation backend",
