@@ -62,7 +62,7 @@ def main() -> int:
     check("package panel resolver exists", (REPO / "tools" / "panel-resolver.ts").is_file())
     check("package MCP manifest exists", (REPO / ".mcp.json").is_file())
     help_run = subprocess.run(
-        ["python3", str(REPO / "scripts" / "fv_init.py"), "--help"],
+        ["uv", "run", "--script", str(REPO / "scripts" / "fv_init.py"), "--help"],
         capture_output=True,
         text=True,
     )
@@ -81,7 +81,9 @@ def main() -> int:
         target = project / "intent.md"
         target.write_text("# Intent\n")
         command = [
-            "python3",
+            "uv",
+            "run",
+            "--script",
             str(REPO / "scripts" / "fv_init.py"),
             str(project),
             "--target-spec",

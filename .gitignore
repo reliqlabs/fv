@@ -74,6 +74,12 @@ build/
 # --- Runtime / cache directories ---
 .crucible/
 .fv/
+# Change-loop records are repository history, not runtime output. Unignore the
+# parent narrowly, then keep every other project-local FV artifact ignored.
+!.fv/
+.fv/*
+!.fv/changes/
+!.fv/changes/*.md
 # Fixture .fv dirs ARE repo content (the global rule above hid them
 # from git; fresh clones failed the r22/r28 suites). Run artifacts are
 # re-ignored below.
