@@ -20,7 +20,7 @@ committed on `main`, one commit per item:
 | M3 live calibration | `calibration/2026-07-13-r1`: blinded seeded-defect run, six scoreable voices | done |
 | OMP-native integration | ModelRegistry-backed adversary fan-out, generated routes, fail-closed session-root gate, live-tree preflight, process-local fallback suppression, failure-isolated evidence, initializer/doctor support (R29/R30/R33) | implemented on `feature/omp-integration`; the canonical 4-voice run is recorded at `calibration/2026-07-28-r3/`. Native calibration remains pending at the route level: one voice is attested and cited; two are unattested and one degraded. |
 | OMP-native deliberation panel | Three-wave `fv-panel` skill (drafts → blinded cross-review → synthesis): family/coverage quorum, randomized-label blinding + deferred identity, brief + git target-drift gating (binary-safe, full-digest, `.fv`-excluded), harness-aware doctor, `project-plan` + `milestone-review` modes (R31, ~50 assertions incl. a real Gate B end-to-end; R32 resolver dispatch-identity contract executed under Bun) | committed on `feature/omp-integration`; **`project-plan` live-verified** project-rooted (`calibration/2026-07-23-omp-panel-e2e/`, 3-family COMPLETE) but uncalibrated; **`milestone-review` EXPERIMENTAL** — evidence-bound fail-closed guard + Gate B `--expect-intent`/`--snapshot-exact`/dup-rejection are correct and deterministically tested, but not yet run against a real project's itf_replay G1 records + live panel; roster-resolver extension live-verified in a real OMP session (`calibration/2026-07-24-resolver-live/`: `ctx.models.family` distinctness positive + negative, canonical `provider/id` dispatch identity, both active seats serving real inference at `:max`); active roster is Sol+GLM (min_families=2) with Fable/Kimi-k3 pending; full three-wave run on that roster and calibration pending |
-| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | implemented 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`); code-adversarial pass complete (two reports under `.fv/code-adversarial/`, 32 findings, every one corrected in the current uncommitted correction set); focused suites PASS, full `ci.py` not yet run, and no real legacy project has been migrated |
+| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | delivered 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`, `8508604`, `5dc765e`, `d5ce1c2`); code-adversarial pass and closure reviews complete; local and Gula CI PASS; real dossier dry run PASS with 0 unsupported/conflicts and unchanged `.colosseum`; no shadow state applied |
 
 Gate: `./scripts/ci.py` validates frontmatter, agent policy, roster drift,
 documentation links, dispatch configuration, fixture tracking, and the full
@@ -458,16 +458,16 @@ mark, and `m1_coverage`'s parity matrix grew to eleven mutations — cross-claim
 artifact reuse, `+dirty` PASS, a non-producer cohort profile, and both
 `required_targets` mismatches among them — each asserted against both tools
 with identical defect text, with the Gate B side in `r6_manifest_failclosed`.
-What that is *not*: a re-review verdict. Both reviews probed the worktree as it
-stood before the wave, so the wave's own behaviour is regression-asserted and
-unreviewed, and nothing here has been through `./scripts/ci.py`.
+The final correction wave was probed by fresh read-only closure agents. Their
+evidence parity sweep found no Gate B/dashboard exit-code or defect-text
+divergence, and their migration closure check found no new high/medium
+fail-open or data-loss issue. Full `scripts/ci.py` passes locally and on Gula.
 
-Not claimed, and the next steps for this item: re-probing the final correction
-wave, which no read-only pass has seen; then a full `./scripts/ci.py` run over
-these commits plus the whole correction set; and a real legacy-project dry run.
-**No real legacy project has been cut over.** `r36` is
-a dossier-*shaped* fixture rehearsal, not a migration of the dossier project;
-no `.colosseum` tree outside `tests/fixtures/` has been read by the migrator.
+A read-only dry run against the real dossier project returned `status: ok`: 5
+mapped artifacts, 173 preserved-history files, 0 unsupported, 0 conflicts, and
+`docs/intent.md` as the elected target. The complete `.colosseum` digest was
+unchanged. **No real legacy project has been cut over:** no `--apply` was run,
+and migrated projects must still re-earn v3 evidence before Gate B can pass.
 
 ## Suggested sequence
 
