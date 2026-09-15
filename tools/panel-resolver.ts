@@ -2,8 +2,14 @@ import * as path from "node:path";
 import type {
 	CustomToolFactory,
 	PanelRole,
-	ResolvedPanelLineup,
+	ResolvedPanelMember,
 } from "@oh-my-pi/pi-coding-agent";
+
+interface RegistryVoice {
+	id: string;
+	omp_model?: string;
+	omp_calibration?: string;
+}
 
 interface ResolvedSeat {
 	seat_id: string;
@@ -16,130 +22,98 @@ interface ResolvedSeat {
 	resolved_family: string;
 }
 
-const factory: CustomToolFactory = pi => {
-	const seatSchema = pi.zod.object({
-		seat_id: pi.zod.string(),
-		declared_family: pi.zod.string(),
-		thinking_level: pi.zod.string().optional(),
-		calibration: pi.zod.string().optional(),
-		candidates: pi.zod.array(pi.zod.string()),
-	});
-	const profileSchema = pi.zod.object({
+const factory: CustomToolFactory = pi => ({
+	name: "fv_panel_resolve",
+	label: "Resolve FV panel roster",
+	description: "Resolve an OMP-defined panel role for the FV execution protocol.",
+	parameters: pi.zod.object({
+		role: pi.zod.string(),
 		mode: pi.zod.enum(["project-plan", "milestone-review"]),
-		min_families: pi.zod.number().optional(),
+		synthesizer: pi.zod.string().optional(),
 		seat_timeout_seconds: pi.zod.number().optional(),
-		seats: pi.zod.array(seatSchema),
-		synthesizer: seatSchema,
-	});
-	const documentSchema = pi.zod.object({ profiles: pi.zod.record(pi.zod.string(), profileSchema) });
+	}),
 
-	return {
-		name: "fv_panel_resolve",
-		label: "Resolve FV panel roster",
-		description: "Resolve an available, family-distinct FV panel roster.",
-		parameters: pi.zod.object({
-			profile: pi.zod.string(),
-			project_root: pi.zod.string().optional(),
-		}),
+	async execute(_toolCallId, params, _onUpdate, ctx) {
+		const parseSettings = pi.pi?.parsePanelSettings;
+		const resolveRole = pi.pi?.resolvePanelRole;
+		const resolveLineup = pi.pi?.resolvePanelLineup;
+		if (typeof parseSettings !== "function" || typeof resolveRole !== "function" || typeof resolveLineup !== "function") {
+			throw new Error(
+				"this OMP build does not expose its panel configuration and lineup resolver; " +
+					"`omp --agent-bridge-contract` must report panelLineupFreeze",
+			);
+		}
+		if (!ctx.settings) throw new Error("OMP session settings are unavailable");
 
-		async execute(_toolCallId, params, _onUpdate, ctx) {
-			// Taken from the injected `pi-coding-agent` exports at call time, not at
-			// factory time: an extension package sits outside OMP's module graph, so
-			// a bare value import would not resolve, and constructing the tool must
-			// stay side-effect free for loaders that probe it.
-			const resolveLineup = pi.pi?.resolvePanelLineup;
-			if (typeof resolveLineup !== "function") {
-				throw new Error(
-					"this OMP build does not expose resolvePanelLineup; " +
-						"`omp --agent-bridge-contract` must report panelLineupFreeze",
-				);
-			}
-			const root = path.resolve(pi.cwd, params.project_root ?? ".");
-			const profilePath = path.join(root, ".fv", "panel-profiles.json");
-			const document = documentSchema.parse(await Bun.file(profilePath).json());
-			const profile = document.profiles[params.profile];
-			if (!profile) throw new Error(`profile ${params.profile} not found in ${profilePath}`);
-			const minFamilies = profile.min_families ?? 3;
-			const seatTimeoutSeconds = profile.seat_timeout_seconds ?? 1800;
-			if (!Number.isFinite(seatTimeoutSeconds) || seatTimeoutSeconds <= 0) {
-				throw new Error(`profile ${params.profile}: seat_timeout_seconds must be positive`);
-			}
-			if (new Set(profile.seats.map(seat => seat.seat_id)).size !== profile.seats.length) {
-				throw new Error(`profile ${params.profile} has duplicate seat_id`);
-			}
-			const declared = new Set(profile.seats.map(seat => seat.declared_family));
-			if (declared.size < minFamilies) {
-				throw new Error(`profile ${params.profile}: ${declared.size} declared families; min_families=${minFamilies}`);
-			}
+		const panelSettings = parseSettings(ctx.settings.get("panel"));
+		const role = resolveRole(panelSettings, params.role);
+		const context = { modelRegistry: ctx.modelRegistry, settings: ctx.settings };
+		const lineup = resolveLineup({
+			context,
+			roleId: role.roleId,
+			role: role.role,
+			taskMode: params.mode === "project-plan" ? "plan" : "answer",
+		});
+		const synthesizerRole: PanelRole = {
+			strategy: "independent",
+			members: [{ model: params.synthesizer ?? "@plan" }],
+		};
+		const synthesizer = resolveLineup({
+			context,
+			roleId: `${role.roleId}.synthesizer`,
+			role: synthesizerRole,
+			taskMode: params.mode === "project-plan" ? "plan" : "answer",
+		});
 
-			// Candidate priority, availability, real served-family distinctness, and
-			// the lineup hash are OMP's; FV keeps the registry semantics on top —
-			// declared families, calibration references, and per-seat effort.
-			type ProfileSeat = (typeof profile.seats)[number];
-			// Both lineups are `independent`, which carries served-family
-			// distinctness by default; only the panel proper takes the floor. The
-			// one-seat synthesizer lineup makes no diversity claim.
-			const seatRole = (seats: ProfileSeat[], floor: boolean, where: string): PanelRole => ({
-				strategy: "independent",
-				members: seats.map((seat, index) => {
-					const [primary, ...fallbacks] = seat.candidates;
-					if (primary === undefined) {
-						throw new Error(`${where}[${index}]: candidates must not be empty`);
-					}
-					return { model: primary, fallbacks };
-				}),
-				...(floor ? { minFamilies } : {}),
-			});
-			const context = { modelRegistry: ctx.modelRegistry, settings: ctx.settings };
-			const resolveSeats = (seats: ProfileSeat[], floor: boolean, where: string): ResolvedPanelLineup => {
-				try {
-					return resolveLineup({
-						context,
-						roleId: `${params.profile}.${where}`,
-						role: seatRole(seats, floor, where),
-						taskMode: "plan",
-					});
-				} catch (error) {
-					throw new Error(`${where}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			};
-
-			const resolvedSeats = resolveSeats(profile.seats, true, "seats");
-			const resolvedSynthesizer = resolveSeats([profile.synthesizer], false, "synthesizer");
-			const toSeat = (seat: ProfileSeat, index: number, lineup: ResolvedPanelLineup): ResolvedSeat => {
-				const member = lineup.members[index];
-				if (!member) throw new Error(`seat ${seat.seat_id} has no resolved member at index ${index}`);
-				const [provider] = member.selector.split("/");
-				if (provider === undefined || provider.length === 0) {
-					throw new Error(`seat ${seat.seat_id} resolved an unqualified selector "${member.selector}"`);
-				}
-				return {
-					seat_id: seat.seat_id,
-					declared_family: seat.declared_family,
-					requested_selector: member.requestedSelector,
-					resolved_provider: provider,
-					resolved_model: member.selector,
-					resolved_family: member.family,
-					thinking_level: seat.thinking_level ?? "",
-					calibration: seat.calibration ?? "pending",
-				};
-			};
-
-			const roster = {
-				profile: params.profile,
-				mode: profile.mode,
-				min_families: minFamilies,
-				seat_timeout_seconds: seatTimeoutSeconds,
-				lineup_hash: resolvedSeats.lineupHash,
-				seats: profile.seats.map((seat, index) => toSeat(seat, index, resolvedSeats)),
-				synthesizer: toSeat(profile.synthesizer, 0, resolvedSynthesizer),
-			};
+		const packageRoot = path.resolve(import.meta.dir, "..");
+		const registry = (await Bun.file(path.join(packageRoot, "registry", "voices.json")).json()) as {
+			voices?: RegistryVoice[];
+		};
+		const voices = registry.voices ?? [];
+		const voiceFor = (member: ResolvedPanelMember): RegistryVoice | undefined =>
+			voices.find(voice => voice.omp_model === member.model);
+		const toSeat = (
+			member: ResolvedPanelMember,
+			index: number,
+			voice: RegistryVoice | undefined,
+			seatId?: string,
+		): ResolvedSeat => {
+			const [provider] = member.selector.split("/");
+			if (!provider) throw new Error(`resolved an unqualified selector "${member.selector}"`);
 			return {
-				content: [{ type: "text", text: JSON.stringify(roster) }],
-				details: roster,
+				seat_id: seatId ?? voice?.id ?? `seat-${index + 1}`,
+				// FV's declared-family quorum now comes from OMP's resolved identity,
+				// so a human label cannot disagree with the mechanical family gate.
+				declared_family: member.family,
+				requested_selector: member.requestedSelector,
+				resolved_provider: provider,
+				resolved_model: member.selector,
+				resolved_family: member.family,
+				thinking_level: member.thinking ?? "",
+				calibration: voice?.omp_calibration ?? "pending",
 			};
-		},
-	};
-};
+		};
+		const synthMember = synthesizer.members[0];
+		if (!synthMember) throw new Error("OMP did not resolve a synthesizer model");
+		const seatTimeoutSeconds = params.seat_timeout_seconds ?? 1800;
+		if (!Number.isFinite(seatTimeoutSeconds) || seatTimeoutSeconds <= 0) {
+			throw new Error("seat_timeout_seconds must be positive");
+		}
+
+		const roster = {
+			role: role.roleId,
+			mode: params.mode,
+			min_families: role.role.minFamilies ?? 2,
+			seat_timeout_seconds: seatTimeoutSeconds,
+			lineup_hash: lineup.lineupHash,
+			seats: lineup.members.map((member, index) => toSeat(member, index, voiceFor(member))),
+			synthesizer: toSeat(synthMember, 0, voiceFor(synthMember), "synthesizer"),
+		};
+		return {
+			content: [{ type: "text", text: JSON.stringify(roster) }],
+			details: roster,
+		};
+	},
+});
 
 export default factory;

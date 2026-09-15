@@ -1,115 +1,33 @@
 {
-  "_comment": "FV OMP panel rosters. The package resolver checks availability and real model-family distinctness; each seat call has a wall-clock deadline.",
-  "version": 1,
-  "profiles": {
-    "large-project": {
-      "mode": "project-plan",
-      "min_families": 4,
-      "seats": [
+  "roles": {
+    "fv-canonical": {
+      "strategy": "independent",
+      "minFamilies": 4,
+      "members": [
         {
-          "seat_id": "openai",
-          "declared_family": "OpenAI",
-          "thinking_level": "xhigh",
-          "calibration": "pending",
-          "candidates": [
-            "openai-codex/gpt-5.6-sol"
-          ]
+          "model": "openai-codex/gpt-5.6-sol",
+          "thinking": "xhigh"
         },
         {
-          "seat_id": "anthropic",
-          "declared_family": "Anthropic",
-          "thinking_level": "xhigh",
-          "calibration": "pending",
-          "candidates": [
-            "anthropic/claude-fable-5"
-          ]
+          "model": "anthropic/claude-fable-5",
+          "thinking": "xhigh"
         },
         {
-          "seat_id": "zhipu",
-          "declared_family": "Zhipu",
-          "thinking_level": "high",
-          "calibration": "pending",
-          "candidates": [
+          "model": [
             "synthetic/hf:zai-org/GLM-5.2",
             "fireworks/glm-5.2"
-          ]
+          ],
+          "thinking": "high"
         },
         {
-          "seat_id": "moonshot",
-          "declared_family": "Moonshot",
-          "thinking_level": "high",
-          "calibration": "pending",
-          "candidates": [
+          "model": [
             "synthetic/hf:moonshotai/Kimi-K3",
             "fireworks/kimi-k3"
-          ]
+          ],
+          "thinking": "high"
         }
-      ],
-      "synthesizer": {
-        "seat_id": "synthesizer",
-        "declared_family": "OpenAI",
-        "thinking_level": "xhigh",
-        "calibration": "pending",
-        "candidates": [
-          "openai-codex/gpt-5.6-sol"
-        ]
-      },
-      "seat_timeout_seconds": 1800
-    },
-    "milestone-review": {
-      "mode": "milestone-review",
-      "min_families": 4,
-      "seats": [
-        {
-          "seat_id": "openai",
-          "declared_family": "OpenAI",
-          "thinking_level": "xhigh",
-          "calibration": "pending",
-          "candidates": [
-            "openai-codex/gpt-5.6-sol"
-          ]
-        },
-        {
-          "seat_id": "anthropic",
-          "declared_family": "Anthropic",
-          "thinking_level": "xhigh",
-          "calibration": "pending",
-          "candidates": [
-            "anthropic/claude-fable-5"
-          ]
-        },
-        {
-          "seat_id": "zhipu",
-          "declared_family": "Zhipu",
-          "thinking_level": "high",
-          "calibration": "pending",
-          "candidates": [
-            "synthetic/hf:zai-org/GLM-5.2",
-            "fireworks/glm-5.2"
-          ]
-        },
-        {
-          "seat_id": "moonshot",
-          "declared_family": "Moonshot",
-          "thinking_level": "high",
-          "calibration": "pending",
-          "candidates": [
-            "synthetic/hf:moonshotai/Kimi-K3",
-            "fireworks/kimi-k3"
-          ]
-        }
-      ],
-      "synthesizer": {
-        "seat_id": "adjudicator",
-        "declared_family": "OpenAI",
-        "thinking_level": "xhigh",
-        "calibration": "pending",
-        "candidates": [
-          "openai-codex/gpt-5.6-sol"
-        ]
-      },
-      "seat_timeout_seconds": 1800
+      ]
     }
   },
-  "registry_profile": "canonical-4@sha256:0f73580ef4e3fdf2"
+  "personas": {}
 }

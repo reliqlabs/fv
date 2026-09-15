@@ -15,7 +15,7 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 PROJECT_SCRIPT_NAMES = ("check_ledger_references.py", "check_evidence_records.py")
 CONFIG_EXAMPLE = REPO / "scripts" / "dispatch.config.example.json"
-PANEL_PROFILE = REPO / "templates" / "omp-panel.json"
+PANEL_SETTINGS = REPO / "templates" / "omp-panel.json"
 PACKAGE_REQUIREMENTS = (
     REPO / "agents",
     REPO / "skills",
@@ -237,6 +237,47 @@ def install_isolation_config(
     results.append(("updated", destination))
     return []
 
+def install_panel_config(
+    project: Path,
+    results: list[tuple[str, Path]],
+) -> list[str]:
+    """Install FV's default role into OMP settings without owning OMP's file."""
+    destination = project / ".omp" / "config.yml"
+    expected = json.loads(PANEL_SETTINGS.read_text())
+    try:
+        data = yaml.safe_load(destination.read_text()) or {}
+    except (OSError, yaml.YAMLError) as error:
+        return [f"{destination}: invalid YAML ({error})"]
+    if not isinstance(data, dict):
+        return [f"{destination}: configuration root must be a mapping"]
+    panel = data.get("panel")
+    if panel is None:
+        lines = destination.read_text().splitlines()
+        if lines and lines[-1].strip():
+            lines.append("")
+        rendered = yaml.safe_dump({"panel": expected}, sort_keys=False).rstrip().splitlines()
+        lines.extend(rendered)
+        _write_lines(destination, lines)
+        results.append(("updated", destination))
+        return []
+    if not isinstance(panel, dict) or not isinstance(panel.get("roles"), dict):
+        return [f"{destination}: panel.roles must be a mapping"]
+    missing = []
+    drifted = []
+    for role_id, role in expected["roles"].items():
+        current = panel["roles"].get(role_id)
+        if current is None:
+            missing.append(role_id)
+        elif current != role:
+            drifted.append(role_id)
+    if missing or drifted:
+        return [
+            f"{destination}: configure FV roles in OMP panel settings; "
+            f"missing={missing}, drifted={drifted}"
+        ]
+    results.append(("skip", destination))
+    return []
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -252,7 +293,7 @@ def main() -> int:
 
     required = [
         CONFIG_EXAMPLE,
-        PANEL_PROFILE,
+        PANEL_SETTINGS,
         *PACKAGE_REQUIREMENTS,
         *(REPO / "scripts" / name for name in PROJECT_SCRIPT_NAMES),
     ]
@@ -275,12 +316,8 @@ def main() -> int:
     errors.extend(install_dispatch_config(project, target_spec, args.force, results))
     errors.extend(install_extension_config(project, args.force, results))
     errors.extend(install_isolation_config(project, results))
-    _copy_owned_file(
-        PANEL_PROFILE,
-        project / ".fv" / "panel-profiles.json",
-        args.force,
-        results,
-    )
+    if not errors:
+        errors.extend(install_panel_config(project, results))
 
     marker = project / ".fv" / "harness"
     if not marker.exists() or args.force:

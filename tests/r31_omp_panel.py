@@ -24,7 +24,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 PANEL = REPO / "skills" / "fv-panel"
 FANOUT = REPO / "skills" / "fv-adversarial" / "omp_fanout.py"
-PROFILE = REPO / "templates" / "omp-panel.json"
 FAILURES: list[str] = []
 
 
@@ -114,14 +113,7 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
     def ok_agent(prompt, **o):
         return {"text": f"OUT {o['label']}", "data": {"stub": True, "label": o["label"]}}
 
-    # ── Roster loader ────────────────────────────────────────────────
-    r = roster.resolve_roster(PROFILE, "large-project")
-    check("roster loads large-project active seats (>=2 distinct families, min_families honored)",
-          len({s["declared_family"] for s in r["seats"]}) >= 2
-          and len({s["declared_family"] for s in r["seats"]}) >= r["min_families"]
-          and r["mode"] == "project-plan")
-    check("roster loader rejects a missing profile",
-          raises(lambda: roster.resolve_roster(PROFILE, "nope"), "not found"))
+    # The stdlib helper decodes only; roster ownership and resolution stay in OMP.
     _rost = {"seats": [{"seat_id": "a"}], "synthesizer": {"seat_id": "s"}, "mode": "project-plan"}
     check("normalize_roster: direct roster",
           roster.normalize_roster(_rost)["seats"] == _rost["seats"])

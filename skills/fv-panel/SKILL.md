@@ -151,10 +151,9 @@ unavailable tree, or a non-COMPLETE run downgrades to `FAIL` / `CONTESTED` /
 The panel runs from an OMP Python eval cell. `agent` and `parallel` are the
 kernel-injected OMP helpers. The security primitives come from the
 fv-adversarial `omp_fanout` module (never reimplemented, never stubbed).
-The roster is resolved and frozen by the `fv_panel_resolve` tool
-(registered by the `fv-panel-resolver` extension), which enforces
-family distinctness with OMP's own `ctx.models.family` and never persists the
-opaque family token.
+The `fv_panel_resolve` tool reads and freezes the named OMP role. OMP enforces
+family distinctness from its canonical model identity and returns that resolved
+family; FV persists it as both the mechanical and declared quorum label.
 
 ```python
 import os
@@ -172,26 +171,27 @@ panel  = _ns("skill://fv-panel/omp_panel.py")
 pc     = _ns("skill://fv-panel/panel_contract.py")
 
 mode = "project-plan"              # or "milestone-review"
-profile = "large-project"          # a profile in .fv/panel-profiles.json
+role = "fv-canonical"              # a role in OMP's panel.roles settings
+synthesizer = "@plan"              # ordinary OMP model-role selector
 
-# 1. Resolve + freeze the roster. The fv-panel-resolver OMP extension is
-#    the ONLY path allowed for panel execution: it enforces model availability
-#    and distinct opaque model families (ctx.models.family). Any error here
-#    propagates and fails closed; do NOT catch it or fall back to the stdlib
-#    loader, which checks only declared_family labels and would silently run a
-#    degenerate panel (two seats on the same real model, or an unavailable one).
-#    The resolver raises its own message for a bad profile / unavailable
-#    candidate / family collision; an unresolved tool name means the extension is
-#    not loaded (install/reload it). resolve_roster is diagnostics/tests only.
+# 1. Resolve + freeze the OMP-owned role. The FV tool delegates settings
+# parsing, role lookup, candidate priority, model availability, family policy,
+# and lineup hashing to OMP. Any error propagates and fails closed; there is no
+# FV-side roster or stdlib fallback.
 roster_lib = _ns("skill://fv-panel/panel_roster.py")
-raw = tool.fv_panel_resolve({"profile": profile})
-roster = roster_lib["normalize_roster"](raw)   # decode the ToolResult; malformed -> propagate
-seats, synthesizer = roster["seats"], roster["synthesizer"]
+raw = tool.fv_panel_resolve({
+    "role": role,
+    "mode": mode,
+    "synthesizer": synthesizer,
+    "seat_timeout_seconds": 1800,
+})
+roster = roster_lib["normalize_roster"](raw)
+seats, synthesizer_seat = roster["seats"], roster["synthesizer"]
 min_families = roster.get("min_families", 2)
+seat_timeout_seconds = roster.get("seat_timeout_seconds", 1800)
 profile_mode = roster.get("mode")
 if profile_mode != mode:
-    raise ValueError(f"requested mode {mode!r} does not match profile mode {profile_mode!r}")
-seat_timeout_seconds = roster.get("seat_timeout_seconds", 1800)
+    raise ValueError(f"requested mode {mode!r} does not match resolver mode {profile_mode!r}")
 
 # 2. Freeze the brief to a file inside the project.
 ts = pc["_iso_now"]() if "_iso_now" in pc else __import__("datetime").datetime.utcnow().isoformat()
@@ -232,14 +232,14 @@ else:
 # 4. Run the panel.
 summary = panel["run_panel"](
     agent_fn=agent, parallel_fn=parallel, secure=secure, mode=mode,
-    seats=seats, synthesizer_seat=synthesizer,
+    seats=seats, synthesizer_seat=synthesizer_seat,
     project_root=str(proj), brief_path=brief_rel,
     run_dir=f".fv/panels/{ts}-{mode}",
     draft_prompt_builder=db, review_prompt_builder=rb, synthesis_prompt_builder=sb,
     draft_schema=S["draft"], review_schema=S["review"], synthesis_schema=S["synthesis"],
     min_families=min_families, seat_timeout_seconds=seat_timeout_seconds,
     profile_mode=profile_mode,
-    metadata={"profile": roster.get("profile", profile)},
+    metadata={"role": roster.get("role", role)},
     allow_unverified_isolation=True, **ms_kwargs)
 
 print(summary["run_status"], summary.get("adjudication"))
@@ -309,23 +309,26 @@ moving target invalidates a milestone verdict.
   summary.json          # run_status, quorum, per-phase records, adjudication
 ```
 
-## Profiles
+## OMP panel role
 
-Panel rosters live in `.fv/panel-profiles.json`. Each profile lists seats
-(each a ranked candidate list, resolved to the first available model) with a
-stable `declared_family` label, a `min_families` floor, and a `synthesizer`
-route. The resolver freezes the roster before wave 1 and never substitutes a
-model mid-run; a runtime call failure is recorded as a seat error, and lost
-family quorum yields `INCOMPLETE`.
+FV reads the named role from OMP's effective `panel.roles` settings. OMP owns
+the members, ranked model candidates, thinking levels, resolved-family policy,
+family floor, and frozen lineup hash. The package template `templates/omp-panel.json`
+is an initializer seed for the OMP `panel` setting; it is never copied under
+`.fv/` and is not read during execution.
 
-`fv_panel_resolve` delegates candidate priority, availability, served-family
-distinctness, and lineup hashing to OMP's `resolvePanelLineup`, then applies
-the registry semantics OMP has no opinion about: declared families, calibration
-references, and per-seat effort. Each resolved seat therefore carries both the
-`requested_selector` and the served `resolved_model`, and the roster carries a
-`lineup_hash` over the served routes. `run_panel` records that hash in
-`route.json`, `meta.json`, and `summary.json`; a `milestone-review` run without
-it is rejected, because a verdict must name the panel that produced it.
+The default `fv-canonical` role serves both FV modes. The synthesizer resolves
+through the ordinary OMP `@plan` model role, keeping model choice in OMP as
+well. A custom OMP role may be passed by changing `role` in the invocation.
+
+`fv_panel_resolve` overlays only FV evidence metadata. `declared_family` is the
+OMP-resolved family itself, so the Python engine's quorum cannot disagree with
+OMP's mechanical diversity gate. Calibration is looked up by the member's
+primary selector in `registry/voices.json`; an unregistered custom member is
+honestly `pending`. Each seat carries both `requested_selector` and the served
+`resolved_model`, and the roster carries OMP's `lineup_hash`. `run_panel`
+records that hash in `route.json`, `meta.json`, and `summary.json`; a
+`milestone-review` run without it is rejected.
 
 ## What this skill does not do
 

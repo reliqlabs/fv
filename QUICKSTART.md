@@ -16,7 +16,7 @@ export FV_ROOT=/absolute/path/to/fv
 uv run --script "$FV_ROOT/scripts/fv_init.py" /absolute/path/to/project
 ```
 
-The initializer writes project state under `.fv/` and adds the FV checkout to `.omp/config.yml` `extensions:`. It does not copy package agents, skills, tools, or MCP definitions into the project.
+The initializer writes project state under `.fv/`, adds the FV checkout to `.omp/config.yml` `extensions:`, and installs the default `fv-canonical` role under OMP's `panel.roles` settings. It does not copy package agents, skills, tools, MCP definitions, or panel profiles into `.fv/`.
 
 After adding or changing the extension root, reload OMP's complete extension
 snapshot in every already-running session:

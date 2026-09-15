@@ -149,25 +149,35 @@ def check_package(report: Report) -> None:
             key: value for key, value in generated_route.items()
             if key not in {"project_root", "target_spec"}
         }
-        panel_profiles = json.loads((REPO / "templates" / "omp-panel.json").read_text())["profiles"]
+        panel = json.loads((REPO / "templates" / "omp-panel.json").read_text())
+        role = panel.get("roles", {}).get("fv-canonical", {})
         expected_voices = {voice["model"]: voice for voice in expected_route["voices"]}
-        profile_errors = []
-        for profile_name, profile in panel_profiles.items():
-            for seat in [*profile["seats"], profile["synthesizer"]]:
-                candidates = seat.get("candidates")
-                expected = expected_voices.get(candidates[0]) if candidates else None
-                if expected is None:
-                    profile_errors.append(f"{profile_name}/{seat['seat_id']}: unknown primary candidate")
-                    continue
-                if seat.get("thinking_level") != expected.get("thinking_level"):
-                    profile_errors.append(f"{profile_name}/{seat['seat_id']}: thinking level drift")
-                if not seat.get("candidates") or seat["candidates"][0] != expected["model"]:
-                    profile_errors.append(f"{profile_name}/{seat['seat_id']}: primary candidate drift")
-        route_current = generated_route == expected_route and not profile_errors
+        panel_errors = []
+        members = role.get("members")
+        if role.get("strategy") != "independent" or not isinstance(members, list):
+            panel_errors.append("fv-canonical must be an independent OMP panel role")
+            members = []
+        if role.get("minFamilies") != len(expected_route["voices"]):
+            panel_errors.append("fv-canonical family floor drift")
+        if len(members) != len(expected_route["voices"]):
+            panel_errors.append(
+                f"fv-canonical members={len(members)}, expected={len(expected_route['voices'])}"
+            )
+        for index, member in enumerate(members):
+            model = member.get("model") if isinstance(member, dict) else None
+            candidates = model if isinstance(model, list) else [model]
+            primary = candidates[0] if candidates else None
+            expected = expected_voices.get(primary)
+            if expected is None:
+                panel_errors.append(f"fv-canonical member {index}: unknown primary candidate")
+                continue
+            if member.get("thinking") != expected.get("thinking_level"):
+                panel_errors.append(f"fv-canonical member {index}: thinking level drift")
+        route_current = generated_route == expected_route and not panel_errors
         report.add(
             "package", "registry-routes", "ok" if route_current else "fail",
-            "full generated OMP routes and panel profiles current"
-            if route_current else "; ".join(profile_errors) or "generated OMP route drift",
+            "generated OMP routes and fv-canonical panel seed current"
+            if route_current else "; ".join(panel_errors) or "generated OMP route drift",
         )
     except (OSError, KeyError, ValueError, json.JSONDecodeError, SystemExit) as error:
         report.add("package", "registry-routes", "fail", str(error))
@@ -276,33 +286,27 @@ def check_project(report: Report, project: Path) -> None:
         "; ".join(errors) if errors else "omp_native block valid",
     )
 
-    project_profile = state / "panel-profiles.json"
-    template_profile = REPO / "templates" / "omp-panel.json"
+    config_path = project / ".omp" / "config.yml"
     try:
-        profile = json.loads(project_profile.read_text())
-        registry = json.loads((REPO / "registry" / "voices.json").read_text())
-        canonical = next(item for item in registry["profiles"] if item["name"] == "canonical-4")
-        generator = load_module("gen_roster_docs", REPO / "scripts" / "gen_roster_docs.py")
-        computed_hash = generator.profile_content_hash(canonical)
-        expected_pin = f"canonical-4@{computed_hash}"
-        profile_errors = []
-        if canonical.get("content_hash") != computed_hash:
-            profile_errors.append(
-                f"registry content_hash={canonical.get('content_hash')!r}, recomputed {computed_hash!r}"
-            )
-        if profile.get("registry_profile") != expected_pin:
-            profile_errors.append(
-                f"registry_profile={profile.get('registry_profile')!r}, expected {expected_pin!r}"
-            )
-        if sha256(project_profile) != sha256(template_profile):
-            profile_errors.append("project panel profile differs from package template")
-    except (OSError, json.JSONDecodeError, StopIteration) as error:
-        profile_errors = [str(error)]
+        config = yaml.safe_load(config_path.read_text()) or {}
+        panel = config.get("panel") if isinstance(config, dict) else None
+        roles = panel.get("roles") if isinstance(panel, dict) else None
+        actual = roles.get("fv-canonical") if isinstance(roles, dict) else None
+        members = actual.get("members") if isinstance(actual, dict) else None
+        strategy = actual.get("strategy") if isinstance(actual, dict) else None
+        floor = actual.get("minFamilies") if isinstance(actual, dict) else None
+        panel_errors = []
+        if strategy != "independent" or not isinstance(members, list) or len(members) < 2:
+            panel_errors.append("OMP panel.roles.fv-canonical must be an independent role with at least two members")
+        if not isinstance(floor, int) or not isinstance(members, list) or floor < 1 or floor > len(members):
+            panel_errors.append("OMP panel.roles.fv-canonical has an invalid minFamilies floor")
+    except (OSError, yaml.YAMLError) as error:
+        panel_errors = [str(error)]
     report.add(
         "project",
-        "panel-profile",
-        "fail" if profile_errors else "ok",
-        "; ".join(profile_errors) if profile_errors else "profile and registry hash aligned",
+        "panel-role",
+        "fail" if panel_errors else "ok",
+        "; ".join(panel_errors) if panel_errors else "OMP owns a structurally valid fv-canonical panel role",
     )
 
     for name in ("check_evidence_records.py", "check_ledger_references.py"):
@@ -388,60 +392,49 @@ def check_toolchain(report: Report, project: Path, omp_command: str = "omp") -> 
         [omp, "models", "--json", "-e", str(REPO)],
         cwd=project, capture_output=True, text=True,
     )
-    if catalog.returncode != 0:
-        report.add("toolchain", "omp-model-contract", "fail",
-                   (catalog.stdout + catalog.stderr).strip() or "omp models failed")
+    panel_config = subprocess.run(
+        [omp, "config", "get", "panel"],
+        cwd=project, capture_output=True, text=True,
+    )
+    if catalog.returncode != 0 or panel_config.returncode != 0:
+        detail = (catalog.stdout + catalog.stderr + panel_config.stdout + panel_config.stderr).strip()
+        report.add("toolchain", "omp-model-contract", "fail", detail or "OMP model/panel query failed")
         return
     try:
         models = {item["selector"]: item for item in json.loads(catalog.stdout)["models"]}
-        registry = json.loads((REPO / "registry" / "voices.json").read_text())
-        canonical = next(item for item in registry["profiles"] if item["name"] == "canonical-4")
-        voices = {item["id"]: item for item in registry["voices"]}
-        panel = json.loads((REPO / "templates" / "omp-panel.json").read_text())["profiles"]["large-project"]
-        seats = {item["declared_family"]: item for item in panel["seats"]}
+        panel = json.loads(panel_config.stdout)["roles"]["fv-canonical"]
+        members = panel["members"]
         errors = []
         fallbacks = []
-        for route in canonical["voices"]:
-            voice = voices[route["id"]]
-            seat = seats[voice["family"]]
-            candidates = seat.get("candidates")
-            if not isinstance(candidates, list) or not candidates:
-                errors.append(f"{voice['id']}: no configured candidates")
+        for index, member in enumerate(members):
+            model = member.get("model")
+            fallbacks_config = member.get("fallbacks", [])
+            candidates = list(model) if isinstance(model, list) else [model, *fallbacks_config]
+            if not candidates or any(not isinstance(candidate, str) or not candidate for candidate in candidates):
+                errors.append(f"member {index}: invalid model candidates")
                 continue
             selected = next((candidate for candidate in candidates if candidate in models), None)
             if selected is None:
-                errors.append(f"{voice['id']}: no candidate available ({candidates})")
+                errors.append(f"member {index}: no candidate available ({candidates})")
                 continue
+            level = member.get("thinking")
             live_ladder = models[selected].get("thinking")
-            level = seat.get("thinking_level")
-            if not isinstance(live_ladder, list) or not live_ladder:
-                errors.append(f"{voice['id']}: selected candidate has no thinking ladder ({selected})")
-                continue
-            if "max" in live_ladder:
-                max_index = live_ladder.index("max")
-                expected_level = live_ladder[max_index - 1] if max_index > 0 else "max"
-            else:
-                expected_level = live_ladder[-1]
-            if level != expected_level:
+            if level not in (None, "auto", "off") and (
+                not isinstance(live_ladder, list) or level not in live_ladder
+            ):
                 errors.append(
-                    f"{voice['id']}: thinking level={level!r} expected={expected_level!r} "
-                    f"for selected candidate {selected} ladder={live_ladder!r}"
+                    f"member {index}: thinking level={level!r} unavailable for "
+                    f"selected candidate {selected} ladder={live_ladder!r}"
                 )
-            if selected == voice["omp_model"]:
-                recorded_ladder = voice.get("omp_thinking_ladder")
-                if recorded_ladder is not None and live_ladder != recorded_ladder:
-                    errors.append(
-                        f"{voice['id']}: thinking ladder live={live_ladder!r} expected={recorded_ladder!r}"
-                    )
-            else:
-                fallbacks.append(f"{voice['id']}->{selected}")
-        detail = "canonical panel candidates and thinking policies available"
+            if selected != candidates[0]:
+                fallbacks.append(f"member-{index + 1}->{selected}")
+        detail = "effective OMP fv-canonical candidates and thinking levels available"
         if fallbacks:
             detail += f"; fallbacks={fallbacks}"
         report.add("toolchain", "omp-model-contract", "fail" if errors else "ok",
                    "; ".join(errors) if errors else detail)
-    except (KeyError, StopIteration, TypeError, json.JSONDecodeError) as error:
-        report.add("toolchain", "omp-model-contract", "fail", f"invalid OMP model catalog: {error}")
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        report.add("toolchain", "omp-model-contract", "fail", f"invalid OMP model/panel output: {error}")
 
 
 def main() -> int:

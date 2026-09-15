@@ -3,26 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""R32 - the panel-resolver extension's dispatch-identity contract.
-
-Runs the real ``tools/panel-resolver.ts`` under Bun with a faked
-``CustomToolAPI`` and a faked ``ctx.modelRegistry``, so the resolver's own logic
-is exercised without an OMP session and without a single model call.
-
-Seat resolution itself now lives in OMP (``resolvePanelLineup``), which the tool
-reaches through the injected ``pi.pi`` exports. The harness locates that module
-from ``OMP_SOURCE`` or from the ``omp`` on PATH and injects it, so these
-assertions exercise the real delegation rather than a stand-in.
-
-Covers the defect found by ``calibration/2026-07-24-resolver-live/``: the
-resolver must emit OMP's canonical ``provider/id`` selector (``omp_panel.py``
-dispatches ``resolved_model``), must record the real ``model.provider``, and
-must key availability by ``provider/id`` so a model that *resolves* but whose
-provider is absent is not accepted on a bare-id collision.
-
-Exit 0 pass, 1 fail, 2 could-not-run (Bun or the OMP source absent ->
-INCOMPLETE via run_all).
-"""
+"""R32: FV resolves named panel roles from OMP settings through OMP's real resolver."""
 from __future__ import annotations
 
 import json
@@ -39,122 +20,79 @@ FAILURES: list[str] = []
 
 
 def omp_panel_module() -> Path | None:
-    """Locate OMP's panel module: an extension package is outside its graph."""
     candidates: list[Path] = []
     source = os.environ.get("OMP_SOURCE")
     if source:
         candidates.append(Path(source))
     omp = shutil.which("omp")
     if omp:
-        entry = Path(omp).resolve()
-        # ~/.local/bin/omp -> <repo>/packages/coding-agent/src/cli.ts
-        candidates.extend(entry.parents)
+        candidates.extend(Path(omp).resolve().parents)
     for candidate in candidates:
         module = candidate / "packages" / "coding-agent" / "src" / "panel" / "index.ts"
         if module.is_file():
             return module
     return None
 
+
 HARNESS_TS = r"""
-const [, , resolverPath, projectRoot, profile, panelModule] = process.argv;
+const [, , resolverPath, settingsPath, role, panelModule, injectPanel] = process.argv;
 const mod = await import(resolverPath);
-const injected = panelModule === "none"
-  ? {}
-  : { resolvePanelLineup: (await import(panelModule)).resolvePanelLineup };
+const panel = injectPanel === "yes" ? await import(panelModule) : {};
+const settingsModule = await import((await import("node:path")).resolve(panelModule, "..", "..", "config", "settings.ts"));
 const stub: any = {};
 for (const key of ["min", "max", "optional", "describe", "default", "nullable", "array"]) stub[key] = () => stub;
 stub.parse = (value: any) => value;
 const zod: any = new Proxy(stub, { get: (target, key) => key in target ? target[key] : () => stub });
+const panelSettings = await Bun.file(settingsPath).json();
 const MODELS = [
   { id: "m1", provider: "pa", identity: { class: "pa", family: "one" } },
   { id: "m1", provider: "pb", identity: { class: "pb", family: "two" } },
   { id: "m2", provider: "pb", identity: { class: "pb", family: "two" } },
   { id: "m3", provider: "pa", identity: { class: "pa", family: "one" } },
 ];
-// `pi.pi` is OMP's injected export surface in production; the harness injects
-// the real module so seat resolution is exercised, not simulated.
-const api: any = { cwd: projectRoot, zod, pi: injected };
+const api: any = { cwd: process.cwd(), zod, pi: panel };
+const settings = settingsModule.Settings.isolated({ panel: panelSettings, modelRoles: { plan: "pa/m1" } });
 const tool = await mod.default(api);
 try {
-  const result = await tool.execute("tc", { profile, project_root: projectRoot }, undefined,
-    { modelRegistry: { getAvailable: () => MODELS, hasConfiguredAuth: () => true } });
+  const result = await tool.execute(
+    "tc",
+    { role, mode: "project-plan", synthesizer: "pa/m1" },
+    undefined,
+    { settings, modelRegistry: { getAvailable: () => MODELS, hasConfiguredAuth: () => true } },
+  );
   console.log(JSON.stringify({ ok: true, roster: result.details, tool_name: tool.name }));
 } catch (error: any) {
-  console.log(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
+  console.log(JSON.stringify({ ok: false, error: String(error?.message ?? error), tool_name: tool.name }));
 }
 """
 
-PROFILES = {
-    "version": 1,
-    "profiles": {
-        # Same bare id under two providers: the exact case a bare-id selector
-        # cannot express unambiguously.
+PANEL_SETTINGS = {
+    "roles": {
         "dup": {
-            "mode": "project-plan",
-            "min_families": 2,
-            "seats": [
-                {"seat_id": "a", "declared_family": "PA", "thinking_level": "max",
-                 "candidates": ["pa/m1"]},
-                {"seat_id": "b", "declared_family": "PB", "thinking_level": "low",
-                 "candidates": ["pb/m1"]},
-            ],
-            "synthesizer": {"seat_id": "s", "declared_family": "PA",
-                            "thinking_level": "max", "candidates": ["pa/m1"]},
+            "strategy": "independent", "minFamilies": 2,
+            "members": [{"model": "pa/m1"}, {"model": "pb/m1"}],
         },
-        # First candidate resolves but its provider is absent from list();
-        # must be skipped, falling through to the second.
         "hidden": {
-            "mode": "project-plan",
-            "min_families": 2,
-            "seats": [
-                {"seat_id": "a", "declared_family": "PZ", "thinking_level": "max",
-                 "candidates": ["pz/m3", "pa/m3"]},
-                {"seat_id": "b", "declared_family": "PB", "thinking_level": "max",
-                 "candidates": ["pb/m2"]},
+            "strategy": "independent", "minFamilies": 2,
+            "members": [
+                {"model": "pz/m3", "fallbacks": ["pa/m3"]},
+                {"model": "pb/m2"},
             ],
-            "synthesizer": {"seat_id": "s", "declared_family": "PB",
-                            "thinking_level": "max", "candidates": ["pb/m2"]},
         },
-        # A bare candidate id must still come back provider-qualified.
         "bare": {
-            "mode": "project-plan",
-            "min_families": 2,
-            "seats": [
-                {"seat_id": "a", "declared_family": "PB", "thinking_level": "max",
-                 "candidates": ["m2"]},
-                {"seat_id": "b", "declared_family": "PA", "thinking_level": "max",
-                 "candidates": ["m3"]},
-            ],
-            "synthesizer": {"seat_id": "s", "declared_family": "PA",
-                            "thinking_level": "max", "candidates": ["m3"]},
+            "strategy": "independent", "minFamilies": 2,
+            "members": [{"model": "m2"}, {"model": "m3"}],
         },
-        # Distinct declared labels, same real provider -> same family token.
         "collide": {
-            "mode": "project-plan",
-            "min_families": 2,
-            "seats": [
-                {"seat_id": "a", "declared_family": "PB", "thinking_level": "max",
-                 "candidates": ["pb/m1"]},
-                {"seat_id": "b", "declared_family": "LooksDifferent",
-                 "thinking_level": "max", "candidates": ["pb/m2"]},
-            ],
-            "synthesizer": {"seat_id": "s", "declared_family": "PB",
-                            "thinking_level": "max", "candidates": ["pb/m1"]},
+            "strategy": "independent", "minFamilies": 2,
+            "members": [{"model": "pb/m1"}, {"model": "pb/m2"}],
         },
-        # No candidate is available at all.
         "none": {
-            "mode": "project-plan",
-            "min_families": 2,
-            "seats": [
-                {"seat_id": "a", "declared_family": "PA", "thinking_level": "max",
-                 "candidates": ["pa/m1"]},
-                {"seat_id": "b", "declared_family": "Ghost", "thinking_level": "max",
-                 "candidates": ["nope/nothing"]},
-            ],
-            "synthesizer": {"seat_id": "s", "declared_family": "PA",
-                            "thinking_level": "max", "candidates": ["pa/m1"]},
+            "strategy": "independent", "minFamilies": 2,
+            "members": [{"model": "pa/m1"}, {"model": "nope/nothing"}],
         },
     },
+    "personas": {},
 }
 
 
@@ -171,7 +109,7 @@ def main() -> int:
         print("SKIP: bun not on PATH; cannot execute the resolver extension")
         return 2
     if not RESOLVER.is_file():
-        print(f"[FAIL] resolver template missing: {RESOLVER}")
+        print(f"[FAIL] resolver missing: {RESOLVER}")
         return 1
     panel_module = omp_panel_module()
     if panel_module is None:
@@ -180,81 +118,67 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="r32-") as td:
         root = Path(td)
-        (root / ".fv").mkdir()
-        (root / ".fv" / "panel-profiles.json").write_text(
-            json.dumps(PROFILES, indent=2) + "\n")
         harness = root / "harness.ts"
+        settings = root / "panel-settings.json"
         harness.write_text(HARNESS_TS)
+        settings.write_text(json.dumps(PANEL_SETTINGS))
 
-        def run(profile: str, inject_panel: bool = True) -> dict:
+        def run(role: str, inject_panel: bool = True) -> dict:
             proc = subprocess.run(
-                ["bun", "run", str(harness), str(RESOLVER), str(root), profile,
-                 str(panel_module) if inject_panel else "none"],
-                capture_output=True, text=True, timeout=120)
-            line = (proc.stdout or "").strip().splitlines()
-            if not line:
-                return {"ok": False, "error": f"no output (rc={proc.returncode}): "
-                                             f"{proc.stderr[-400:]}"}
+                ["bun", "run", str(harness), str(RESOLVER), str(settings), role,
+                 str(panel_module), "yes" if inject_panel else "no"],
+                cwd=REPO, capture_output=True, text=True, timeout=120,
+            )
+            lines = (proc.stdout or "").strip().splitlines()
+            if not lines:
+                return {"ok": False, "error": f"no output (rc={proc.returncode}): {proc.stderr[-400:]}"}
             try:
-                return json.loads(line[-1])
+                return json.loads(lines[-1])
             except json.JSONDecodeError:
-                return {"ok": False, "error": f"unparseable: {line[-1][:300]}"}
+                return {"ok": False, "error": f"unparseable: {lines[-1][:300]}"}
 
         dup = run("dup")
-        check("resolver loads under Bun and registers fv_panel_resolve",
-              dup.get("ok") and dup.get("tool_name") == "fv_panel_resolve", dup)
+        check("resolver loads and reads a named OMP panel role",
+              dup.get("ok") and dup.get("tool_name") == "fv_panel_resolve"
+              and dup["roster"]["role"] == "dup", dup)
         if dup.get("ok"):
             seats = dup["roster"]["seats"]
-            # The regression: bare `model.id` would make both seats "m1".
-            check("duplicate bare id resolves to distinct provider-qualified selectors",
-                  [s["resolved_model"] for s in seats] == ["pa/m1", "pb/m1"], seats)
-            check("resolved_provider records the real model.provider",
-                  [s["resolved_provider"] for s in seats] == ["pa", "pb"], seats)
-            check("synthesizer is provider-qualified too",
+            check("duplicate bare ids stay provider-qualified",
+                  [seat["resolved_model"] for seat in seats] == ["pa/m1", "pb/m1"], seats)
+            check("declared quorum labels come from OMP resolved families",
+                  [seat["declared_family"] for seat in seats] == ["pa", "pb"], seats)
+            check("OMP family floor is carried into FV orchestration",
+                  dup["roster"]["min_families"] == 2, dup["roster"])
+            check("OMP lineup hash names the frozen FV panel",
+                  isinstance(dup["roster"].get("lineup_hash"), str)
+                  and len(dup["roster"]["lineup_hash"]) == 71, dup["roster"])
+            check("synthesizer resolves through the OMP model selector",
                   dup["roster"]["synthesizer"]["resolved_model"] == "pa/m1",
                   dup["roster"]["synthesizer"])
-            check("roster names the frozen lineup with OMP's content hash",
-                  isinstance(dup["roster"].get("lineup_hash"), str)
-                  and dup["roster"]["lineup_hash"].startswith("sha256:")
-                  and len(dup["roster"]["lineup_hash"]) == 71,
-                  dup["roster"].get("lineup_hash"))
-            check("thinking_level is carried per seat, unmodified",
-                  [s["thinking_level"] for s in seats] == ["max", "low"], seats)
-            check("resolver persists model-registry family identities for engine verification",
-                  [s["resolved_family"] for s in seats] == ["pa", "pb"], seats)
 
         hidden = run("hidden")
-        check("a resolvable model whose provider is absent is skipped "
-              "(availability keyed by provider/id, not bare id)",
+        check("OMP role candidates fall through in priority order",
               hidden.get("ok")
-              and hidden["roster"]["seats"][0]["resolved_model"] == "pa/m3",
+              and hidden["roster"]["seats"][0]["requested_selector"] == "pa/m3",
               hidden)
 
         bare = run("bare")
-        check("a bare candidate id is returned provider-qualified",
+        check("bare OMP model ids resolve to provider-qualified selectors",
               bare.get("ok")
-              and [s["resolved_model"] for s in bare["roster"]["seats"]] == ["pb/m2", "pa/m3"],
+              and [seat["resolved_model"] for seat in bare["roster"]["seats"]] == ["pb/m2", "pa/m3"],
               bare)
 
         collide = run("collide")
-        check("two seats on one real family are rejected despite distinct labels",
-              not collide.get("ok")
-              and "duplicate resolved model family" in collide.get("error", "")
-              and "seats" in collide.get("error", ""),
-              collide)
+        check("OMP rejects a panel role whose served families collide",
+              not collide.get("ok") and "duplicate resolved model family" in collide.get("error", ""), collide)
 
         none = run("none")
-        check("a seat with no available candidate fails closed",
-              not none.get("ok")
-              and "nope/nothing" in none.get("error", "")
-              and "unavailable" in none.get("error", ""),
-              none)
+        check("OMP rejects a panel role with no available candidate",
+              not none.get("ok") and "nope/nothing" in none.get("error", ""), none)
 
-        # The tool must not silently degrade on an OMP without the capability.
-        legacy = run("dup", inject_panel=False)
-        check("a harness without resolvePanelLineup fails closed with a capability error",
-              not legacy.get("ok") and "panelLineupFreeze" in legacy.get("error", ""),
-              legacy)
+        missing = run("dup", inject_panel=False)
+        check("missing OMP panel API fails closed",
+              not missing.get("ok") and "panelLineupFreeze" in missing.get("error", ""), missing)
 
     if FAILURES:
         print(f"\nR32: {len(FAILURES)} failure(s)")
@@ -264,4 +188,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

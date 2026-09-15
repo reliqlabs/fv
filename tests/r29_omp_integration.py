@@ -115,6 +115,12 @@ def main() -> int:
         check("unrelated config preserved", config.get("model") == "example/model")
         check("initializer enables isolated subagents",
               config.get("task", {}).get("isolation", {}).get("mode") == "auto", config)
+        panel_seed = json.loads((REPO / "templates" / "omp-panel.json").read_text())
+        check("initializer installs fv-canonical in OMP panel settings",
+              config.get("panel", {}).get("roles", {}).get("fv-canonical")
+              == panel_seed["roles"]["fv-canonical"], config.get("panel"))
+        check("initializer writes no FV-owned panel profile",
+              not (project / ".fv" / "panel-profiles.json").exists())
         config_text = (project / ".omp" / "config.yml").read_text()
         check("initializer preserves comments and YAML 1.2-like enum scalars",
               "# preserve this comment" in config_text and "codeMode: on" in config_text,
@@ -160,10 +166,12 @@ def main() -> int:
                 f"version = {version!r}",
                 f"contract = {json.dumps(payload)!r}",
                 f"catalog = {json.dumps(catalog)!r}",
+                f"panel = {json.dumps(panel_seed)!r}",
                 f"expected_cwd = {str(project.resolve())!r}",
                 "catalog_out = catalog if os.getcwd() == expected_cwd else '{\"models\": []}'",
                 "print(version if '--version' in sys.argv else "
-                "contract if '--agent-bridge-contract' in sys.argv else catalog_out)",
+                "contract if '--agent-bridge-contract' in sys.argv else "
+                "panel if 'config' in sys.argv and 'panel' in sys.argv else catalog_out)",
             ]) + "\n")
             path.chmod(0o755)
             return path
@@ -187,7 +195,7 @@ def main() -> int:
                   for item in checked_report["findings"]), checked.stdout)
         check("doctor accepts the first available canonical panel candidate",
               any(item["name"] == "omp-model-contract" and item["status"] == "ok"
-                      and "glm-5.2->fireworks/glm-5.2" in item["detail"]
+                      and "member-3->fireworks/glm-5.2" in item["detail"]
                       for item in checked_report["findings"]), checked.stdout)
 
         missing_capability = dict(contract)
