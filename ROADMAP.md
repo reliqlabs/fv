@@ -20,7 +20,8 @@ committed on `main`, one commit per item:
 | M3 live calibration | `calibration/2026-07-13-r1`: blinded seeded-defect run, six scoreable voices | done |
 | OMP-native integration | ModelRegistry-backed adversary fan-out, generated routes, fail-closed session-root gate, live-tree preflight, process-local fallback suppression, failure-isolated evidence, initializer/doctor support (R29/R30/R33) | implemented on `feature/omp-integration`; the canonical 4-voice run is recorded at `calibration/2026-07-28-r3/`. Native calibration remains pending at the route level: one voice is attested and cited; two are unattested and one degraded. |
 | OMP-native deliberation panel | Three-wave `fv-panel` skill (drafts → blinded cross-review → synthesis): family/coverage quorum, randomized-label blinding + deferred identity, brief + git target-drift gating (binary-safe, full-digest, `.fv`-excluded), harness-aware doctor, `project-plan` + `milestone-review` modes (R31, ~50 assertions incl. a real Gate B end-to-end; R32 resolver dispatch-identity contract executed under Bun) | committed on `feature/omp-integration`; **`project-plan` live-verified** project-rooted (`calibration/2026-07-23-omp-panel-e2e/`, 3-family COMPLETE) but uncalibrated; **`milestone-review` EXPERIMENTAL** — evidence-bound fail-closed guard + Gate B `--expect-intent`/`--snapshot-exact`/dup-rejection are correct and deterministically tested, but not yet run against a real project's itf_replay G1 records + live panel; roster-resolver extension live-verified in a real OMP session (`calibration/2026-07-24-resolver-live/`: `ctx.models.family` distinctness positive + negative, canonical `provider/id` dispatch identity, both active seats serving real inference at `:max`); active roster is Sol+GLM (min_families=2) with Fable/Kimi-k3 pending; full three-wave run on that roster and calibration pending |
-| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | delivered 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`, `8508604`, `5dc765e`, `d5ce1c2`, `dec002d`); code-adversarial pass and closure reviews complete; local and Gula CI PASS; real dossier dry run PASS with 0 unsupported/conflicts and unchanged `.colosseum`; no shadow state applied; advisory-closure wave uncommitted in the worktree with its validation pending |
+| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence, legacy ledgers gated before migration | delivered 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`, `8508604`, `5dc765e`, `d5ce1c2`, `dec002d`, `0fa4e22`, `368cae0`); code-adversarial pass and closure reviews complete; Gula `tests/run_all.py` 32/32 PASS and `scripts/ci.py` 6/6 PASS, executed over the current tree without `--tolerate-incomplete` |
+| Real-project readiness | Dry-run sweep over all ten legacy `.colosseum` projects the read-only inventory found under the deployment host's `~/Development` | 1 of 10 apply-ready (`zkdcap`); 9 blocked on operator-owned legacy-input defects in three classes (`#gate-a`, `#intent`, symlink); no `--apply` run against any project; recorded in `.fv/changes/2026-09-15-real-project-readiness.md` |
 
 Gate: `./scripts/ci.py` validates frontmatter, agent policy, roster drift,
 documentation links, dispatch configuration, fixture tracking, and the full
@@ -244,7 +245,7 @@ ignored files. Real build/run artifacts (a `target/` next to a Cargo.toml,
 `.fv/verify/`) stay tolerated. Verified off a fresh clone and on
 the live runner; both workflow jobs green.
 
-### Migration readiness — DELIVERED 2026-09-15 (commits f2d0556, 9eb3709, b1003a3, 8508604, 5dc765e, d5ce1c2, dec002d)
+### Migration readiness — DELIVERED 2026-09-15 (commits f2d0556, 9eb3709, b1003a3, 8508604, 5dc765e, d5ce1c2, dec002d, 0fa4e22, 368cae0)
 
 Authority for this work is the user-authorized migration requirements given in
 the session that produced these commits, not an intent revision: this repository
@@ -514,17 +515,21 @@ evidence parity sweep found no Gate B/dashboard exit-code or defect-text
 divergence, and their migration closure check found no new high/medium
 fail-open or data-loss issue. Full `scripts/ci.py` passes locally and on Gula.
 
-A read-only dry run against the real dossier project returned `status: ok`: 5
-mapped artifacts, 173 preserved-history files, 0 unsupported, 0 conflicts, and
-`docs/intent.md` as the elected target. The complete `.colosseum` digest was
-unchanged. **No real legacy project has been cut over:** no `--apply` was run,
-and migrated projects must still re-earn v3 evidence before Gate B can pass.
+Real-project dry runs are recorded below and, in full, in
+`.fv/changes/2026-09-15-real-project-readiness.md`. The earlier
+dossier-integration dry run that returned `status: ok` (5 mapped, 173
+preserved-history, 0 unsupported, 0 conflicts, `docs/intent.md` elected,
+`.colosseum` digest unchanged) predates `368cae0`; under the current migrator
+that same tree is blocked by one `.colosseum/ledger.md#gate-a` row.
+**No real legacy project has been cut over:** no `--apply` was run against any
+of the ten, and a migrated project must still re-earn v3 evidence before Gate B
+can pass.
 
-**Advisory closure wave — uncommitted, unvalidated.** A further wave sits in the
-working tree across `fv_project.py`, `tools/evidence-run.ts`, `fv_migrate.py`,
-`fv_init.py`, `fv_doctor.py`, `pyramid_run.py`, `check_evidence_records.py`,
+**Advisory closure wave — committed as `0fa4e22`.** It landed across
+`fv_project.py`, `tools/evidence-run.ts`, `fv_migrate.py`, `fv_init.py`,
+`fv_doctor.py`, `pyramid_run.py`, `check_evidence_records.py`,
 `check_ledger_references.py`, `coverage_dashboard.py`, their suites, and the
-trust documents. What it changes: `.fv/verified-inputs.txt` becomes a two-mode
+trust documents. What it changed: `.fv/verified-inputs.txt` becomes a two-mode
 policy (`mode: exclude`, still the default a directive-free file carries, or
 `mode: include` whose allowlist binds the policy file itself); the structural
 exclusions grow from six to nine with `.fv/changes/`, `.fv/attacks/`, and
@@ -539,11 +544,116 @@ unusable; and a recomputed Gate B run keeps the unqualified
 `VERIFIED[profile=...]` token while only a pinned or unbound run qualifies the
 scope.
 
-Validation of that wave is pending. The suites it touches, `scripts/ci.py`, and
-the doctor have not been re-run over it, so none of the PASS records above cover
-it, and no evidence in this repository is bound to it. The no-apply boundary is
-unchanged by it: still no `--apply` against a real legacy project, and a
-migrated project still has to re-earn v3 evidence before Gate B can pass.
+That wave and the legacy-ledger readiness gate (`368cae0`) are both covered by
+an executed validation run on Gula rather than an inferred one:
+`tests/run_all.py` reported **all 32 suites PASS** — the runner enumerates
+`tests/r*.py` + `tests/m*.py` minus itself and refuses a zero-suite run, so 32
+is the whole set — and `scripts/ci.py` reported **6 of 6 checks PASS**
+(`frontmatter`, `roster-drift`, `doc-links`, `dispatch-config`,
+`fixture-tracking`, `regression`), run **without** `--tolerate-incomplete`, so
+the regression check had to pass outright instead of being allowed to degrade
+to the toolchain-incomplete exit 3 a bare runner is permitted. The no-apply
+boundary is unchanged: still no `--apply` against a real legacy project, and a
+migrated project still re-earns v3 evidence before Gate B can pass.
+
+### Real-project migration readiness — 1 of 10 apply-ready (2026-09-15)
+
+`scripts/fv_migrate.py PROJECT` was run in dry-run mode, no `--apply`, against
+all ten legacy `.colosseum` projects a read-only inventory found under the
+deployment host's `~/Development`. Toolkit readiness and project readiness are
+separate facts and are kept separate here: the 32/32 suite run and the 6/6 CI
+run above say FV's migrator, gates, producer, and doctor behave as specified;
+they say nothing about whether any legacy tree's own bytes let it cross into
+`.fv/`. That second number is 1 of 10, and it moves only when an operator fixes
+a legacy tree.
+
+Every row is the current migrator, at `368cae0`:
+
+| Project | exit | status | mapped | preserved-history | unsupported rows | conflicts | elected `target_spec` |
+|---|---|---|---|---|---|---|---|
+| zkdcap | 0 | ok | 1 | 172 | 0 | 0 | `.fv/intent.md` |
+| dossier | 1 | blocked | 5 | 166 | 1 — `.colosseum/ledger.md#gate-a` | 0 | `docs/intent.md` |
+| dossier-integration | 1 | blocked | 5 | 173 | 1 — `.colosseum/ledger.md#gate-a` | 0 | `docs/intent.md` |
+| dossier-organization | 1 | blocked | 5 | 169 | 1 — `.colosseum/ledger.md#gate-a` | 0 | `docs/intent.md` |
+| clanked | 1 | blocked | not captured | not captured | 1 — `.colosseum#intent` | 0 | none elected |
+| colosseum | 1 | blocked | not captured | not captured | 1 — `.colosseum#intent` | 0 | none elected |
+| dens | 1 | blocked | not captured | not captured | 1 — `.colosseum#intent` | 0 | none elected |
+| travel | 1 | blocked | not captured | not captured | 1 — `.colosseum#intent` | 0 | none elected |
+| quartz | 1 | blocked | not captured | not captured | 2 — `.colosseum#intent` + `.colosseum/ledger.md#gate-a` | 0 | none elected |
+| verified-rcv | 1 | blocked | not captured | not captured | 6 — five `.colosseum/attacks/…` symlink rows + `.colosseum/ledger.md#gate-a` | 0 | `.fv/intent.md` |
+
+`mapped` / `preserved-history` read "not captured" where the run reported them
+but the counts were not carried into the record; a `--json` re-run completes
+those cells rather than a guess filling them. Conflicts are zero on all ten: no
+destination crossed a symlinked path component and none existed with different
+content, so every blocker is input-side.
+
+**Three blocker classes, fifteen rows across the nine blocked projects.**
+
+1. `.colosseum/ledger.md#gate-a` — dossier, dossier-integration,
+   dossier-organization, quartz, verified-rcv. `368cae0` runs the extension's
+   own `check_ledger_references.py` over the legacy ledger with
+   `--root PROJECT` at default strictness, loaded from its own path and called
+   in-process so a project's stale `.fv/scripts/` copy cannot decide readiness,
+   and only exit 0 permits the mapping. All five rows are a returned rejection
+   of the bytes, not an infrastructure failure of the check (the row
+   distinguishes the two). Refusal classes observed: `missing required content
+   hash`, `cited line is empty or comment-only`, an unparseable valueless
+   `code:` annotation, and a malformed `@sha256:` binding.
+2. `.colosseum#intent` — clanked, colosseum, dens, travel, quartz. No
+   `.colosseum/intent.md` and no document citing an existing canonical intent,
+   so the migrated project would declare no `target_spec` and nothing could
+   resolve a target. Election is stub-first, ledger-citations second; zero
+   candidates block, and so do two or more.
+3. `symlink` — verified-rcv only, five files under
+   `.colosseum/attacks/intent-v0.3.0-2026-05-16T121229Z/`
+   (`shell-glm-4-7-flash.md`, `shell-google-gemma-4-26b-a4b.md`,
+   `shell-kimi-k2-6.md`, `shell-mistral-small-4-119b-2603.md`,
+   `shell-qwen3.6-27b-mlx.md`). Copying one would duplicate its target's bytes
+   under a second identity; preserving it would put a dangling link in history.
+
+**Old Gate A versus current Gate A.** The three dossier ledgers pass each
+project's own copied gate and fail the current one on the same bytes: copied
+gate exit 0 (`OK: 138` / `147` / `139` citations, 41 dependency links, 8 axiom
+annotations) against current gate exit 1 (`GATE FAILED: 39` / `39` / `36`
+failures). Quartz and verified-rcv carry no copied gate at all and fail the
+current one. The copies are of an older CLI vintage too — invoked as
+`<ledger> --root <root>` they exit 2 with `unrecognized arguments`, since they
+want `--ledger LEDGER` — which is exactly the hazard `368cae0` closes. So this
+is an explicit contract upgrade, not a regression and not a parser crash: the
+pre-`368cae0` inventory read `status: ok` for those three trees, and the
+current run blocks them on one new check applied to bytes that were always this
+way.
+
+**No-write / no-apply boundary.** All ten runs were dry runs; a dry run writes
+nothing anywhere; `.colosseum/` is read-only in every mode; the inventory was
+read-only; a blocked run refuses before proposing any write, so the nine
+blocked projects never reached a write plan. zkdcap is apply-ready and **not
+applied** — `--apply` against a real legacy project remains unexercised, and no
+shadow state exists in any of the ten projects.
+
+**Remediation, all operator-owned (owner: user).** Re-running the migrator
+without fixing inputs reproduces the same refusals.
+
+- **R1 — regenerate or fix ledger citations** (dossier, dossier-integration,
+  dossier-organization, quartz, verified-rcv): read the full `#gate-a` row via
+  `fv_migrate.py PROJECT --json`, content-bind every citation
+  (`check_ledger_references.py --suggest-hashes` prints each required
+  `@sha256:<12hex>`), re-point citations landing on empty or comment-only
+  lines, repair each valueless `code:` annotation, re-root any citation written
+  relative to `.colosseum/`, then re-run. The migration validates readiness and
+  never rewrites a ledger.
+- **R2 — declare a canonical intent** (clanked, colosseum, dens, travel,
+  quartz): add a `.colosseum/intent.md` stub citing the one canonical
+  `*intent.md` under the project root, or author that intent first
+  (`fv-reverse-intent`) and then declare it. Exactly one surviving candidate is
+  required.
+- **R3 — resolve the five verified-rcv symlinks, operator decision**: replace
+  each link with its target's real bytes, or delete links whose targets are
+  already preserved elsewhere. The migrator picks neither, deliberately.
+
+quartz carries R1 and R2; verified-rcv carries R1 and R3. Both must clear before
+either reaches `status ok`, and one re-run reports both.
 
 ## Suggested sequence
 
@@ -551,6 +661,11 @@ W1, W2, and W5 are done; W3 waits on a discriminating W2-iteration corpus.
 The repo is pushed and CI is green, so W4 now waits only on an external
 party picking up `docs/replication-protocol.md`. Remaining W6 items land
 whenever their inputs appear (account fix, ds4 endpoint, Google credential).
+
+Migration work is now input-bound rather than code-bound: nine of the ten real
+legacy projects wait on R1/R2/R3 in their own trees (see "Real-project
+migration readiness"), and zkdcap is the one `--apply` candidate whenever the
+operator wants the first real cutover.
 
 ## Provenance
 
