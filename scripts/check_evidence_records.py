@@ -58,6 +58,13 @@ OBLIGATION_COLLECTIONS: tuple[tuple[str, str], ...] = (
     ("system_claims", "system_claim"),
 )
 CLAIM_DEPENDENCY_KINDS = frozenset({"invariant", "witness"})
+# The freshness discipline of an unqualified run: the gate recomputed both the
+# verified-input snapshot and the intent hash itself. The weaker disciplines
+# (operator-pinned, or skipped under --allow-unbound) are a different claim and
+# qualify the verdict scope; this one is the established wire default and adds
+# nothing, so a consumer matching VERIFIED[profile=...] can never read a weaker
+# run as this one.
+DEFAULT_BINDING = "recomputed"
 # An assumed or unverified class asserts nothing about the system: PASSing on it
 # requires an explicit waiver, wherever in the record the class appears.
 ASSUMED_CLASSES = frozenset({"externally-assumed", "unverified"})
@@ -863,10 +870,10 @@ def main() -> int:
     required = sorted(dict.fromkeys(required))
     repo_root = args.root.resolve() if args.root else infer_repo_root(args.records)
     intent_path: str | None = None
-    # The verdict must say which freshness discipline produced it: a pinned or
-    # unbound run is not the same claim as a recomputed one.
+    # The report always names the freshness discipline that produced it: a pinned
+    # or unbound run is not the same claim as a recomputed one.
     pinned = args.expect_snapshot is not None or args.expect_intent is not None
-    binding = "unbound" if args.allow_unbound else ("pinned" if pinned else "recomputed")
+    binding = "unbound" if args.allow_unbound else ("pinned" if pinned else DEFAULT_BINDING)
     if not args.allow_unbound:
         try:
             if args.expect_snapshot is None:
@@ -954,7 +961,15 @@ def main() -> int:
         verdict, code = "INCOMPLETE", 3
     else:
         profiles = sorted({by_claim[claim]["bindings"]["profile"] for claim in required})
-        verdict = f"VERIFIED[profile={'/'.join(profiles)}; binding={binding}]"
+        # The default discipline keeps the established token byte for byte; only a
+        # weaker one qualifies it. A consumer pinned to VERIFIED[profile=...] thus
+        # keeps reading recomputed runs and stops matching pinned or unbound ones,
+        # instead of silently accepting all three. The full mode is in the report's
+        # `binding` field either way.
+        scope = f"profile={'/'.join(profiles)}"
+        if binding != DEFAULT_BINDING:
+            scope += f"; binding={binding}"
+        verdict = f"VERIFIED[{scope}]"
         if waived:
             verdict += f" (waived: {','.join(sorted(waived))})"
         code = 0

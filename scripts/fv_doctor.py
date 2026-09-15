@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import yaml
@@ -79,7 +80,15 @@ def load_module(name: str, path: Path):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # The module must be visible in sys.modules while its own body executes:
+    # a @dataclass (or anything else resolving cls.__module__ during class
+    # creation) fails outright when its defining module cannot be looked up.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return module
 
 
@@ -296,19 +305,65 @@ def check_canonical_target(report: Report, project: Path) -> None:
         "; ".join([*drift, 'rerun fv_init.py to store "." and a repo-relative target'])
         if drift else "dispatch paths survive a clone or a move",
     )
-    # The frozen defaults always apply, so the only real drift the doctor can
-    # report here is a project list it cannot parse.
+    # The structural defaults always apply, so the drift the doctor reports
+    # here is a project list it cannot parse. The mode belongs in the detail:
+    # "N exclusion prefix(es)" says nothing about a project whose snapshot is
+    # actually an allowlist.
     try:
-        effective = helper.load_exclusions(project)
+        policy = helper.load_policy(project)
     except (helper.ProjectError, OSError) as error:
         report.add("project", "verified-inputs", "fail", str(error))
     else:
         seeded = (project / helper.VERIFIED_INPUTS_RELATIVE).is_file()
+        if policy.mode == helper.MODE_INCLUDE:
+            scope = (f"include mode, {len(policy.selectors())} selected "
+                     f"path(s) including the policy itself, "
+                     f"{len(policy.structural)} structural exclusion(s)")
+        else:
+            scope = (f"exclude mode, {len(policy.exclusions())} exclusion "
+                     f"prefix(es), {len(policy.prefixes)} declared")
         report.add(
             "project", "verified-inputs", "ok",
-            f"{len(effective)} exclusion prefix(es)"
+            scope
             + ("" if seeded else f"; {helper.VERIFIED_INPUTS_RELATIVE} absent, defaults apply"),
         )
+
+
+def check_verification_plan(report: Report, project: Path) -> None:
+    """A present plan must load under the runner that auto-discovers it.
+
+    `pyramid_run.py` reads <project>/.fv/verification-plan.json with no flag,
+    so a plan the runner would reject is a broken gate, not a dormant file:
+    every run of this project is ERROR until it is fixed. The doctor says so
+    here instead of letting the next verification run discover it."""
+    try:
+        runner = load_module("pyramid_run", REPO / "scripts" / "pyramid_run.py")
+    except (OSError, RuntimeError, ImportError, SyntaxError) as error:
+        report.add("project", "verification-plan", "fail",
+                   f"cannot load scripts/pyramid_run.py: {error}")
+        return
+    relative = runner.PLAN_RELATIVE
+    discovered = runner.discover_plan(project)
+    if discovered is None:
+        report.add("project", "verification-plan", "ok",
+                   f"{relative} absent; pyramid_run.py uses the built-in "
+                   "layer defaults")
+        return
+    try:
+        plan = runner.load_plan(discovered, project)
+    except runner.PlanError as error:
+        report.add("project", "verification-plan", "fail",
+                   f"{relative} is present but unusable, so every "
+                   f"pyramid_run.py run of this project is ERROR: {error}")
+        return
+    layers = plan["layers"]
+    gating = [name for name, spec in layers.items() if spec["required"]]
+    custom = [name for name in layers if name not in runner.LAYER_ORDER]
+    detail = (f"{relative} loads as {plan['schema']}: {len(layers)} layer(s) "
+              f"auto-discovered, gating {', '.join(gating) or 'none'}")
+    if custom:
+        detail += f"; custom layer(s) {', '.join(custom)}"
+    report.add("project", "verification-plan", "ok", detail)
 
 
 def check_project(report: Report, project: Path) -> None:
@@ -351,6 +406,7 @@ def check_project(report: Report, project: Path) -> None:
         "; ".join(errors) if errors else "omp_native block valid",
     )
     check_canonical_target(report, project)
+    check_verification_plan(report, project)
 
     config_path = project / ".omp" / "config.yml"
     try:

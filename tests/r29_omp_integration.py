@@ -10,12 +10,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "scripts"))
+import fv_project  # noqa: E402  the initializer's own verified-input policy API
+
 FAILURES: list[str] = []
 AGENTS = {
     "fv-panelist",
@@ -40,6 +44,115 @@ def frontmatter(path: Path) -> dict:
     text = path.read_text()
     _, block, _ = text.split("---", 2)
     return yaml.safe_load(block)
+
+
+def policy_project(temporary: Path, name: str) -> tuple[Path, list[str]]:
+    """A scaffolded project plus the initializer command that produced it.
+
+    Each policy case gets its own project: the initializer's treatment of an
+    include-mode file is about what it leaves alone, which a project other
+    assertions keep mutating cannot show.
+    """
+    project = temporary / name
+    project.mkdir(parents=True)
+    (project / "intent.md").write_text("# Intent\n")
+    command = [
+        "uv", "run", "--script", str(REPO / "scripts" / "fv_init.py"), str(project),
+        "--target-spec", str(project / "intent.md"),
+    ]
+    first = subprocess.run(command, capture_output=True, text=True)
+    check(f"initializer scaffolds {name}", first.returncode == 0, first.stdout + first.stderr)
+    return project, command
+
+
+def test_policy_default_file_is_exclusion_mode(temporary: Path) -> None:
+    project, _ = policy_project(temporary, "policy-default")
+    text = (project / ".fv" / "verified-inputs.txt").read_text()
+    policy = fv_project.load_policy(project)
+    check("initializer seeds an explicit exclusion-mode policy",
+          fv_project.mode_directive(fv_project.MODE_EXCLUDE) + "\n" in text
+          and policy.mode == fv_project.MODE_EXCLUDE, text)
+    check("initializer seeds every frozen structural exclusion, lifecycle reports included",
+          list(policy.prefixes) == list(fv_project.DEFAULT_EXCLUSIONS)
+          and {".fv/changes/", ".fv/attacks/", ".fv/code-adversarial/"}
+          <= set(policy.prefixes), text)
+    check("initializer scaffolds a directory for every lifecycle report it excludes",
+          all((project / prefix).is_dir() for prefix in
+              (".fv/changes", ".fv/attacks", ".fv/code-adversarial", ".fv/panels",
+               ".fv/verify", ".fv/evidence")),
+          sorted(path.name for path in (project / ".fv").iterdir()))
+    check("a lifecycle report is not a verified input",
+          not policy.selects(".fv/changes/2026-09-15-change.md")
+          and not policy.selects(".fv/code-adversarial/report-1.md")
+          and not policy.selects(".fv/attacks/attack-1.md")
+          and policy.selects("intent.md"), policy.exclusions())
+
+
+def test_policy_include_mode_is_preserved(temporary: Path) -> None:
+    project, command = policy_project(temporary, "policy-include")
+    verified_inputs = project / ".fv" / "verified-inputs.txt"
+    declared = (
+        "# Allowlist: only these paths can change a verification verdict.\n"
+        "mode: include\n"
+        "intent.md\n"
+        "crates/\n"
+    )
+    verified_inputs.write_text(declared)
+    rerun = subprocess.run(command, capture_output=True, text=True)
+    check("initializer rerun preserves an include-mode policy byte for byte",
+          rerun.returncode == 0 and verified_inputs.read_text() == declared,
+          rerun.stdout + verified_inputs.read_text())
+    # An include entry names a path *in* scope, so appending FV's exclusion prefixes
+    # would declare generated output to be verified input.
+    check("initializer appends no exclusion prefix to an include-mode policy",
+          not any(prefix in verified_inputs.read_text()
+                  for prefix in fv_project.DEFAULT_EXCLUSIONS),
+          verified_inputs.read_text())
+    forced = subprocess.run([*command, "--force"], capture_output=True, text=True)
+    check("--force does not replace an include-mode policy with exclusion defaults",
+          forced.returncode == 0 and verified_inputs.read_text() == declared,
+          forced.stdout + verified_inputs.read_text())
+    policy = fv_project.load_policy(project)
+    check("the preserved policy still parses as the declared allowlist",
+          policy.mode == fv_project.MODE_INCLUDE
+          and list(policy.prefixes) == ["intent.md", "crates/"]
+          and policy.selects("crates/lib.rs") and not policy.selects("README.md"),
+          policy)
+    check("the preserved allowlist still selects itself, so revising it moves the snapshot",
+          policy.selects(fv_project.VERIFIED_INPUTS_RELATIVE), policy.selectors())
+    check("structural exclusions still apply under the preserved allowlist",
+          not policy.selects(".fv/evidence/records/W1.json")
+          and not policy.selects(".fv/changes/2026-09-15-change.md"), policy.structural)
+
+
+def test_policy_unparseable_file_needs_force(temporary: Path) -> None:
+    project, command = policy_project(temporary, "policy-invalid")
+    verified_inputs = project / ".fv" / "verified-inputs.txt"
+    broken = "mode: allowlist\ncrates/\n"
+    verified_inputs.write_text(broken)
+    refused = subprocess.run(command, capture_output=True, text=True)
+    check("initializer refuses an unparseable policy and names the defect",
+          refused.returncode == 1 and "unknown mode 'allowlist'" in refused.stdout
+          and verified_inputs.read_text() == broken,
+          refused.stdout + refused.stderr)
+    replaced = subprocess.run([*command, "--force"], capture_output=True, text=True)
+    check("--force replaces an unparseable policy with the exclusion-mode default",
+          replaced.returncode == 0
+          and fv_project.load_policy(project).mode == fv_project.MODE_EXCLUDE
+          and list(fv_project.load_policy(project).prefixes)
+          == list(fv_project.DEFAULT_EXCLUSIONS),
+          replaced.stdout + verified_inputs.read_text())
+
+
+def test_policy_empty_include_is_refused(temporary: Path) -> None:
+    project, command = policy_project(temporary, "policy-empty-include")
+    verified_inputs = project / ".fv" / "verified-inputs.txt"
+    empty = "mode: include\n"
+    verified_inputs.write_text(empty)
+    refused = subprocess.run(command, capture_output=True, text=True)
+    check("initializer refuses an allowlist that names no path, leaving it in place",
+          refused.returncode == 1 and "names no path" in refused.stdout
+          and verified_inputs.read_text() == empty, refused.stdout + refused.stderr)
 
 
 def main() -> int:
@@ -252,6 +365,52 @@ def main() -> int:
               any(item["name"] == "fv_project.py" and item["status"] == "ok"
                   for item in checked_report["findings"]), checked.stdout)
 
+        # pyramid_run.py auto-discovers <project>/.fv/verification-plan.json,
+        # so a plan the runner cannot use is a broken gate the doctor owns:
+        # every verification run of that project is ERROR until it is fixed.
+        def run_doctor() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["uv", "run", "--script", str(doctor), "--project", str(project),
+                 "--omp", str(omp_stub), "--json"],
+                env={**os.environ, "FV_ROOT": str(REPO)},
+                capture_output=True, text=True)
+
+        def plan_finding(result: subprocess.CompletedProcess) -> dict:
+            return next((item for item in json.loads(result.stdout)["findings"]
+                         if item["name"] == "verification-plan"), {})
+
+        check("doctor reports an absent verification plan as built-in defaults",
+              plan_finding(checked).get("status") == "ok"
+              and "absent" in plan_finding(checked).get("detail", ""),
+              checked.stdout)
+        plan_path = project / ".fv" / "verification-plan.json"
+        plan_path.write_text(json.dumps({
+            "schema": "fv-verification-plan/v1",
+            "layers": {
+                "types": {"required": True, "executions": [
+                    {"argv": ["cargo", "check"], "cwd": ".",
+                     "timeout_seconds": 600}]},
+                "quint": {"required": True, "executions": [
+                    {"argv": ["quint", "typecheck", "spec.qnt"], "cwd": ".",
+                     "timeout_seconds": 600}]},
+            },
+        }, indent=2) + "\n")
+        planned = run_doctor()
+        planned_finding = plan_finding(planned)
+        check("doctor loads the project's verification plan",
+              planned.returncode == 0 and planned_finding.get("status") == "ok"
+              and "2 layer(s)" in planned_finding.get("detail", "")
+              and "quint" in planned_finding.get("detail", ""), planned.stdout)
+        plan_path.write_text("{not json")
+        unusable = run_doctor()
+        unusable_finding = plan_finding(unusable)
+        check("doctor fails on a verification plan the runner cannot use",
+              unusable.returncode == 1
+              and unusable_finding.get("status") == "fail"
+              and "malformed JSON" in unusable_finding.get("detail", ""),
+              unusable.stdout)
+        plan_path.unlink()
+
         missing_capability = dict(contract)
         missing_capability.pop("perCallTimeout")
         bad_capability_stub = write_omp_stub(
@@ -383,6 +542,11 @@ def main() -> int:
               and "unsupported inline task syntax" in inline_mode.stdout
               and config_path.read_text() == inline_config,
               inline_mode.stdout + inline_mode.stderr)
+
+        test_policy_default_file_is_exclusion_mode(Path(temporary))
+        test_policy_include_mode_is_preserved(Path(temporary))
+        test_policy_unparseable_file_needs_force(Path(temporary))
+        test_policy_empty_include_is_refused(Path(temporary))
 
     quickstart = (REPO / "QUICKSTART.md").read_text()
     for skill in sorted(path.parent.name for path in (REPO / "skills").glob("*/SKILL.md")):

@@ -122,9 +122,20 @@ Every write lands under `.fv/`:
   whose `required_evidence` is its `layers`; each distinct target is synthesized
   as an invariant, or as a witness when its prefix is `proptest`/`test`.
 - `.colosseum/evidence/runs/layer-runs.json` to `.fv/verification-plan.json`.
-- `.fv/verified-inputs.txt` with FV's conservative exclusion defaults, which
-  include `.fv/history/`. The legacy file is an include list, the exact opposite,
-  so it is kept as history rather than inverted.
+- `.fv/verified-inputs.txt`. The legacy file is already an include list and FV
+  include mode means the same thing, so it is translated rather than inverted:
+  the policy is written with `mode: include` first, every legacy source root is
+  kept verbatim, an entry naming a legacy manifest binds the FV artifact its
+  content migrated to (`.colosseum/obligations.json` and
+  `.colosseum/g1-claims.json` bind `.fv/obligations.json`), and the elected
+  canonical target, whichever of `.fv/obligations.json` and
+  `.fv/verification-plan.json` this run wrote, and the policy file itself are
+  bound too. An entry naming legacy bytes that migrate to history alone binds
+  nothing and is reported as a `#<entry>` deviation row; a legacy list that
+  does not parse, declares no entries, or has no entry left to translate blocks
+  the migration rather than publishing a policy that binds nothing a layer
+  reads. The exact legacy list is kept as history either way. A legacy tree
+  with no include list gets FV's conservative exclusion defaults instead.
 - `.fv/dispatch.json` with `project_root` `"."` and a repo-relative
   `target_spec`. This is the one destination adopted rather than refused: an
   existing route keeps every other field, other `omp_native` keys and other
@@ -214,12 +225,15 @@ uv run --script "$FV_ROOT/scripts/fv_init.py" /absolute/path/to/project
 It merges the FV checkout into `.omp/config.yml` `extensions:`, installs
 `fv-canonical` under OMP's `panel.roles`, copies the Gate A/B validators and
 `fv_project.py` into `.fv/scripts/`, and writes `.fv/harness`. Without
-`--target-spec` it preserves the migrated `target_spec`, and it only appends
-exclusion defaults missing from `.fv/verified-inputs.txt`. Do not pass `--force`
-after a migration: it replaces FV-owned state, including the migrated dispatch
-target. `.fv/history/` survives `--force` because it is one of the structural
-exclusion defaults rather than a line the migration alone wrote. Then run
-`/reload-plugins` in every already-running OMP session.
+`--target-spec` it preserves the migrated `target_spec`, and it leaves the
+migrated `.fv/verified-inputs.txt` alone: an include-mode policy is skipped byte
+for byte, `--force` included, since appending FV's exclusion prefixes to an
+allowlist would declare generated output to be verified input. Only an
+exclusion-mode file gains the structural defaults it dropped. Do not pass
+`--force` after a migration: it replaces FV-owned state, including the migrated
+dispatch target. `.fv/history/` survives `--force` because it is one of the
+structural exclusion defaults rather than a line the migration alone wrote. Then
+run `/reload-plugins` in every already-running OMP session.
 
 ### Review the converted claims and the verification plan
 

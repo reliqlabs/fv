@@ -128,7 +128,21 @@ def load_target_resolver(project: str | Path) -> ModuleType:
         if spec is None or spec.loader is None:
             continue
         loaded = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(loaded)
+        # The module must be visible in sys.modules while its own body runs:
+        # a ``@dataclass`` (or anything else resolving ``cls.__module__``
+        # during class creation) fails outright when its defining module
+        # cannot be looked up. Same contract as ``fv_doctor.load_module``; a
+        # failed exec leaves sys.modules exactly as it was found.
+        previous = sys.modules.get(_RESOLVER_MODULE)
+        sys.modules[_RESOLVER_MODULE] = loaded
+        try:
+            spec.loader.exec_module(loaded)
+        except BaseException:
+            if previous is None:
+                sys.modules.pop(_RESOLVER_MODULE, None)
+            else:
+                sys.modules[_RESOLVER_MODULE] = previous
+            raise
         _resolver_cache[key] = loaded
         return loaded
     try:

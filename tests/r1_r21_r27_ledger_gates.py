@@ -29,9 +29,12 @@ per-link coverage; every valid dossier form (`snake_case` harness,
 locator, parenthesised bound, closed-list skip) still passes. A
 `Depends on:` block closes at a blank
 line or a heading, so a later unrelated bullet list is not counted as
-trust-chain links, while a loose list nested under the header is; a
-post-blank bullet at the header's own indentation is deliberately NOT
-reopened, and both sides of that trade are pinned here.
+trust-chain links, while a loose list nested under the header is. The
+blank between the header and its first list is the header's own
+paragraph break, so the flagship shape (header, blank, flush list)
+opens the block; once an entry has been read, a post-blank bullet at
+the header's own indentation is deliberately NOT reopened, and both
+sides of that trade are pinned here.
 
 Gate B (semantic evidence, check_evidence_records.py):
 R27: a G1 record missing any binding field (or the waiver key) is
@@ -379,6 +382,60 @@ def main() -> int:
         check("R1: indenting the continuation under the header restores the link",
               code == 0 and "Trust-chain links: 2" in out, out[-400:])
 
+        # ── legacy spacing: the header's own paragraph break ────────────
+        # The flagship Markdown dossier writes the header, a blank line,
+        # then the entry list flush with the header. No entry has been
+        # read at that blank, so it is the header's paragraph break, not
+        # a block close: the first list after the header IS the block,
+        # flush or indented.
+        header_paragraph_break = (
+            "## Cross-component link — attestation binds the handle\n"
+            "\n"
+            "**Depends on:**\n"
+            "\n"
+            f"- L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+            f"- L2 at `src/guard.rs:5@sha256:{h5}` kani: harness_check\n"
+            f"- L3 at `src/guard.rs:1@sha256:{h1}` kani: harness_check\n"
+        )
+        code, out = gate_a(root, header_paragraph_break, "--strict-kani")
+        check("F11: blank after the header is its paragraph break — a flush "
+              "list still opens the block",
+              code == 0 and "Trust-chain links: 3" in out
+              and "trust-chain link without" not in out, out[-400:])
+
+        # …and that permission does not reopen F11: once the first entry
+        # has been read, the next blank closes the block exactly as
+        # before, so a later unrelated list is still not counted.
+        break_then_unrelated = (
+            "**Depends on:**\n"
+            "\n"
+            f"- L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+            f"- L2 at `src/guard.rs:5@sha256:{h5}` kani: harness_check\n"
+            "\n"
+            "- unrelated follow-up bullet\n"
+            "- another unrelated bullet\n"
+        )
+        code, out = gate_a(root, break_then_unrelated, "--strict-kani")
+        check("F11: after the paragraph break, a blank still closes the block "
+              "(later bullets are not links)",
+              code == 0 and "Trust-chain links: 2" in out
+              and "trust-chain link without" not in out, out[-400:])
+
+        # Only blanks are skipped: prose between header and list closes
+        # the block, so the permission cannot reach past a paragraph and
+        # adopt some unrelated list further down the section.
+        prose_between = (
+            "**Depends on:**\n"
+            "\n"
+            "Dependencies are recorded in the table above.\n"
+            "\n"
+            f"- unrelated bullet at `src/guard.rs:2@sha256:{h}` {KANI_OK}\n"
+        )
+        code, out = gate_a(root, prose_between, "--strict-kani")
+        check("F11: prose between header and list closes the block",
+              code == 0 and "Trust-chain links: 0" in out
+              and "trust-chain link without" not in out, out[-400:])
+
         # ── dossier-shaped citation forms (explicit parser) ─────────────
         # A real fv-compose Step 3 dependency entry: bold block header,
         # `at` citations, one fully backticked `code:` annotation, one
@@ -469,7 +526,10 @@ def main() -> int:
     code, out = gate_b(valid, "--require", "B1,W1")
     check("Gate B: valid records for all required claims -> exit 0", code == 0,
           out[-300:])
-    check("Gate B: verdict scope names the profile and the freshness binding",
+    # This helper always passes --allow-unbound, so the scope must carry the
+    # qualifier that marks the weaker discipline: only the default recomputed
+    # run (r6_manifest_failclosed) emits the bare VERIFIED[profile=...] token.
+    check("Gate B: an unbound run qualifies the verdict scope with its binding mode",
           "VERIFIED[profile=bounded; binding=unbound]" in out
           and "VERDICT: VERIFIED\n" not in out)
 

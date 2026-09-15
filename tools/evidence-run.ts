@@ -12,13 +12,29 @@ const PASS_MARKERS: Record<string, RegExp> = {
 	unverified: /--- fv-evidence: exit=0 ---/,
 };
 
-/** Generated FV output, including quarantined legacy history and in-flight migration
- * staging. Never part of the verified-input snapshot, so producing and committing
- * evidence cannot invalidate the records it just wrote, quarantining more history cannot
- * invalidate live evidence, and a killed migration's staging residue cannot either.
+/** Generated FV output, including lifecycle reports, quarantined legacy history, and
+ * in-flight migration staging. Never part of the verified-input snapshot, so producing
+ * and committing evidence cannot invalidate the records it just wrote, writing the change
+ * record / attack log / code-adversarial report a run produces cannot stale that run's
+ * evidence, quarantining more history cannot invalidate live evidence, and a killed
+ * migration's staging residue cannot either. Applied under an include policy too, so an
+ * allowlist naming `.fv/` cannot pull generated output back in.
  * Mirrors `fv_project.DEFAULT_EXCLUSIONS`. */
-const DEFAULT_EXCLUSIONS = [".fv/evidence/", ".fv/verify/", ".fv/panels/", ".fv/history/",
-	".fv/.migrate-staging/", ".colosseum/"];
+const DEFAULT_EXCLUSIONS = [".fv/evidence/", ".fv/verify/", ".fv/panels/", ".fv/changes/",
+	".fv/attacks/", ".fv/code-adversarial/", ".fv/history/", ".fv/.migrate-staging/",
+	".colosseum/"];
+/** Verified-input policy modes. `exclude` is the historical shape and what a file with no
+ * directive means, so every list written before include mode existed keeps its meaning.
+ * Mirrors `fv_project.MODE_EXCLUDE` / `fv_project.MODE_INCLUDE`. */
+const MODE_EXCLUDE = "exclude";
+const MODE_INCLUDE = "include";
+const POLICY_MODES: readonly string[] = [MODE_EXCLUDE, MODE_INCLUDE];
+/** A mode directive is the first non-comment line or nothing. `mode: include` is the
+ * canonical spelling; `mode:include` and interior padding parse the same. A line whose
+ * lowercased head is this prefix but whose value names no known mode is rejected rather
+ * than read as a path entry. Mirrors `fv_project.MODE_DIRECTIVE_PREFIX`. */
+const MODE_DIRECTIVE_PREFIX = "mode:";
+const VERIFIED_INPUTS_RELATIVE = ".fv/verified-inputs.txt";
 const DEFAULT_TARGET_SPEC = ".fv/intent.md";
 const NUL = new Uint8Array([0]);
 /** Mirrors `EVIDENCE_TOOL_ID` in `scripts/check_evidence_records.py`: a cohort's tool
@@ -191,29 +207,81 @@ async function resolveCanonicalTarget(projectRoot: string): Promise<{ absolute: 
 	return { absolute: real, relative: path.relative(projectRoot, real).split(path.sep).join("/") };
 }
 
-/** Exclusion prefixes: the generated-output defaults unioned with
- * `.fv/verified-inputs.txt`. Mirrors `fv_project.load_exclusions`. Exported so the
- * differential fixtures in `tests/r34_evidence_run.py` can hold this parser and
- * `fv_project.load_exclusions` to one accept/reject rule character by character. */
-export async function loadExclusions(projectRoot: string): Promise<string[]> {
-	const listFile = Bun.file(path.join(projectRoot, ".fv", "verified-inputs.txt"));
-	const exclusions = [...DEFAULT_EXCLUSIONS];
-	if (!(await listFile.exists())) return exclusions;
-	let text: string;
-	try {
-		// `ignoreBOM` keeps a leading U+FEFF in the string, as Python's utf-8 decode does,
-		// so the scan below can reject it; `fatal` makes invalid UTF-8 a rejection instead
-		// of a U+FFFD the gate would never see. Both mirror `Path.read_text("utf-8")`.
-		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
-			.decode(await listFile.arrayBuffer());
-	} catch (error) {
-		throw new Error(`cannot read .fv/verified-inputs.txt: ${error instanceof Error ? error.message : String(error)}`);
+/** A project's verified-input policy: how git candidates become verified inputs.
+ * `mode` is `exclude` (the historical shape, and what a file with no directive means) or
+ * `include`; `prefixes` are the declared entries in file order; `structural` are the
+ * generated-output prefixes that apply in either mode and that no project file drops.
+ * Mirrors `fv_project.InputPolicy`. */
+export type InputPolicy = {
+	mode: string;
+	prefixes: string[];
+	structural: string[];
+};
+
+/** The canonical directive lines, the only two spellings a policy file is rendered with.
+ * Mirrors `fv_project.mode_directive`. */
+const INCLUDE_DIRECTIVE = `${MODE_DIRECTIVE_PREFIX} ${MODE_INCLUDE}`;
+const EXCLUDE_DIRECTIVE = `${MODE_DIRECTIVE_PREFIX} ${MODE_EXCLUDE}`;
+
+/** The mode a directive line names, or null when the line is not one. The prefix is
+ * matched case-insensitively over exactly its own length, so recognition is length-stable
+ * in both languages. Mirrors `fv_project._directive_value`. */
+function directiveValue(line: string): string | null {
+	if (line.slice(0, MODE_DIRECTIVE_PREFIX.length).toLowerCase() !== MODE_DIRECTIVE_PREFIX) return null;
+	return line.slice(MODE_DIRECTIVE_PREFIX.length).replace(PYTHON_WHITESPACE, "");
+}
+
+/** One path-matching rule for both policy modes: a trailing-slash entry matches a literal
+ * path prefix, a bare entry matches the path itself or the subtree beneath that whole
+ * directory component. Mirrors `fv_project.matches_prefixes`. */
+function matchesPrefixes(relative: string, prefixes: readonly string[]): boolean {
+	return prefixes.some(entry =>
+		entry.endsWith("/") ? relative.startsWith(entry) : relative === entry || relative.startsWith(`${entry}/`),
+	);
+}
+
+/** Include-mode allowlist with the policy file self-bound, so revising the allowlist moves
+ * the snapshot instead of silently re-scoping what existing evidence covers; empty under
+ * exclude mode. Mirrors `fv_project.InputPolicy.selectors`. */
+export function policySelectors(policy: InputPolicy): string[] {
+	if (policy.mode !== MODE_INCLUDE) return [];
+	if (policy.prefixes.includes(VERIFIED_INPUTS_RELATIVE)) return [...policy.prefixes];
+	return [...policy.prefixes, VERIFIED_INPUTS_RELATIVE];
+}
+
+/** Exclusion prefixes that apply: structural, plus the declared ones under exclude mode.
+ * Mirrors `fv_project.InputPolicy.exclusions`. */
+export function policyExclusions(policy: InputPolicy): string[] {
+	const prefixes = [...policy.structural];
+	if (policy.mode === MODE_EXCLUDE) {
+		for (const entry of policy.prefixes) if (!prefixes.includes(entry)) prefixes.push(entry);
 	}
-	// One rule, mirroring `fv_project.parse_exclusions`: LF and CRLF separate entries, and
-	// every other control character, plus a byte-order mark, is rejected outright. The two
-	// languages disagree about which of them break lines, which of them strip, and whether
-	// a BOM survives decoding, so accepting one here would derive an exclusion set the gate
-	// never derives and silently move the snapshot on one side only.
+	return prefixes;
+}
+
+/** True when candidate `relative` is a verified input under `policy`. Structural
+ * exclusions apply first in both modes, so an allowlist entry can never pull generated FV
+ * output back into the snapshot and make writing a report stale the evidence it describes.
+ * Mirrors `fv_project.InputPolicy.selects`. */
+export function policySelects(relative: string, policy: InputPolicy): boolean {
+	if (matchesPrefixes(relative, policy.structural)) return false;
+	if (policy.mode === MODE_INCLUDE) return matchesPrefixes(relative, policySelectors(policy));
+	return !matchesPrefixes(relative, policy.prefixes);
+}
+
+/** Parse verified-input policy text. A `mode:` directive is legal only as the first
+ * non-comment line; anywhere else it is a rejection rather than a path entry. With no
+ * directive the policy is exclusion mode. Every rejection, and its wording, mirrors
+ * `fv_project.parse_policy`: a fixture the two ends read differently is a silent snapshot
+ * split that surfaces only as a stale record, with nothing naming the parse.
+ * Exported so the differential fixtures in `tests/r34_evidence_run.py` can hold this
+ * parser and `fv_project.parse_policy` to one rule character by character. */
+export function parseInputPolicy(text: string): InputPolicy {
+	// LF and CRLF separate entries, and every other control character, plus a byte-order
+	// mark, is rejected outright. The two languages disagree about which of them break
+	// lines, which of them strip, and whether a BOM survives decoding, so accepting one
+	// here would derive an input set the gate never derives and silently move the snapshot
+	// on one side only.
 	let lineno = 1;
 	for (let at = 0; at < text.length; at += 1) {
 		const char = text[at]!;
@@ -222,7 +290,7 @@ export async function loadExclusions(projectRoot: string): Promise<string[]> {
 			continue;
 		}
 		if (char === "\r" && text[at + 1] === "\n") continue;
-		const location = `.fv/verified-inputs.txt:${lineno}`;
+		const location = `${VERIFIED_INPUTS_RELATIVE}:${lineno}`;
 		if (char === "\r" || AMBIGUOUS_LINE_CHARS.includes(char)) {
 			throw new Error(`${location}: ambiguous line terminator ${charRepr(char)}; use LF`);
 		}
@@ -233,34 +301,89 @@ export async function loadExclusions(projectRoot: string): Promise<string[]> {
 			throw new Error(`${location}: control character ${charRepr(char)}; use LF-separated entries`);
 		}
 	}
+	let mode: string | null = null;
+	const prefixes: string[] = [];
+	// `str.splitlines` drops a single trailing terminator and never yields a final empty
+	// line for it; every other terminator it honours is already rejected above, so
+	// splitting on /\r?\n/ and skipping the empty tail lands on the same line numbers.
 	const lines = text.split(/\r?\n/);
 	for (let index = 0; index < lines.length; index += 1) {
-		const line = lines[index]!.replace(PYTHON_WHITESPACE, "");
+		let line = lines[index]!.replace(PYTHON_WHITESPACE, "");
 		if (line.length === 0 || line.startsWith("#")) continue;
-		const entry = line.startsWith("./") ? line.slice(2) : line;
-		const location = `.fv/verified-inputs.txt:${index + 1}`;
-		if (entry.length === 0 || entry === "." || entry === "/") {
-			throw new Error(`${location}: entry excludes the whole project`);
+		const location = `${VERIFIED_INPUTS_RELATIVE}:${index + 1}`;
+		const value = directiveValue(line);
+		if (value !== null) {
+			if (mode !== null || prefixes.length > 0) {
+				throw new Error(`${location}: mode directive must be the first non-comment line`);
+			}
+			if (!POLICY_MODES.includes(value)) {
+				throw new Error(`${location}: unknown mode '${value}'; write '${INCLUDE_DIRECTIVE}'`
+					+ ` or '${EXCLUDE_DIRECTIVE}'`);
+			}
+			mode = value;
+			continue;
 		}
-		if (path.isAbsolute(entry)) throw new Error(`${location}: absolute entry '${entry}'`);
-		if (entry.split("/").includes("..")) throw new Error(`${location}: entry escapes project root: '${entry}'`);
-		if (!exclusions.includes(entry)) exclusions.push(entry);
+		if (mode === null) mode = MODE_EXCLUDE;
+		if (line.startsWith("./")) line = line.slice(2);
+		if (line.length === 0 || line === "." || line === "/") {
+			const verb = mode === MODE_INCLUDE ? "selects" : "excludes";
+			throw new Error(`${location}: entry ${verb} the whole project`);
+		}
+		if (path.isAbsolute(line)) throw new Error(`${location}: absolute entry '${line}'`);
+		if (line.split("/").includes("..")) throw new Error(`${location}: entry escapes project root: '${line}'`);
+		if (!prefixes.includes(line)) prefixes.push(line);
 	}
-	return exclusions;
+	if (mode === MODE_INCLUDE && prefixes.length === 0) {
+		throw new Error(`${VERIFIED_INPUTS_RELATIVE}: ${INCLUDE_DIRECTIVE} names no path;`
+			+ " list the paths in scope or drop the directive");
+	}
+	return { mode: mode ?? MODE_EXCLUDE, prefixes, structural: [...DEFAULT_EXCLUSIONS] };
 }
 
-/** Trailing-slash entries are literal path prefixes; bare entries match whole components. */
-function isExcluded(relative: string, exclusions: readonly string[]): boolean {
-	return exclusions.some(entry =>
-		entry.endsWith("/") ? relative.startsWith(entry) : relative === entry || relative.startsWith(`${entry}/`),
-	);
+/** The project's declared policy; exclusion mode with no entries when the file is absent.
+ * Mirrors `fv_project.load_policy`. */
+export async function loadInputPolicy(projectRoot: string): Promise<InputPolicy> {
+	const listFile = Bun.file(path.join(projectRoot, ".fv", "verified-inputs.txt"));
+	if (!(await listFile.exists())) {
+		return { mode: MODE_EXCLUDE, prefixes: [], structural: [...DEFAULT_EXCLUSIONS] };
+	}
+	let text: string;
+	try {
+		// `ignoreBOM` keeps a leading U+FEFF in the string, as Python's utf-8 decode does,
+		// so the scan in the parser can reject it; `fatal` makes invalid UTF-8 a rejection
+		// instead of a U+FFFD the gate would never see. Both mirror `read_bytes().decode`.
+		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+			.decode(await listFile.arrayBuffer());
+	} catch (error) {
+		throw new Error(`cannot read ${VERIFIED_INPUTS_RELATIVE}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	return parseInputPolicy(text);
 }
 
-/** `sha256:<hex>` over every tracked-or-untracked, unignored, non-excluded file:
- * UTF-8 path, NUL, content SHA-256 hex, newline, concatenated in UTF-8 byte order. */
+/** Exclusion prefixes that apply to the project. Mirrors `fv_project.load_exclusions`:
+ * under `mode: include` only the structural defaults are exclusions and selection is the
+ * allowlist's, so what the snapshot covers is `loadInputPolicy`'s answer, never this one's.
+ * Exported for the differential fixtures in `tests/r34_evidence_run.py`. */
+export async function loadExclusions(projectRoot: string): Promise<string[]> {
+	return policyExclusions(await loadInputPolicy(projectRoot));
+}
+
+/** Snapshot order: UTF-8 byte-wise, not code-unit-wise. This runtime's default string
+ * comparison orders by UTF-16 code unit, which puts every astral-plane path (leading
+ * surrogate U+D800..U+DBFF) ahead of U+E000..U+FFFF, the reverse of UTF-8 byte order, so
+ * a repository holding both would hash to two snapshots. Mirrors
+ * `fv_project.order_inputs`; exported for the differential fixtures in
+ * `tests/r34_evidence_run.py`. */
+export function orderVerifiedInputs(paths: readonly string[]): string[] {
+	return [...paths].sort((left, right) =>
+		Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+}
+
+/** `sha256:<hex>` over every candidate the policy selects: UTF-8 path, NUL, content
+ * SHA-256 hex, newline, concatenated in UTF-8 byte order. */
 async function verifiedInputSnapshot(
 	projectRoot: string,
-	exclusions: readonly string[],
+	policy: InputPolicy,
 	exec: Exec,
 	signal?: AbortSignal,
 ): Promise<string> {
@@ -272,11 +395,10 @@ async function verifiedInputSnapshot(
 	const candidates = new Set<string>();
 	for (const entry of listed.stdout.split("\0")) {
 		if (entry.length === 0) continue;
-		if (!isExcluded(entry, exclusions)) candidates.add(entry);
+		if (policySelects(entry, policy)) candidates.add(entry);
 	}
 	const hasher = new Bun.CryptoHasher("sha256");
-	const ordered = [...candidates].sort((left, right) =>
-		Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+	const ordered = orderVerifiedInputs([...candidates]);
 	for (const relative of ordered) {
 		const absolute = path.join(projectRoot, relative);
 		const info = await fs.lstat(absolute).catch(() => null);
@@ -293,9 +415,9 @@ async function verifiedInputSnapshot(
 	return `sha256:${hasher.digest("hex")}`;
 }
 
-/** Non-excluded paths reported by `git status --porcelain -z`. Changes confined to
- * generated FV output are not dirt. */
-function dirtyVerifiedInputs(status: string, exclusions: readonly string[]): string[] {
+/** Paths reported by `git status --porcelain -z` that the policy selects. Changes confined
+ * to generated FV output, or to a file no include policy names, are not dirt. */
+function dirtyVerifiedInputs(status: string, policy: InputPolicy): string[] {
 	const fields = status.split("\0");
 	const dirty: string[] = [];
 	for (let index = 0; index < fields.length; index += 1) {
@@ -308,7 +430,7 @@ function dirtyVerifiedInputs(status: string, exclusions: readonly string[]): str
 			if (original) changed.push(original);
 		}
 		for (const relative of changed) {
-			if (!isExcluded(relative, exclusions)) dirty.push(relative);
+			if (policySelects(relative, policy)) dirty.push(relative);
 		}
 	}
 	return dirty;
@@ -523,14 +645,14 @@ const factory: CustomToolFactory = pi => ({
 		// The baseline binding is taken before the `--version` probes below: a probe that
 		// edits a verified input must move the snapshot like any other command instead of
 		// being absorbed into the recorded pre-run state.
-		const exclusions = await loadExclusions(projectRoot);
-		const snapshot = await verifiedInputSnapshot(projectRoot, exclusions, exec, signal);
+		const policy = await loadInputPolicy(projectRoot);
+		const snapshot = await verifiedInputSnapshot(projectRoot, policy, exec, signal);
 		const beforeStatus = await exec("git", ["status", "--porcelain", "--untracked-files=all", "-z"],
 			{ cwd: projectRoot, signal });
 		if (beforeStatus.code !== 0) throw new Error("git status failed before evidence command");
 		// Bindings are checked around every execution, so a cohort whose second command
 		// edits a verified input cannot ship as PASS evidence for its first.
-		let dirty = dirtyVerifiedInputs(beforeStatus.stdout, exclusions).length > 0;
+		let dirty = dirtyVerifiedInputs(beforeStatus.stdout, policy).length > 0;
 
 		// Resolve every execution's cwd and executable identity before running any of
 		// them: a cohort with one unresolvable tool must not leave half a cohort behind.
@@ -577,7 +699,7 @@ const factory: CustomToolFactory = pi => ({
 		const probeStatus = await exec("git", ["status", "--porcelain", "--untracked-files=all", "-z"],
 			{ cwd: projectRoot, signal });
 		if (probeStatus.code !== 0) throw new Error("git status failed after toolchain version probes");
-		if (dirtyVerifiedInputs(probeStatus.stdout, exclusions).length > 0) dirty = true;
+		if (dirtyVerifiedInputs(probeStatus.stdout, policy).length > 0) dirty = true;
 		if ((await requiredFileHash(target.absolute, "intent")) !== intentHash) dirty = true;
 		if ((await requiredFileHash(manifestPath, "obligation manifest")) !== manifestHash) dirty = true;
 
@@ -605,7 +727,7 @@ const factory: CustomToolFactory = pi => ({
 			const markerMatched = plan.passMarker
 				? rawOutput.includes(plan.passMarker)
 				: PASS_MARKERS[plan.evidenceClass]!.test(rawOutput);
-			const snapshotAfter = await verifiedInputSnapshot(projectRoot, exclusions, exec, signal);
+			const snapshotAfter = await verifiedInputSnapshot(projectRoot, policy, exec, signal);
 			const intentHashAfter = await requiredFileHash(target.absolute, "intent");
 			const manifestHashAfter = await requiredFileHash(manifestPath, "obligation manifest");
 			const afterStatus = await exec("git", ["status", "--porcelain", "--untracked-files=all", "-z"],
@@ -614,7 +736,7 @@ const factory: CustomToolFactory = pi => ({
 			if (snapshotAfter !== snapshot || intentHashAfter !== intentHash || manifestHashAfter !== manifestHash) {
 				dirty = true;
 			}
-			if (dirtyVerifiedInputs(afterStatus.stdout, exclusions).length > 0) dirty = true;
+			if (dirtyVerifiedInputs(afterStatus.stdout, policy).length > 0) dirty = true;
 			exitCodes.push(run.code);
 			executions.push({
 				tool: plan.tool,

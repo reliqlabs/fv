@@ -14,17 +14,20 @@ production code. Exit 0 pass, 1 fail.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 PANEL = REPO / "skills" / "fv-panel"
 FANOUT = REPO / "skills" / "fv-adversarial" / "omp_fanout.py"
+_RESOLVER = "fv_project"  # the canonical target resolver the engine loads by path
 FAILURES: list[str] = []
 
 
@@ -39,7 +42,15 @@ def check(label: str, ok: bool, detail: object = "") -> None:
 def _load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    # Registered before exec for the same reason the engine's own resolver
+    # loader does it: a module body that creates a class (@dataclass) needs
+    # its own module to be importable by name.
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return mod
 
 
@@ -146,6 +157,36 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
     check("normalize_roster: malformed successful result raises (fail-closed, no downgrade)",
           raises(lambda: roster.normalize_roster({"content": [{"type": "text", "text": "not json"}]}),
                  "does not contain a roster"))
+
+    # ── Resolver loader: cold-loads the real scripts/fv_project.py ───
+    # The engine execs that module by path. It must be registered in
+    # sys.modules while its body runs, or the module's own
+    # ``@dataclass(frozen=True) InputPolicy`` raises during class creation
+    # (cls.__module__ is unresolvable) on Python >= 3.12.
+    saved_resolver = sys.modules.pop(_RESOLVER, None)
+    saved_cache = dict(panel._resolver_cache)
+    panel._resolver_cache.clear()
+    try:
+        with tempfile.TemporaryDirectory(prefix="r31-resolver-") as td:
+            cold = Path(td)
+            resolver = panel.load_target_resolver(cold)
+            check("resolver cold-load runs the real dataclass-bearing fv_project",
+                  dataclasses.is_dataclass(resolver.InputPolicy)
+                  and resolver.load_policy(cold).mode == resolver.MODE_EXCLUDE
+                  and callable(resolver.resolve_target))
+            check("loaded resolver is registered under its own module name",
+                  sys.modules.get(_RESOLVER) is resolver)
+            sys.modules.pop(_RESOLVER, None)  # force the by-path cache lookup
+            check("resolver is cached by path (no re-exec on the next call)",
+                  panel.load_target_resolver(cold) is resolver
+                  and list(panel._resolver_cache.values()) == [resolver])
+    finally:
+        panel._resolver_cache.clear()
+        panel._resolver_cache.update(saved_cache)
+        if saved_resolver is None:
+            sys.modules.pop(_RESOLVER, None)
+        else:
+            sys.modules[_RESOLVER] = saved_resolver
 
     # ── Contract: schemas + AC parsing ───────────────────────────────
     check("both modes expose draft/review/synthesis schemas",

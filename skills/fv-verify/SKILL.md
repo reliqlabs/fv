@@ -28,6 +28,16 @@ The run-level verdict follows the G2 truth table exactly: any required layer **f
 
 The deterministic layers (types, lints, property tests, fuzz, Kani, Verus) can run without an agent via the headless runner **`$FV_ROOT/scripts/pyramid_run.py --crate <path> --profile <name>`** (CI-friendly; exit 0 verified / 1 failed / 2 error / 3 incomplete). The agent flow remains responsible for failure classification and for the Aeneas/Lean layers.
 
+## Verification plans are mandatory once they exist
+
+A project declares its own layer commands in `<crate>/.fv/verification-plan.json` (schema `fv-verification-plan/v1`). That file is not optional configuration waiting to be pointed at: `pyramid_run.py` **auto-discovers it** and executes it whenever `--plan` is absent, and every report names where its commands came from in `plan.discovery` — `explicit`, `autodiscovered`, `absent`, or `disabled`.
+
+- **A migrated project has a plan, so a plan run is the normal run.** `fv_migrate.py` writes one for every legacy harness it converts. Running such a project on the built-in defaults would report verification the project does not perform, so it cannot happen by omission.
+- **Unusable means ERROR, never legacy.** A plan that is present but unreadable, malformed, or schema-invalid ends the run at `ERROR` (exit 2) before any layer executes; there is no fall back to the built-in layers. `fv_doctor.py` fails the same project on `project/verification-plan` rather than waiting for the next verification run to discover it.
+- **`--plan <path>`** overrides discovery (one plan, explicitly chosen). **`--no-plan`** is the only escape hatch: a deliberate legacy run on the built-in defaults, recorded as `plan.discovery = "disabled"` with the ignored path named. Use it to compare a plan against the defaults, never to turn a red plan green.
+- **Custom layers run.** A plan may name a layer the pyramid has no built-in default for (`quint`, `mutation`, `sanitizers`, ...). It executes after every known pyramid layer, in lexical order, with the same argv/cwd/timeout/env validation and the same report shape as a built-in layer; with `required: true` it joins the G2 gating set, which is how a tool outside the Rust pyramid becomes a gate. A plan can only tighten the verdict: `required: false` never un-requires a layer the profile already requires, and a plan naming a tool this machine lacks is a `failed` layer with a `launch_errors` row, not a skip.
+- Layers the plan does not name keep their built-in defaults.
+
 ## Engineering baseline floors (C8)
 
 Under `tested` (and therefore `bounded`/`proved`) the headless runner enforces a required **`floors`** layer: mechanical engineering-baseline checks so periphery coverage is visible rather than assumed. Floors are read from `<crate>/.fv/floors.json`; an absent or partial file falls back to documented defaults. The layer status rolls up per G2 (any failed sub-check gives `failed`; else any unmeasurable sub-check gives `skipped`/INCOMPLETE; else `passed`) and is written into the runner's JSON report (`layers.floors` plus a top-level `floors` summary) so ledger tooling can cite it.

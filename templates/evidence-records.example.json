@@ -1,0 +1,187 @@
+{
+  "_schema": "fv-evidence-run/v3",
+  "_source": "Shipped example record set for the ranked-choice tabulation project templates/obligations.example.json declares: one single-execution invariant record (A1) and one multi-execution system-claim record (S1) whose cohort covers every tool ID in S1's required_evidence. Field order, field set, and the derivation of the record-level legacy bindings from executions[0] are exactly what tools/evidence-run.ts writes; the envelope around `records` is the one-file form Gate B's load_records unwraps (a producer writes one bare record per file at .fv/evidence/records/<claim_id>.json). Record semantics: docs/dogfood-evidence.md.",
+  "_materialization": {
+    "convention": "Every <angle-bracketed> value is a PLACEHOLDER and no shipped file can carry its real value: these digests bind to one project tree and to the executables of one machine. Materialize them before the set means anything - a record carrying a placeholder digest is rejected by Gate B, not tolerated by it.",
+    "placeholder_fields": [
+      "bindings.source_snapshot - `scripts/fv_project.py snapshot`; one value shared by every record of one run",
+      "bindings.intent_hash - SHA-256 over the resolved canonical target's bytes (.fv/intent.md here, since this project declares no omp_native.target_spec)",
+      "bindings.obligation_manifest_hash - SHA-256 over .fv/obligations.json bytes",
+      "bindings.toolchain_digests.executable and .sha256, and the same two fields of every executions[] entry - absolute path of the resolved launched executable and SHA-256 over its bytes",
+      "bindings.raw_output_hash and every executions[].raw_output_hash - SHA-256 over that execution's raw log bytes"
+    ],
+    "literal_fields": "claim_id, required, evidence_class, result, scope, profile, required_targets, environment_policy, command, configuration, seeds, run_id, raw_output_path, and every executions[] field not listed above are literal. raw_output_path is derivable rather than captured: under profile producer-trusted-execution it is exactly .fv/evidence/raw/<claim_id>-<execution run_id>.log. toolchain_digests.version and .version_exit_code are illustrative captured text - Gate B checks their types, not their content.",
+    "project_layout": {
+      ".fv/intent.md": "# Intent: ranked-choice tabulation\n\nA1: no candidate is eliminated while tied for the minimum tally.\nS1: the protocol model, the proved tally core, and the contract entry point agree on eliminated-candidate ordering.\n",
+      ".fv/verified-inputs.txt": "# generated build output is not a verified input\ntarget/\n",
+      "specs/rcv.qnt": "module rcv {\n  val eliminationOrderAgrees = true\n}\n",
+      "crates/tally/src/lib.rs": "pub fn eliminate(tallies: &[u64]) -> usize {\n    0\n}\n",
+      "contracts/rcv/Cargo.toml": "[package]\nname = \"rcv\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+    },
+    "project_layout_note": ".fv/obligations.json is templates/obligations.example.json copied verbatim: its bytes are what bindings.obligation_manifest_hash binds, so a reformatting edit stales this whole set. The paths above are the tree the commands and cwds below presume; a git repository over them is what makes the verified-input snapshot computable.",
+    "raw_artifacts": {
+      ".fv/evidence/raw/A1-2026-09-15T11-42-07-311Z.log": [
+        "Checking harness proof_no_tied_elimination...",
+        "VERIFICATION RESULT:",
+        " ** 0 of 137 failed",
+        "",
+        "VERIFICATION:- SUCCESSFUL",
+        "Verification Time: 6.4210577s",
+        "",
+        "Complete - 1 successfully verified harnesses, 0 failures, 1 total."
+      ],
+      ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-1-quint.log": [
+        "[ok] No violation found (2841ms).",
+        "You may increase --max-steps."
+      ],
+      ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-2-verus.log": [
+        "verification results:: 41 verified, 0 errors"
+      ],
+      ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-3-cargo-kani.log": [
+        "Checking harness proof_elimination_order_matches_model...",
+        "VERIFICATION RESULT:",
+        " ** 0 of 212 failed",
+        "",
+        "VERIFICATION:- SUCCESSFUL",
+        "Verification Time: 18.9024413s",
+        "",
+        "Complete - 1 successfully verified harnesses, 0 failures, 1 total."
+      ]
+    },
+    "raw_artifact_trailer": "--- fv-evidence: exit=0 ---",
+    "raw_artifact_note": "Each list above is one raw log's captured output without its trailer. The producer appends exactly one canonical trailer line as the log's last line, and Gate B rejects a PASS artifact that carries two of them or ends anywhere else, so materialize each log as the lines above followed by raw_artifact_trailer, each line newline-terminated.",
+    "gate": "scripts/check_evidence_records.py --records .fv/evidence/records --manifest .fv/obligations.json --root <project root>",
+    "gate_note": "No --expect-snapshot, no --expect-intent, no --allow-unbound: the gate recomputes the verified-input snapshot and the intent hash itself and answers VERDICT: VERIFIED[profile=producer-trusted-execution] with binding=recomputed. tests/r37_evidence_examples.py performs this materialization in a temporary git project and asserts that verdict, so the example is machine-validated rather than illustrated."
+  },
+  "records": [
+    {
+      "claim_id": "A1",
+      "required": true,
+      "evidence_class": "bounded-checked",
+      "result": "PASS",
+      "scope": "proof_no_tied_elimination: no candidate is eliminated while tied for the minimum tally",
+      "bindings": {
+        "source_snapshot": "sha256:<64 hex over the project's verified inputs>",
+        "intent_path": ".fv/intent.md",
+        "intent_hash": "<64 hex over .fv/intent.md bytes>",
+        "obligation_manifest_hash": "<64 hex over .fv/obligations.json bytes>",
+        "profile": "producer-trusted-execution",
+        "required_targets": ["A1", "S1"],
+        "environment_policy": "omp-extension-tool",
+        "toolchain_digests": {
+          "executable": "<absolute path of the resolved cargo executable>",
+          "sha256": "<64 hex over the cargo executable>",
+          "version": "cargo 1.89.0 (c24e10642 2025-06-23)",
+          "version_exit_code": 0
+        },
+        "command": "[\"cargo\",\"kani\",\"--harness\",\"proof_no_tied_elimination\"]",
+        "configuration": { "cwd": "contracts/rcv" },
+        "seeds": null,
+        "raw_output_hash": "<64 hex over .fv/evidence/raw/A1-2026-09-15T11-42-07-311Z.log>",
+        "raw_output_path": ".fv/evidence/raw/A1-2026-09-15T11-42-07-311Z.log",
+        "executions": [
+          {
+            "tool": "cargo-kani",
+            "evidence_class": "bounded-checked",
+            "command": ["cargo", "kani", "--harness", "proof_no_tied_elimination"],
+            "cwd": "contracts/rcv",
+            "toolchain_digests": {
+              "executable": "<absolute path of the resolved cargo executable>",
+              "sha256": "<64 hex over the cargo executable>",
+              "version": "cargo 1.89.0 (c24e10642 2025-06-23)",
+              "version_exit_code": 0
+            },
+            "raw_output_path": ".fv/evidence/raw/A1-2026-09-15T11-42-07-311Z.log",
+            "raw_output_hash": "<64 hex over .fv/evidence/raw/A1-2026-09-15T11-42-07-311Z.log>",
+            "result": "PASS",
+            "run_id": "2026-09-15T11-42-07-311Z"
+          }
+        ],
+        "parser_schema_version": "fv-evidence-run/v3",
+        "run_id": "2026-09-15T11-42-07-311Z"
+      },
+      "waiver": null
+    },
+    {
+      "claim_id": "S1",
+      "required": true,
+      "evidence_class": "bounded-checked",
+      "result": "PASS",
+      "scope": "Tabulation composition: Quint protocol invariant, Verus-proved tally core, and Kani-bounded contract entry point agree on eliminated-candidate ordering",
+      "bindings": {
+        "source_snapshot": "sha256:<64 hex over the project's verified inputs>",
+        "intent_path": ".fv/intent.md",
+        "intent_hash": "<64 hex over .fv/intent.md bytes>",
+        "obligation_manifest_hash": "<64 hex over .fv/obligations.json bytes>",
+        "profile": "producer-trusted-execution",
+        "required_targets": ["A1", "S1"],
+        "environment_policy": "omp-extension-tool",
+        "toolchain_digests": {
+          "executable": "<absolute path of the resolved quint executable>",
+          "sha256": "<64 hex over the quint executable>",
+          "version": "0.32.0",
+          "version_exit_code": 0
+        },
+        "command": "[\"quint\",\"verify\",\"specs/rcv.qnt\",\"--invariant\",\"eliminationOrderAgrees\"]",
+        "configuration": { "cwd": "." },
+        "seeds": null,
+        "raw_output_hash": "<64 hex over .fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-1-quint.log>",
+        "raw_output_path": ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-1-quint.log",
+        "executions": [
+          {
+            "tool": "quint",
+            "evidence_class": "bounded-checked",
+            "command": ["quint", "verify", "specs/rcv.qnt", "--invariant", "eliminationOrderAgrees"],
+            "cwd": ".",
+            "toolchain_digests": {
+              "executable": "<absolute path of the resolved quint executable>",
+              "sha256": "<64 hex over the quint executable>",
+              "version": "0.32.0",
+              "version_exit_code": 0
+            },
+            "raw_output_path": ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-1-quint.log",
+            "raw_output_hash": "<64 hex over .fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-1-quint.log>",
+            "result": "PASS",
+            "run_id": "2026-09-15T11-58-02-104Z-1-quint"
+          },
+          {
+            "tool": "verus",
+            "evidence_class": "proof-discharged",
+            "command": ["verus", "crates/tally/src/lib.rs"],
+            "cwd": ".",
+            "toolchain_digests": {
+              "executable": "<absolute path of the resolved verus executable>",
+              "sha256": "<64 hex over the verus executable>",
+              "version": "verus 0.2026.07.1",
+              "version_exit_code": 0
+            },
+            "raw_output_path": ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-2-verus.log",
+            "raw_output_hash": "<64 hex over .fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-2-verus.log>",
+            "result": "PASS",
+            "run_id": "2026-09-15T11-58-02-104Z-2-verus",
+            "pass_marker": "verification results:: 41 verified, 0 errors"
+          },
+          {
+            "tool": "cargo-kani",
+            "evidence_class": "bounded-checked",
+            "command": ["cargo", "kani", "--harness", "proof_elimination_order_matches_model"],
+            "cwd": "contracts/rcv",
+            "toolchain_digests": {
+              "executable": "<absolute path of the resolved cargo executable>",
+              "sha256": "<64 hex over the cargo executable>",
+              "version": "cargo 1.89.0 (c24e10642 2025-06-23)",
+              "version_exit_code": 0
+            },
+            "raw_output_path": ".fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-3-cargo-kani.log",
+            "raw_output_hash": "<64 hex over .fv/evidence/raw/S1-2026-09-15T11-58-02-104Z-3-cargo-kani.log>",
+            "result": "PASS",
+            "run_id": "2026-09-15T11-58-02-104Z-3-cargo-kani"
+          }
+        ],
+        "parser_schema_version": "fv-evidence-run/v3",
+        "run_id": "2026-09-15T11-58-02-104Z"
+      },
+      "waiver": null
+    }
+  ]
+}

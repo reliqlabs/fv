@@ -20,7 +20,7 @@ committed on `main`, one commit per item:
 | M3 live calibration | `calibration/2026-07-13-r1`: blinded seeded-defect run, six scoreable voices | done |
 | OMP-native integration | ModelRegistry-backed adversary fan-out, generated routes, fail-closed session-root gate, live-tree preflight, process-local fallback suppression, failure-isolated evidence, initializer/doctor support (R29/R30/R33) | implemented on `feature/omp-integration`; the canonical 4-voice run is recorded at `calibration/2026-07-28-r3/`. Native calibration remains pending at the route level: one voice is attested and cited; two are unattested and one degraded. |
 | OMP-native deliberation panel | Three-wave `fv-panel` skill (drafts → blinded cross-review → synthesis): family/coverage quorum, randomized-label blinding + deferred identity, brief + git target-drift gating (binary-safe, full-digest, `.fv`-excluded), harness-aware doctor, `project-plan` + `milestone-review` modes (R31, ~50 assertions incl. a real Gate B end-to-end; R32 resolver dispatch-identity contract executed under Bun) | committed on `feature/omp-integration`; **`project-plan` live-verified** project-rooted (`calibration/2026-07-23-omp-panel-e2e/`, 3-family COMPLETE) but uncalibrated; **`milestone-review` EXPERIMENTAL** — evidence-bound fail-closed guard + Gate B `--expect-intent`/`--snapshot-exact`/dup-rejection are correct and deterministically tested, but not yet run against a real project's itf_replay G1 records + live panel; roster-resolver extension live-verified in a real OMP session (`calibration/2026-07-24-resolver-live/`: `ctx.models.family` distinctness positive + negative, canonical `provider/id` dispatch identity, both active seats serving real inference at `:max`); active roster is Sol+GLM (min_families=2) with Fable/Kimi-k3 pending; full three-wave run on that roster and calibration pending |
-| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | delivered 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`, `8508604`, `5dc765e`, `d5ce1c2`); code-adversarial pass and closure reviews complete; local and Gula CI PASS; real dossier dry run PASS with 0 unsupported/conflicts and unchanged `.colosseum`; no shadow state applied |
+| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | delivered 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`, `8508604`, `5dc765e`, `d5ce1c2`, `dec002d`); code-adversarial pass and closure reviews complete; local and Gula CI PASS; real dossier dry run PASS with 0 unsupported/conflicts and unchanged `.colosseum`; no shadow state applied; advisory-closure wave uncommitted in the worktree with its validation pending |
 
 Gate: `./scripts/ci.py` validates frontmatter, agent policy, roster drift,
 documentation links, dispatch configuration, fixture tracking, and the full
@@ -244,7 +244,7 @@ ignored files. Real build/run artifacts (a `target/` next to a Cargo.toml,
 `.fv/verify/`) stay tolerated. Verified off a fresh clone and on
 the live runner; both workflow jobs green.
 
-### Migration readiness — DELIVERED 2026-09-15 (commits f2d0556, 9eb3709, b1003a3)
+### Migration readiness — DELIVERED 2026-09-15 (commits f2d0556, 9eb3709, b1003a3, 8508604, 5dc765e, d5ce1c2, dec002d)
 
 Authority for this work is the user-authorized migration requirements given in
 the session that produced these commits, not an intent revision: this repository
@@ -261,21 +261,41 @@ Delivered:
   missing, directory, symlink, or escaping target is an error. The initializer
   writes `project_root: "."` and a repo-relative spec. The old "root
   `intent.md` as recognized alternative" fallback is gone — declare it.
-- **Verified-input content snapshot.** `.fv/verified-inputs.txt` is an
-  exclusion-prefix list over `git ls-files --cached --others
-  --exclude-standard`; the snapshot is `sha256:<hex>` over sorted
-  path + NUL + content-hash lines. `.fv/evidence/`, `.fv/verify/`,
-  `.fv/panels/`, `.fv/history/`, `.fv/.migrate-staging/`, and `.colosseum/`
-  are structural defaults in `fv_project.DEFAULT_EXCLUSIONS`, mirrored in
-  `tools/evidence-run.ts`, that no project file can drop; a non-regular
-  verified input is classified instead of
-  opened, and a list whose line terminators the Python and TypeScript parsers
-  would read differently is rejected on both ends. `tools/evidence-run.ts`
+- **Verified-input content snapshot.** `.fv/verified-inputs.txt` is the
+  project's verified-input policy over `git ls-files --cached --others
+  --exclude-standard`; the snapshot is `sha256:<hex>` over
+  path + NUL + content-hash lines, ordered by the UTF-8 bytes of the path
+  rather than by string comparison, so the Python and TypeScript ends cannot
+  order an astral-plane path differently and hash one tree to two snapshots.
+  The first non-comment line selects the mode. `mode: exclude` (the default
+  when no directive is present, which is what every list written before include
+  mode existed already means) makes the entries exclusion prefixes;
+  `mode: include` makes them the allowlist and binds the policy file itself, so
+  revising an allowlist moves the snapshot instead of silently re-scoping what
+  existing evidence covers, and an include directive naming no path is
+  rejected. Nine prefixes are structural defaults in
+  `fv_project.DEFAULT_EXCLUSIONS`, mirrored in `tools/evidence-run.ts`, that no
+  project file can drop and that apply before include matching:
+  `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/changes/`,
+  `.fv/attacks/`, `.fv/code-adversarial/`, `.fv/history/`,
+  `.fv/.migrate-staging/`, `.colosseum/`. The three lifecycle-report
+  directories are among them so that writing a change record, an attack log, or
+  a code-adversarial report cannot stale the evidence it describes. A
+  non-regular verified input is classified instead of opened; a list whose line
+  terminators or byte-order mark the two parsers would read differently is
+  rejected on both ends; a `mode:` directive anywhere but the first non-comment
+  line is a rejection rather than a path entry. `tools/evidence-run.ts`
   recomputes the snapshot (plus the intent and manifest hashes) before the
   toolchain probes and around every execution; Gate B recomputes and demands
   an exact match unless `--expect-snapshot` / `--expect-intent` /
-  `--allow-unbound` are passed, and discloses which discipline ran in the
-  verdict scope as `binding=recomputed|pinned|unbound`. A `+dirty` snapshot
+  `--allow-unbound` are passed, and always names the discipline that produced
+  the run in its report's `binding` field (`recomputed`, `pinned`, or
+  `unbound`). Only a weaker discipline qualifies the verdict scope: a
+  recomputed run keeps the unqualified `VERIFIED[profile=...]`, and a pinned or
+  unbound one reads `VERIFIED[profile=...; binding=pinned]` or
+  `VERIFIED[profile=...; binding=unbound]`, so a consumer matched to the plain
+  token stops matching the weaker runs rather than silently accepting all
+  three. A `+dirty` snapshot
   cannot PASS in any comparison mode. Evidence no longer binds to a commit id
   plus a dirty flag.
 - **Gate A citation grammar.** `scripts/check_ledger_references.py` parses four
@@ -318,15 +338,27 @@ Delivered:
   `evidence-gap` from `dependency-gap` and applies Gate B's own v3 cohort
   schema, so the two tools cannot disagree about which records are valid.
   v2 records remain accepted.
-- **Configurable and custom verification layers.** `pyramid_run.py --plan`
-  reads `fv-verification-plan/v1`: per-layer `required` plus argv/cwd/timeout/env
-  executions, no shell strings, escapes and ambient env mutation rejected.
-  Non-reserved layer ids are accepted as custom layers, run after the known
-  `LAYER_ORDER` in lexical order, join `required_layers` when `required: true`,
-  and go `not_run` under a types failure like any other layer. A malformed plan
-  is exit 2 before any layer runs, and an execution naming an absent
-  executable is a recorded `failed` layer with a `launch_error` rather than a
-  traceback that suppresses the whole report.
+- **Configurable and custom verification layers, auto-discovered.**
+  `pyramid_run.py` reads `fv-verification-plan/v1`: per-layer `required` plus
+  argv/cwd/timeout/env executions, no shell strings, escapes and ambient env
+  mutation rejected. The plan is not opt-in configuration. Once
+  `<crate>/.fv/verification-plan.json` exists the runner discovers and executes
+  it with no flag, so a migrated project cannot keep reporting the built-in
+  defaults its plan replaced; every report names its provenance in
+  `plan.discovery` (`explicit`, `autodiscovered`, `absent`, `disabled`) and one
+  stderr line says where the layer commands came from. `--plan PATH` overrides
+  discovery and `--no-plan` is the only escape hatch, a deliberate legacy run
+  on the built-in defaults. A plan present but unreadable or malformed is
+  exit 2 before any layer runs, never a silent fall back to the legacy layers,
+  and `fv_doctor.py` fails the same project on `project/verification-plan`
+  rather than leaving it for the next verification run to discover; the doctor
+  also reports the verified-input policy by mode instead of a bare prefix
+  count. Non-reserved layer ids are accepted as custom layers, run after the
+  known `LAYER_ORDER` in lexical order, join `required_layers` when
+  `required: true`, and go `not_run` under a types failure like any other
+  layer. An execution naming an absent executable is a recorded `failed` layer
+  with a `launch_error` rather than a traceback that suppresses the whole
+  report.
 - **Portability.** Target declarations, execution `cwd`s, and `intent_path`
   are repo-relative and containment-checked; evidence binds to content, not to
   a commit. A record earned in one clone is checkable in another with the same
@@ -388,8 +420,24 @@ Delivered:
   collide with a later run, and is safe to delete once accounted for. Nothing
   sweeps it, deliberately: no later run can distinguish a dead staging tree
   from a live migration's, or from a rollback's surviving originals. The legacy
-  *include*-shaped `verified-inputs.txt` is preserved as history rather than
-  inverted, and FV's conservative exclusion defaults are written instead.
+  *include*-shaped `verified-inputs.txt` is translated rather than inverted:
+  the migrated policy declares `mode: include`, keeps every legacy source root
+  verbatim, rebinds an entry naming a legacy manifest to the FV artifact its
+  content migrated to, and additionally binds the elected canonical target,
+  whichever migrated manifests the run wrote, and the policy file itself. An
+  entry naming legacy bytes that migrate to history alone binds nothing and is
+  a deviation row; a legacy list that is not valid UTF-8, does not parse,
+  declares no entries, or has no entry left to translate blocks the migration
+  rather than publishing a policy that binds nothing a layer reads; the emitted
+  bytes are read back through the same parser the gate and the producer use
+  before the write is planned. Inverting the list was the alternative and is
+  not the fallback, since it would enumerate the complement of the repository.
+  A legacy tree with no include list gets FV's exclusion defaults instead, and
+  the exact legacy list survives verbatim as history either way. `fv_init.py`
+  leaves an include-mode policy byte for byte, `--force` included: appending
+  exclusion prefixes to an allowlist would declare generated output to be
+  verified input, and only an exclusion-mode file gains the structural defaults
+  it dropped.
 
 Focused verification (orchestrator-run, all PASS; enumerated per phase in the
 change record): `py_compile` over changed Python modules plus
@@ -422,8 +470,8 @@ are unchanged.
 The code-adversarial pass is complete: `.fv/code-adversarial/2026-09-15-evidence-architecture.json`
 (17 findings: 1 HIGH, 4 MEDIUM, 1 MEDIUM-LOW, 1 LOW-MEDIUM, 8 LOW, 2 INFO) and
 `.fv/code-adversarial/2026-09-15-shadow-migration.json` (15 findings: 2 high,
-2 medium-high, 6 medium, 3 low-medium, 2 low). All 32 findings have corrections
-in the current **uncommitted** set across `check_evidence_records.py`,
+2 medium-high, 6 medium, 3 low-medium, 2 low). All 32 findings are corrected
+and committed across `check_evidence_records.py`,
 `coverage_dashboard.py`, `fv_project.py`, `fv_migrate.py`, `pyramid_run.py`,
 `check_ledger_references.py`, `tools/evidence-run.ts`, and their suites; the
 two documentation findings (a status string spelled `coverage-gap` in four
@@ -450,7 +498,7 @@ two tools disagreed on the exit code for a manifest Gate B rejects, and a
 UTF-8 BOM in `.fv/verified-inputs.txt` parsing differently in Python and
 TypeScript.
 
-That wave is now in the worktree: the dashboard calls Gate B's own
+That wave is committed with the rest of the set: the dashboard calls Gate B's own
 `dirty_snapshot_defects`, `shared_artifact_defects`, and `v3_producer_defects`,
 its manifest loader rejects an obligation id outside either id grammar with the
 same exit 2 Gate B uses, both exclusion parsers reject a `U+FEFF` byte-order
@@ -468,6 +516,31 @@ mapped artifacts, 173 preserved-history files, 0 unsupported, 0 conflicts, and
 `docs/intent.md` as the elected target. The complete `.colosseum` digest was
 unchanged. **No real legacy project has been cut over:** no `--apply` was run,
 and migrated projects must still re-earn v3 evidence before Gate B can pass.
+
+**Advisory closure wave — uncommitted, unvalidated.** A further wave sits in the
+working tree across `fv_project.py`, `tools/evidence-run.ts`, `fv_migrate.py`,
+`fv_init.py`, `fv_doctor.py`, `pyramid_run.py`, `check_evidence_records.py`,
+`check_ledger_references.py`, `coverage_dashboard.py`, their suites, and the
+trust documents. What it changes: `.fv/verified-inputs.txt` becomes a two-mode
+policy (`mode: exclude`, still the default a directive-free file carries, or
+`mode: include` whose allowlist binds the policy file itself); the structural
+exclusions grow from six to nine with `.fv/changes/`, `.fv/attacks/`, and
+`.fv/code-adversarial/`, so a lifecycle report cannot stale the evidence it
+describes; snapshot ordering is pinned to UTF-8 bytes on both ends rather than
+to each language's string comparison; a legacy include list is translated into
+include mode instead of preserved-and-replaced; `fv_init.py` leaves an
+include-mode policy byte for byte, `--force` included; `pyramid_run.py`
+auto-discovers `<crate>/.fv/verification-plan.json` with `--no-plan` as the only
+escape hatch, and `fv_doctor.py` fails a project whose plan is present but
+unusable; and a recomputed Gate B run keeps the unqualified
+`VERIFIED[profile=...]` token while only a pinned or unbound run qualifies the
+scope.
+
+Validation of that wave is pending. The suites it touches, `scripts/ci.py`, and
+the doctor have not been re-run over it, so none of the PASS records above cover
+it, and no evidence in this repository is bound to it. The no-apply boundary is
+unchanged by it: still no `--apply` against a real legacy project, and a
+migrated project still has to re-earn v3 evidence before Gate B can pass.
 
 ## Suggested sequence
 

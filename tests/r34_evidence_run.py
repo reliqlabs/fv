@@ -221,6 +221,13 @@ const afterExcludedOutput = await probe("EXT3");
 // must neither dirty the tree nor move the snapshot live evidence binds to.
 await Bun.write(`${projectRoot}/.fv/history/colosseum/legacy-record.json`, "{}\n");
 const afterQuarantinedHistory = await probe("EXT4");
+// Lifecycle reports are written after the evidence they describe: a change record, an
+// attack log, and a code-adversarial report all land once the run that produced the
+// evidence is over. They are structural exclusions, so none of them can stale it.
+await Bun.write(`${projectRoot}/.fv/changes/2026-09-15-change.md`, "change record\n");
+await Bun.write(`${projectRoot}/.fv/attacks/attack-1.md`, "attack log\n");
+await Bun.write(`${projectRoot}/.fv/code-adversarial/report-1.md`, "code-adversarial report\n");
+const afterLifecycleReports = await probe("EXT9");
 const inputsFile = `${projectRoot}/.fv/verified-inputs.txt`;
 const originalInputs = await Bun.file(inputsFile).text();
 // Only the list itself is committed, so the untracked build output stays untracked: if a
@@ -251,6 +258,7 @@ git("add", ".fv/verified-inputs.txt");
 git("commit", "-qm", "restore exclusion list");
 console.log(JSON.stringify({
   first, afterEvidenceCommit, afterExcludedOutput, afterQuarantinedHistory,
+  afterLifecycleReports,
   afterCrlfList, afterPaddedList, ambiguousList: ambiguous.error, bomList: bomList.error,
 }));
 """
@@ -377,6 +385,206 @@ for (const fixture of fixtures) {
   }
 }
 console.log(JSON.stringify(results));
+"""
+
+# The same differential duty for the *policy* layer: which mode a file declares, which
+# entries it carries, and which candidates that selects. `fv_project.load_policy` and
+# `loadInputPolicy` in tools/evidence-run.ts have to agree on all three, including the
+# wording of every rejection: a mode one end reads as include and the other as exclude
+# would hash two different input sets from one file and surface only as "stale record".
+POLICY_FIXTURES: tuple[tuple[str, bytes, str], ...] = (
+    # No directive is exclusion mode, which is what every list written before include
+    # mode existed means; that compatibility is the whole reason the default is not
+    # "declare a mode or be rejected".
+    ("no directive stays exclusion mode", b"build/\nlogs/\n", "accept"),
+    ("explicit exclude directive", b"mode: exclude\nbuild/\n", "accept"),
+    ("include directive", b"mode: include\ncrates\nquint/\n", "accept"),
+    ("include after comments and blanks", b"# scope\n\nmode: include\ncrates\n", "accept"),
+    ("include with no space after the colon", b"mode:include\ncrates\n", "accept"),
+    ("include with strippable padding", "mode:  include  \n crates \n".encode(), "accept"),
+    ("include directive in mixed case prefix", b"MODE: include\ncrates\n", "accept"),
+    ("include entry deduped after ./ stripping", b"mode: include\n./crates\ncrates\n", "accept"),
+    ("include naming the policy file itself",
+     b"mode: include\n.fv/verified-inputs.txt\ncrates\n", "accept"),
+    ("include with non-ascii and astral entries",
+     "mode: include\ncaf\u00e9/\n\U0001f600-astral.txt\n".encode(), "accept"),
+    ("include across crlf", b"mode: include\r\ncrates\r\n", "accept"),
+    # A comment is a comment even when it quotes a directive.
+    ("commented-out directive", b"# mode: include\nbuild/\n", "accept"),
+    # An allowlist may name the .fv tree; the structural exclusions still win inside it.
+    ("include naming the whole .fv directory", b"mode: include\n.fv/\n", "accept"),
+    ("empty include policy", b"mode: include\n", "reject"),
+    ("include policy of comments only", b"# scope\nmode: include\n# nothing\n", "reject"),
+    ("directive after an entry", b"build/\nmode: include\n", "reject"),
+    ("second directive", b"mode: include\ncrates\nmode: exclude\n", "reject"),
+    ("mode word in the wrong case", b"Mode: Include\ncrates\n", "reject"),
+    ("unknown mode word", b"mode: allowlist\ncrates\n", "reject"),
+    ("directive with no mode word", b"mode:\ncrates\n", "reject"),
+    ("include entry selecting the whole project", b"mode: include\n.\n", "reject"),
+    ("include entry that is absolute", b"mode: include\n/etc\n", "reject"),
+    ("include entry that escapes the root", b"mode: include\n../outside\n", "reject"),
+    # The character rules are the policy's rules, not the exclusion list's: they hold
+    # above an include directive too.
+    ("byte-order mark before an include directive",
+     "\ufeffmode: include\ncrates\n".encode(), "reject"),
+    ("bare carriage return under include mode", b"mode: include\ncrates\rquint\n", "reject"),
+    ("tab inside an include entry", b"mode: include\ncra\ttes\n", "reject"),
+    ("invalid utf-8 under include mode", b"mode: include\ncrates\xff\n", "reject"),
+)
+
+# Fixtures whose rejection text belongs to the UTF-8 decoder rather than to the policy
+# grammar: Python names the offending byte and offset, this runtime says "Invalid byte
+# sequence". Both refuse the file, which is the property that matters; the wording check
+# below skips them rather than pinning one runtime's decoder message into the other.
+RUNTIME_WORDED_REJECTIONS = frozenset({"invalid utf-8 under include mode"})
+
+# Candidates every accepted policy is asked about, on both sides. The astral and
+# private-use names are here because a path is not only ordered but *matched*, and the
+# two runtimes index strings differently.
+SELECTION_PROBES: tuple[str, ...] = (
+    "crates/lib.rs",
+    "crates",
+    "cratesX/lib.rs",
+    "quint/spec.qnt",
+    "build/out.bin",
+    "logs/run.txt",
+    "README.md",
+    ".fv/verified-inputs.txt",
+    ".fv/intent.md",
+    ".fv/evidence/records/W1.json",
+    ".fv/changes/2026-09-15-change.md",
+    ".fv/attacks/attack-1.md",
+    ".fv/code-adversarial/report-1.md",
+    ".fv/history/colosseum/ledger.md",
+    "caf\u00e9/notes.md",
+    "\U0001f600-astral.txt",
+    "\ue000-pua.txt",
+)
+
+# Snapshot order is UTF-8 byte-wise on both sides. A JavaScript runtime's default string
+# comparison is UTF-16 code-unit-wise, which sorts every astral-plane path ahead of
+# U+E000..U+FFFF instead of behind it, so a repository holding both would hash to two
+# snapshots with nothing naming the sort. These paths make the two orders differ.
+ORDER_PROBES: tuple[str, ...] = (
+    "a.txt",
+    "crates/lib.rs",
+    "\ue000-pua.txt",
+    "\ufffd-replacement.txt",
+    "\U000103a0-old-persian.txt",
+    "\U0001f600-astral.txt",
+    "caf\u00e9.txt",
+)
+
+# The include-mode fixture repository: an allowlist whose entries include a private-use
+# and an astral-plane filename, so the end-to-end snapshot comparison exercises the
+# ordering rule on real files rather than on a list of strings.
+ASTRAL_INPUT = "\U0001f600-astral.txt"
+PUA_INPUT = "\ue000-pua.txt"
+INCLUDE_POLICY = (
+    "# Verified-input policy: an allowlist, deliberately.\n"
+    "mode: include\n"
+    ".fv/intent.md\n"
+    ".fv/obligations.json\n"
+    "crates/\n"
+    f"{ASTRAL_INPUT}\n"
+    f"{PUA_INPUT}\n"
+)
+
+# Replays every policy fixture through the producer's own loader, answers the selection
+# probes with what it derived, and reports both orderings of the ordering probes.
+POLICY_HARNESS = PRELUDE + r"""
+const { fixtures, probes, order } = await Bun.file(`${projectRoot}/policy-fixtures.json`).json();
+const inputs = `${projectRoot}/.fv/verified-inputs.txt`;
+const policies: Record<string, unknown> = {};
+for (const fixture of fixtures) {
+  await Bun.write(inputs, Buffer.from(fixture.hex, "hex"));
+  try {
+    const policy = await mod.loadInputPolicy(projectRoot);
+    const selects: Record<string, boolean> = {};
+    for (const probe of probes) selects[probe] = mod.policySelects(probe, policy);
+    policies[fixture.label] = {
+      ok: true, mode: policy.mode, prefixes: policy.prefixes,
+      selectors: mod.policySelectors(policy), exclusions: mod.policyExclusions(policy),
+      selects, error: "",
+    };
+  } catch (error) {
+    policies[fixture.label] = { ok: false, mode: "", prefixes: null, selectors: null,
+                                exclusions: null, selects: null, error: String(error) };
+  }
+}
+console.log(JSON.stringify({
+  policies,
+  order: { utf8: mod.orderVerifiedInputs(order), codeUnit: [...order].sort() },
+}));
+"""
+
+# Real repository under an include policy: what the allowlist selects, what it refuses to
+# let a later write disturb, and what a revision of the allowlist itself does.
+INCLUDE_HARNESS = PRELUDE + r"""
+const api: any = { cwd: projectRoot, zod, exec: realExec };
+const tool = await mod.default(api);
+function git(...args: string[]) {
+  const done = Bun.spawnSync(["git", ...args], { cwd: projectRoot });
+  if (!done.success) throw new Error(`git ${args.join(" ")}: ${new TextDecoder().decode(done.stderr)}`);
+}
+async function probe(claim: string, scope: string) {
+  try {
+    const run = await tool.execute(claim, {
+      claim_id: claim,
+      command: ["sh", "-c", "echo 'test result: ok.'"],
+      evidence_class: "test-witnessed",
+      scope,
+    }, undefined, {}, undefined);
+    return { error: "", record: run.details.record };
+  } catch (error) { return { error: String(error), record: null }; }
+}
+const inputsFile = `${projectRoot}/.fv/verified-inputs.txt`;
+const originalPolicy = await Bun.file(inputsFile).text();
+const first = await probe("INC1", "include-policy snapshot probe");
+// A file no allowlist entry names is not a verified input, so editing it neither dirties
+// the tree nor moves the snapshot live evidence binds to.
+await Bun.write(`${projectRoot}/docs/scratch.md`, "edited outside the allowlist\n");
+const afterUnlisted = await probe("INC2", "unlisted path probe");
+// Lifecycle reports are written *after* the evidence they describe. They are structural
+// exclusions in both modes, so writing a change record, an attack log, or a
+// code-adversarial report cannot stale the run that produced them.
+await Bun.write(`${projectRoot}/.fv/changes/2026-09-15-change.md`, "change record\n");
+await Bun.write(`${projectRoot}/.fv/attacks/attack-1.md`, "attack log\n");
+await Bun.write(`${projectRoot}/.fv/code-adversarial/report-1.md`, "code-adversarial report\n");
+const afterLifecycle = await probe("INC3", "lifecycle report probe");
+git("add", "-A");
+git("commit", "-qm", "commit the evidence and the lifecycle reports it produced");
+const afterCommit = await probe("INC4", "committed lifecycle output probe");
+// An allowlisted input changing is exactly what has to move the snapshot.
+await Bun.write(`${projectRoot}/crates/lib.rs`, "pub const N: u8 = 2;\n");
+git("add", "-A");
+git("commit", "-qm", "edit an allowlisted input");
+const afterIncludedEdit = await probe("INC5", "allowlisted input edit probe");
+// A new file under an allowlisted directory is an uncommitted verified input: dirt.
+await Bun.write(`${projectRoot}/crates/extra.rs`, "pub const M: u8 = 3;\n");
+const withNewIncluded = await probe("INC6", "new allowlisted input probe");
+git("add", "-A");
+git("commit", "-qm", "commit the new allowlisted input");
+const afterNewIncluded = await probe("INC7", "committed new allowlisted input probe");
+// The policy file selects itself, so widening the allowlist invalidates the evidence
+// bound to the narrower one instead of silently re-scoping what it covered.
+await Bun.write(inputsFile, originalPolicy + "docs/\n");
+git("add", "-A");
+git("commit", "-qm", "widen the allowlist");
+const afterPolicyChange = await probe("INC8", "widened allowlist probe");
+// An allowlist naming nothing would bind evidence to the policy file alone.
+await Bun.write(inputsFile, "mode: include\n");
+git("add", "-A");
+git("commit", "-qm", "empty allowlist");
+const emptyPolicy = await probe("INC9", "empty allowlist probe");
+await Bun.write(inputsFile, originalPolicy);
+git("add", "-A");
+git("commit", "-qm", "restore the original allowlist");
+const restored = await probe("INC10", "restored allowlist probe");
+console.log(JSON.stringify({
+  first, afterUnlisted, afterLifecycle, afterCommit, afterIncludedEdit,
+  withNewIncluded, afterNewIncluded, afterPolicyChange, emptyPolicy, restored,
+}));
 """
 
 
@@ -529,6 +737,12 @@ def check_external_target(temporary: Path) -> None:
           history.get("source_snapshot") == bindings.get("source_snapshot")
           and result["afterQuarantinedHistory"]["result"] == "PASS",
           history.get("source_snapshot"))
+    lifecycle = result.get("afterLifecycleReports", {}).get("bindings", {})
+    check("a change record, attack log, and code-adversarial report written after "
+          "evidence neither dirty nor move the snapshot",
+          lifecycle.get("source_snapshot") == bindings.get("source_snapshot")
+          and result["afterLifecycleReports"]["result"] == "PASS",
+          lifecycle.get("source_snapshot"))
     check("a CRLF exclusion list still parses, so build/ stays excluded",
           result.get("afterCrlfList", {}).get("record", {}).get("result") == "PASS",
           result.get("afterCrlfList"))
@@ -594,6 +808,236 @@ def check_external_target(temporary: Path) -> None:
     check("symlinked verified input rejected before evidence is written",
           "verified input is a symlink" in resolution.get("symlinkInput", {}).get("error", ""),
           resolution.get("symlinkInput"))
+
+
+def check_policy_parity(temporary: Path) -> None:
+    """Gate-side and producer-side policy parsing, selection, and ordering."""
+    project = temporary / "policy-parity"
+    (project / ".fv").mkdir(parents=True)
+    (project / "policy-fixtures.json").write_text(json.dumps({
+        "fixtures": [{"label": label, "hex": payload.hex()}
+                     for label, payload, _ in POLICY_FIXTURES],
+        "probes": list(SELECTION_PROBES),
+        "order": list(ORDER_PROBES),
+    }))
+    listing = project / ".fv" / "verified-inputs.txt"
+    gate_side: dict[str, dict] = {}
+    for label, payload, _ in POLICY_FIXTURES:
+        listing.write_bytes(payload)
+        try:
+            policy = fv_project.load_policy(project)
+        except fv_project.ProjectError as error:
+            gate_side[label] = {"ok": False, "mode": "", "prefixes": None, "selectors": None,
+                                "exclusions": None, "selects": None, "error": str(error)}
+            continue
+        gate_side[label] = {
+            "ok": True,
+            "mode": policy.mode,
+            "prefixes": list(policy.prefixes),
+            "selectors": list(policy.selectors()),
+            "exclusions": policy.exclusions(),
+            "selects": {probe: policy.selects(probe) for probe in SELECTION_PROBES},
+            "error": "",
+        }
+    harness = run_harness(temporary / "policy-harness.ts", POLICY_HARNESS, project)
+    producer = harness.get("policies", {})
+
+    def producer_error(label: str) -> str:
+        return str(producer.get(label, {}).get("error", "")).removeprefix("Error: ")
+
+    check("policy parity: the producer reports a verdict for every fixture",
+          set(producer) == {label for label, _, _ in POLICY_FIXTURES},
+          sorted({label for label, _, _ in POLICY_FIXTURES} ^ set(producer)))
+    misjudged = [label for label, _, expect in POLICY_FIXTURES
+                 if gate_side[label]["ok"] != (expect == "accept")]
+    check("policy parity: Gate B's parser lands on every fixture's declared verdict",
+          not misjudged, [(label, gate_side[label]["error"]) for label in misjudged])
+    divergent = [label for label, _, _ in POLICY_FIXTURES
+                 if producer.get(label, {}).get("ok") != gate_side[label]["ok"]]
+    check("policy parity: producer and gate accept and reject the same fixtures",
+          not divergent,
+          [(label, gate_side[label]["error"], producer_error(label)) for label in divergent])
+    for field in ("mode", "prefixes", "selectors", "exclusions"):
+        unequal = [label for label, _, expect in POLICY_FIXTURES if expect == "accept"
+                   and producer.get(label, {}).get(field) != gate_side[label][field]]
+        check(f"policy parity: an accepted policy yields one {field} on both sides",
+              not unequal,
+              [(label, gate_side[label][field], producer.get(label, {}).get(field))
+               for label in unequal])
+    mismatched = [(label, probe) for label, _, expect in POLICY_FIXTURES if expect == "accept"
+                  for probe in SELECTION_PROBES
+                  if (producer.get(label, {}).get("selects") or {}).get(probe)
+                  is not gate_side[label]["selects"][probe]]
+    check("policy parity: both ends select the same candidates under every accepted policy",
+          not mismatched, mismatched[:4])
+    worded = [label for label, _, expect in POLICY_FIXTURES
+              if expect == "reject" and label not in RUNTIME_WORDED_REJECTIONS
+              and producer_error(label) != gate_side[label]["error"]]
+    check("policy parity: both ends word every grammar rejection identically",
+          not worded, [(label, gate_side[label]["error"], producer_error(label))
+                       for label in worded])
+    check("policy parity: invalid UTF-8 is refused by both ends, decoder wording aside",
+          all(not gate_side[label]["ok"] and not producer.get(label, {}).get("ok")
+              and "cannot read .fv/verified-inputs.txt" in gate_side[label]["error"]
+              and "cannot read .fv/verified-inputs.txt" in producer_error(label)
+              for label in RUNTIME_WORDED_REJECTIONS),
+          [(label, gate_side[label]["error"], producer_error(label))
+           for label in RUNTIME_WORDED_REJECTIONS])
+    # The rejection has to name the cause, for the same reason the BOM rule does: an
+    # unexplained stale record is what a silent policy split looks like from outside.
+    for label, fragment in (
+        ("empty include policy", "mode: include names no path"),
+        ("directive after an entry", "mode directive must be the first non-comment line"),
+        ("mode word in the wrong case", "unknown mode 'Include'"),
+        ("unknown mode word", "unknown mode 'allowlist'"),
+        ("byte-order mark before an include directive", "byte-order mark U+FEFF"),
+        ("bare carriage return under include mode", "ambiguous line terminator '\\r'"),
+    ):
+        check(f"policy parity: both ends name the defect identically ({label})",
+              fragment in gate_side[label]["error"] and fragment in producer_error(label),
+              (gate_side[label]["error"], producer_error(label)))
+    include = gate_side["include directive"]
+    check("policy: an include policy selects itself, so revising it moves the snapshot",
+          fv_project.VERIFIED_INPUTS_RELATIVE in include["selectors"]
+          and include["selects"][fv_project.VERIFIED_INPUTS_RELATIVE]
+          and (producer.get("include directive", {}).get("selectors") or [])[-1]
+          == fv_project.VERIFIED_INPUTS_RELATIVE,
+          (include["selectors"], producer.get("include directive", {}).get("selectors")))
+    check("policy: an include policy selects nothing it does not name",
+          not include["selects"]["README.md"] and not include["selects"]["cratesX/lib.rs"]
+          and include["selects"]["crates/lib.rs"] and include["selects"]["quint/spec.qnt"],
+          include["selects"])
+    dotfv = gate_side["include naming the whole .fv directory"]
+    check("policy: structural exclusions outrank an allowlist naming the .fv tree",
+          dotfv["selects"][".fv/intent.md"]
+          and not any(dotfv["selects"][probe] for probe in (
+              ".fv/evidence/records/W1.json", ".fv/changes/2026-09-15-change.md",
+              ".fv/attacks/attack-1.md", ".fv/code-adversarial/report-1.md",
+              ".fv/history/colosseum/ledger.md")),
+          dotfv["selects"])
+    legacy = gate_side["no directive stays exclusion mode"]
+    check("policy: a list with no directive keeps its exclusion meaning",
+          legacy["mode"] == fv_project.MODE_EXCLUDE
+          and legacy["prefixes"] == ["build/", "logs/"]
+          and legacy["selects"]["README.md"] and not legacy["selects"]["build/out.bin"],
+          legacy)
+    check("policy: the structural defaults are identical on both sides and cover "
+          "every lifecycle report directory",
+          producer.get("include directive", {}).get("exclusions")
+          == list(fv_project.DEFAULT_EXCLUSIONS)
+          and {".fv/changes/", ".fv/attacks/", ".fv/code-adversarial/"}
+          <= set(fv_project.DEFAULT_EXCLUSIONS),
+          producer.get("include directive", {}).get("exclusions"))
+    order = harness.get("order", {})
+    check("snapshot order: both ends order astral-plane paths UTF-8 byte-wise",
+          order.get("utf8") == fv_project.order_inputs(list(ORDER_PROBES)), order.get("utf8"))
+    # Without this the parity above would be vacuous: it only means anything because the
+    # runtime's own comparison disagrees on exactly these paths.
+    check("snapshot order: the runtime's default comparison really does disagree",
+          order.get("codeUnit") != order.get("utf8"), order)
+
+
+def include_mode_project(temporary: Path) -> Path:
+    """Repository whose verified inputs are an allowlist, astral-plane names included."""
+    project = temporary / "include-mode"
+    (project / ".fv").mkdir(parents=True)
+    (project / "crates").mkdir()
+    (project / "docs").mkdir()
+    (project / ".fv" / "intent.md").write_text("# Include Intent\n")
+    (project / ".fv" / "obligations.json").write_text(json.dumps({
+        "version": 1,
+        "invariants": [],
+        # Only the claim Gate B is asked about below: a manifest naming every probe would
+        # make the gate's verdict INCOMPLETE over the nine records it was never given.
+        "witnesses": [{"id": "INC10", "name": "witness_inc10"}],
+    }))
+    (project / ".fv" / "verified-inputs.txt").write_text(INCLUDE_POLICY)
+    (project / "crates" / "lib.rs").write_text("pub const N: u8 = 1;\n")
+    (project / ASTRAL_INPUT).write_text("astral-plane verified input\n")
+    (project / PUA_INPUT).write_text("private-use verified input\n")
+    (project / "docs" / "notes.md").write_text("documentation the allowlist omits\n")
+    git_repository(project)
+    return project
+
+
+def check_include_mode(temporary: Path) -> None:
+    project = include_mode_project(temporary)
+    manifest = project / ".fv" / "obligations.json"
+    records = project / ".fv" / "evidence" / "records"
+    result = run_harness(temporary / "include-harness.ts", INCLUDE_HARNESS, project)
+
+    def snapshot(key: str) -> str:
+        return str(((result.get(key) or {}).get("record") or {})
+                   .get("bindings", {}).get("source_snapshot"))
+
+    def verdict(key: str) -> str:
+        return str(((result.get(key) or {}).get("record") or {}).get("result"))
+
+    check("include mode produces a well-formed content snapshot",
+          verdict("first") == "PASS"
+          and re.fullmatch(r"sha256:[0-9a-f]{64}", snapshot("first")) is not None,
+          result.get("first"))
+    check("include mode: editing a path the allowlist omits neither dirties nor moves it",
+          verdict("afterUnlisted") == "PASS" and snapshot("afterUnlisted") == snapshot("first"),
+          result.get("afterUnlisted"))
+    check("include mode: lifecycle reports written after evidence keep it fresh",
+          verdict("afterLifecycle") == "PASS"
+          and snapshot("afterLifecycle") == snapshot("first"),
+          result.get("afterLifecycle"))
+    check("include mode: committing the evidence and those reports keeps it fresh",
+          verdict("afterCommit") == "PASS" and snapshot("afterCommit") == snapshot("first"),
+          result.get("afterCommit"))
+    check("include mode: editing an allowlisted input moves the snapshot",
+          verdict("afterIncludedEdit") == "PASS"
+          and snapshot("afterIncludedEdit") != snapshot("first"),
+          result.get("afterIncludedEdit"))
+    check("include mode: an uncommitted new file under an allowlisted directory is dirt",
+          verdict("withNewIncluded") == "FAIL" and snapshot("withNewIncluded").endswith("+dirty"),
+          result.get("withNewIncluded"))
+    check("include mode: a committed new allowlisted input moves the snapshot",
+          verdict("afterNewIncluded") == "PASS"
+          and snapshot("afterNewIncluded") != snapshot("afterIncludedEdit"),
+          result.get("afterNewIncluded"))
+    check("include mode: widening the allowlist invalidates evidence bound to the narrow one",
+          verdict("afterPolicyChange") == "PASS"
+          and snapshot("afterPolicyChange") != snapshot("afterNewIncluded"),
+          result.get("afterPolicyChange"))
+    check("include mode: an allowlist naming no path is refused, not bound to itself",
+          "names no path" in str(result.get("emptyPolicy", {}).get("error", "")),
+          result.get("emptyPolicy"))
+    check("include mode: restoring the allowlist restores the snapshot",
+          verdict("restored") == "PASS"
+          and snapshot("restored") == snapshot("afterNewIncluded"),
+          (snapshot("restored"), snapshot("afterNewIncluded")))
+    # The end-to-end differential: one repository, two implementations, one hash. An
+    # ordering or matching difference over the astral-plane inputs shows up here and
+    # nowhere else, because a snapshot is the only thing both ends publish.
+    check("include mode: the gate recomputes the producer's snapshot byte for byte",
+          fv_project.content_snapshot(project) == snapshot("restored"),
+          (fv_project.content_snapshot(project), snapshot("restored")))
+    selected = {path for path, _ in fv_project.snapshot_entries(project)}
+    check("include mode: the snapshot covers exactly the allowlist plus the policy itself",
+          selected == {".fv/intent.md", ".fv/obligations.json", fv_project.VERIFIED_INPUTS_RELATIVE,
+                       "crates/lib.rs", "crates/extra.rs", ASTRAL_INPUT, PUA_INPUT},
+          sorted(selected))
+
+    fresh = subprocess.run(["python3", str(GATE), "--records", str(records / "INC10.json"),
+                            "--root", str(project), "--manifest", str(manifest), "--json"],
+                           capture_output=True, text=True)
+    check("Gate B accepts an include-mode record under default freshness",
+          fresh.returncode == 0, fresh.stdout + fresh.stderr)
+    (project / "docs" / "notes.md").write_text("documentation edited after the run\n")
+    unlisted = subprocess.run(["python3", str(GATE), "--records", str(records / "INC10.json"),
+                               "--root", str(project), "--manifest", str(manifest), "--json"],
+                              capture_output=True, text=True)
+    check("Gate B keeps an include-mode record fresh when an unlisted path changes",
+          unlisted.returncode == 0, unlisted.stdout + unlisted.stderr)
+    (project / ASTRAL_INPUT).write_text("astral-plane input edited after the run\n")
+    stale = subprocess.run(["python3", str(GATE), "--records", str(records / "INC10.json"),
+                            "--root", str(project), "--manifest", str(manifest), "--json"],
+                           capture_output=True, text=True)
+    check("Gate B stales an include-mode record once an allowlisted input changes",
+          stale.returncode == 3 and "stale record" in stale.stdout, stale.stdout)
 
 
 def main() -> int:
@@ -899,6 +1343,8 @@ def main() -> int:
 
         check_external_target(Path(temporary))
         check_exclusion_parity(Path(temporary))
+        check_policy_parity(Path(temporary))
+        check_include_mode(Path(temporary))
 
     print()
     if FAILURES:

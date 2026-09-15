@@ -24,8 +24,12 @@ PROJECT_SCRIPT_NAMES = (
     "fv_project.py",
 )
 VERIFIED_INPUTS_HEADER = (
-    "# Verified-input exclusion prefixes for the FV evidence content snapshot.\n"
+    "# Verified-input policy for the FV evidence content snapshot.\n"
     "# Blank lines and # comments are ignored; directory prefixes end in /.\n"
+    "# This file declares exclusion mode: the prefixes below are kept out of the\n"
+    "# snapshot and everything else git reports is a verified input. A project that\n"
+    "# wants an allowlist instead writes `mode: include` as its first non-comment\n"
+    "# line and lists the paths in scope; this initializer never rewrites one.\n"
 )
 CONFIG_EXAMPLE = REPO / "scripts" / "dispatch.config.example.json"
 PANEL_SETTINGS = REPO / "templates" / "omp-panel.json"
@@ -77,23 +81,44 @@ def install_verified_inputs(
     force: bool,
     results: list[tuple[str, Path]],
 ) -> list[str]:
-    """Seed the frozen exclusion prefixes the evidence snapshot depends on."""
+    """Seed or complete the project's verified-input policy.
+
+    A project with no policy gets the default exclusion-mode file. An existing
+    exclusion-mode policy keeps its own entries and gains any frozen default it
+    dropped, which is the historical behaviour. An existing *include*-mode policy
+    is left byte for byte, ``--force`` included: its entries name the paths in
+    scope, so appending FV's exclusion prefixes would declare generated output to
+    be verified input, and replacing it with exclusion defaults would silently
+    widen what every later record claims to cover. The frozen prefixes apply
+    structurally in both modes, so nothing is lost by leaving the file alone.
+    """
     destination = project / ".fv" / "verified-inputs.txt"
-    defaults = list(fv_project.DEFAULT_EXCLUSIONS)
-    existed = destination.exists()
-    if not existed or force:
+    defaults = fv_project.InputPolicy(fv_project.MODE_EXCLUDE, fv_project.DEFAULT_EXCLUSIONS)
+    default_text = fv_project.render_policy(defaults, VERIFIED_INPUTS_HEADER)
+    if not destination.exists():
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(
-            VERIFIED_INPUTS_HEADER + "".join(f"{prefix}\n" for prefix in defaults)
-        )
-        results.append(("overwrote" if existed else "wrote", destination))
+        destination.write_text(default_text)
+        results.append(("wrote", destination))
         return []
     try:
-        text = destination.read_text()
-        present = set(fv_project.parse_exclusions(text))
-    except (OSError, fv_project.ProjectError) as error:
-        return [f"{destination}: {error}; use --force to replace it"]
-    missing = [prefix for prefix in defaults if prefix not in present]
+        # Decoded from bytes with no newline translation, as fv_project does: a lone
+        # CR that the policy grammar rejects must not be rewritten into an LF here.
+        text = destination.read_bytes().decode("utf-8")
+        policy = fv_project.parse_policy(text)
+    except (OSError, UnicodeDecodeError, fv_project.ProjectError) as error:
+        if not force:
+            return [f"{destination}: {error}; use --force to replace it"]
+        destination.write_text(default_text)
+        results.append(("overwrote", destination))
+        return []
+    if policy.mode == fv_project.MODE_INCLUDE:
+        results.append(("skip", destination))
+        return []
+    if force:
+        destination.write_text(default_text)
+        results.append(("overwrote", destination))
+        return []
+    missing = [prefix for prefix in defaults.prefixes if prefix not in policy.prefixes]
     if not missing:
         results.append(("skip", destination))
         return []
@@ -390,7 +415,10 @@ def main() -> int:
     results: list[tuple[str, Path]] = []
     errors: list[str] = []
 
-    for subdirectory in ("attacks", "verify", "evidence", "scripts", "panels"):
+    # Every generated-output directory the structural exclusions cover, so a lifecycle
+    # report has a home that cannot stale the evidence the report describes.
+    for subdirectory in ("attacks", "verify", "evidence", "scripts", "panels",
+                         "changes", "code-adversarial"):
         (project / ".fv" / subdirectory).mkdir(parents=True, exist_ok=True)
     for name in PROJECT_SCRIPT_NAMES:
         source = REPO / "scripts" / name

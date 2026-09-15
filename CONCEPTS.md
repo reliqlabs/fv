@@ -71,8 +71,8 @@ Canonical locations within a FV-managed project. Skills cite these; do not inven
 - `<project>/.fv/classifications/` — failure-classifier reports (`fv-verify`)
 - `<project>/.fv/evidence/` — typed G1 evidence records, one JSON per claim ID (`fv-compose`, Gate B)
 - `<project>/.fv/scripts/` — project-local copies of dispatch + CI-gate scripts
-- `<project>/.fv/verified-inputs.txt` — the verified-input **exclusion** list that defines the content snapshot (below)
-- `<project>/.fv/verification-plan.json` — optional `fv-verification-plan/v1` layer configuration read by `pyramid_run.py --plan`
+- `<project>/.fv/verified-inputs.txt` — the verified-input **policy** that defines the content snapshot: an exclusion list, or a `mode: include` allowlist (below)
+- `<project>/.fv/verification-plan.json` — `fv-verification-plan/v1` layer configuration. `pyramid_run.py` auto-discovers it; once the file exists it is mandatory, and `--no-plan` is the only way to run the built-in defaults instead
 - `<project>/.fv/history/colosseum/` — quarantined pre-FV artifacts, byte-for-byte, written by `scripts/fv_migrate.py`; history, never live evidence, and excluded from the content snapshot by a structural default rather than by a project declaration
 - `<fv>/agents/` — static OMP agents loaded from the extension package
 
@@ -95,31 +95,63 @@ whose content could change what a verification run concludes; the snapshot is a
 single hash over all of them, so a record names the exact tree state it was
 earned against rather than a commit plus a dirty flag.
 
-- **The input set is an exclusion list.** `.fv/verified-inputs.txt` holds
-  path prefixes to *exclude* (blank and `#` lines ignored, directory entries
-  end in `/`). Six prefixes are structural defaults, applied whether or not
-  any file declares them: `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`,
-  `.fv/history/`, `.fv/.migrate-staging/`, and `.colosseum/`. A project's file
-  only ever *adds* prefixes to them, so quarantined history and a migration's
-  staging tree cannot perturb the snapshot even after `fv_init --force`
-  rewrites the project file — the guarantee is a property of the defaults, not
-  of a line the migration happened to write. Everything else that
-  `git ls-files --cached --others --exclude-standard` reports is a verified
-  input. Exclusion, not inclusion, is the safe default: a newly added source
-  file is in scope automatically, and only FV's own generated output and
-  quarantined history sit outside it. Entries are separated by LF or CRLF
-  only: any other break character the Python and TypeScript parsers would
-  split differently is rejected on both ends rather than yielding two
-  exclusion sets from one list.
+- **The policy names which candidates count, in one of two modes.**
+  `.fv/verified-inputs.txt` is the project's verified-input policy. Its first
+  non-comment line may be `mode: exclude` or `mode: include`; with no directive
+  the policy is exclusion mode, which is what every list written before include
+  mode existed already means. Blank and `#` lines are ignored, directory
+  entries end in `/`, and one path grammar serves both modes: a trailing-slash
+  entry matches a literal path prefix, and a bare entry matches the path itself
+  or the subtree beneath that whole directory component, so `build` never
+  matches `buildout.bin`.
+  - **Exclusion mode** lists prefixes to *exclude*, and everything else that
+    `git ls-files --cached --others --exclude-standard` reports is a verified
+    input. That is the safe default: a newly added source file is in scope
+    automatically, and only FV's own generated output and quarantined history
+    sit outside it.
+  - **Include mode** lists the paths in scope, and nothing else is hashed. It
+    is what a project with a narrow verification surface declares, and what a
+    legacy `.colosseum` include list migrates to. **An include policy binds
+    itself**, whether or not it names itself, so revising the allowlist moves
+    the snapshot and the evidence bound to the old one has to be re-earned
+    rather than silently covering a different set of files. An include
+    directive naming no path is rejected instead of being read as "hash the
+    policy and nothing else". `fv_init.py` leaves an include policy byte for
+    byte, `--force` included: appending FV's exclusion prefixes to an allowlist
+    would declare generated output to be verified input, and the structural
+    prefixes below already apply in both modes.
+- **Nine prefixes are structural, in either mode.** `.fv/evidence/`,
+  `.fv/verify/`, `.fv/panels/`, `.fv/changes/`, `.fv/attacks/`,
+  `.fv/code-adversarial/`, `.fv/history/`, `.fv/.migrate-staging/`, and
+  `.colosseum/` are excluded whether or not any file declares them, and they
+  are applied *before* include matching, so an allowlist naming `.fv/` cannot
+  pull generated output back in. Lifecycle reports are covered on purpose: a
+  change record, an attack log, or a code-adversarial report describes a run,
+  so writing one must not stale the evidence that run earned. A project's
+  exclusion list only ever *adds* prefixes, so quarantined history and a
+  migration's staging tree cannot perturb the snapshot even after
+  `fv_init --force` rewrites the project file. The guarantee is a property of
+  the defaults, not of a line the migration happened to write.
+- **One file, one parse, two languages.** Entries are separated by LF or CRLF
+  only: any other break character, and a byte-order mark anywhere, is rejected
+  on both ends rather than yielding two input sets from one file. A `mode:`
+  directive is legal only as the first non-comment line; anywhere else it is a
+  rejection and never a path entry, so a mode declared halfway down a file can
+  never apply to the entries above it.
 - **A verified input must be a regular file.** A tracked path whose worktree
   entry is a symlink, a FIFO, or any other non-regular file is classified as
   an error instead of being opened, so a snapshot can never block forever on
   a reader that never arrives. Directory entries (submodule gitlinks) are
   skipped; they are verified by their own repository.
 - **The snapshot is content, not identity.** `sha256:<hex>` over, for each
-  input in sorted repo-relative POSIX-path order, the path, a NUL byte, the
-  file's content SHA-256 in hex, and a newline. Symlinks and paths resolving
-  outside the project root are rejected rather than hashed.
+  input in ascending UTF-8 byte order of its repo-relative POSIX path, the
+  path, a NUL byte, the file's content SHA-256 in hex, and a newline. The
+  ordering is byte-wise rather than string-wise because the two
+  implementations disagree otherwise: JavaScript compares by UTF-16 code unit,
+  which sorts every astral-plane path ahead of U+E000..U+FFFF and so reverses
+  UTF-8 order. Both ends sort on the encoded bytes, so one repository hashes to
+  one snapshot. Symlinks and paths resolving outside the project root are
+  rejected rather than hashed.
 - **It is checked around every execution, not once per run.** The producer
   recomputes the snapshot, the intent hash, and the obligation-manifest hash
   after each command. A command that edits a verified input therefore cannot
@@ -150,10 +182,11 @@ earned against rather than a commit plus a dirty flag.
   machine.
 
 `scripts/fv_project.py` (`content_snapshot`, `is_content_snapshot`,
-`load_exclusions`) is the rule's Python implementation; the gates and the
-doctor call it rather than reimplementing it, and the TypeScript producer
-(`tools/evidence-run.ts`) mirrors the same byte-for-byte rule so producer and
-gate bind identically.
+`load_policy`, `InputPolicy.selects`, `order_inputs`) is the rule's Python
+implementation; the gates and the doctor call it rather than reimplementing it,
+and the TypeScript producer (`tools/evidence-run.ts`) mirrors the same
+byte-for-byte rule, policy modes, structural prefixes, path grammar, and UTF-8
+ordering alike, so producer and gate bind identically.
 
 ## System claims and evidence cohorts
 
@@ -254,6 +287,25 @@ destination conflict blocks the run rather than producing a partial `.fv/`.
   `.fv/history/colosseum/<path>` and never placed where Gate B would read
   them as live `fv-evidence-run/v3` evidence. `.fv/history/` is a structural
   snapshot exclusion, so quarantining them cannot invalidate fresh evidence.
+- **The legacy include list is translated, not inverted.** A legacy
+  `verified-inputs.txt` already names the paths in scope, and FV include mode
+  means the same thing, so the migration writes `mode: include` and carries
+  every entry across. Inverting it would mean enumerating the complement of
+  the repository, which is what the legacy project adopted an include list to
+  avoid. A source root is kept verbatim; an entry naming a legacy manifest
+  binds the FV artifact that manifest's content migrated to, read out of this
+  run's own inventory, because the legacy tree is structurally excluded and its
+  bytes become history; an entry naming bytes that migrate to history alone
+  binds nothing and is reported as a deviation row. The elected canonical
+  target, whichever migrated manifests the run wrote, and the policy file
+  itself are bound as well, since those are what FV reads to decide what each
+  layer must discharge. A legacy list that is not valid UTF-8, does not parse,
+  declares no entries, or has no entry left after translation blocks the
+  migration rather than publishing a policy that binds nothing a layer reads,
+  and the emitted bytes are read back through the same parser the gate and the
+  producer use before the write is planned. A legacy tree with no include list
+  gets FV's exclusion defaults instead. Either way the exact legacy list
+  survives verbatim under `.fv/history/colosseum/`.
 - **A lossy translation names what it dropped.** Migrated obligation ids are
   normalized into the shape the evidence producer can discharge, with the
   legacy string kept in `legacy_id` and any collision or empty normalization

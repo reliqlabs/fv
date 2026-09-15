@@ -29,8 +29,16 @@ directly, then runs the headless runner end-to-end against fixture crates:
 The plan half covers `--plan` (fv-verification-plan/v1): validation rejections
 (shell strings, absolute/escaping cwd, non-positive timeouts, non-string env),
 canonical layer order, exact argv/cwd/env delivery, multi-invocation layer
-failure, required-layer aggregation, and that a plan file sitting on disk stays
-inert without --plan.
+failure and required-layer aggregation.
+
+The discovery half covers how a plan reaches a normal run: a plan at the
+conventional <crate>/.fv/verification-plan.json executes with no flag at all
+and is reported as `autodiscovered`; a discovered plan that cannot be read or
+parsed is ERROR (exit 2) rather than a silently-legacy run; `--no-plan` is the
+only way a present plan does not run, and it records the path it ignored;
+`--plan` overrides discovery; the two flags together are rejected; and with no
+plan on disk the report still says so (`absent`) while the built-in defaults
+run.
 
 The custom-layer half covers plan-declared layers the pyramid has no default
 for (`quint`, `mutation`): id acceptance/rejection, execution after every known
@@ -553,7 +561,8 @@ def test_plan_runner() -> None:
               code == 1 and "FAILED" in out, f"exit={code}")
         check("plan run: report carries the plan provenance",
               report.get("plan", {}).get("schema") == PLAN_SCHEMA
-              and report["plan"]["source"] == str(plan), str(report.get("plan")))
+              and report["plan"]["source"] == str(plan)
+              and report["plan"]["discovery"] == "explicit", str(report.get("plan")))
         check("plan run: unplanned layers keep their built-in behaviour",
               report["layers"]["floors"]["status"] == "passed",
               report["layers"]["floors"]["status"])
@@ -650,20 +659,128 @@ def test_plan_runner() -> None:
               [json.loads(line)["label"] for line in kdlog.read_text().splitlines()]
               == ["t", "p"], kdlog.read_text())
 
-        # Legacy: a plan file on disk is inert unless --plan names it.
+
+def test_plan_discovery() -> None:
+    print("plan discovery (a declared plan runs in the normal workflow)")
+    with tempfile.TemporaryDirectory(prefix="r28-plan-find-") as td:
+        tmp = Path(td)
+
+        # No flag at all: the conventional path is discovered and executed,
+        # custom layer included, and the report names where it came from.
+        found = tmp / "discovered"
+        shutil.copytree(MINICRATE, found)
+        (found / "probe.py").write_text(PROBE)
+        dlog = tmp / "discovered.log"
+        write_plan(found, {
+            "types": {"required": True, "executions": [probe(found, dlog, "t")]},
+            "lints": {"required": True, "executions": [probe(found, dlog, "l")]},
+            "proptests": {"required": True,
+                          "executions": [probe(found, dlog, "p")]},
+            "quint": {"required": True, "executions": [probe(found, dlog, "q")]},
+        })
+        resolved = str((found / ".fv" / "verification-plan.json").resolve())
+        code, out = run(found, "tested")
+        report = latest_report(found)
+        labels = [json.loads(line)["label"]
+                  for line in dlog.read_text().splitlines()]
+        check("discovery: the conventional plan executes with no --plan flag",
+              code == 0 and "VERIFIED[tested]" in out
+              and labels == ["t", "l", "p", "q"], f"exit={code} {labels}")
+        check("discovery: the report names the auto-discovered source",
+              report["plan"]["discovery"] == "autodiscovered"
+              and report["plan"]["path"] == resolved
+              and report["plan"]["source"] == resolved,
+              str({k: v for k, v in report["plan"].items() if k != "layers"}))
+        check("discovery: the run names its plan source on stderr",
+              f"plan: autodiscovered {resolved}" in out, out[:400])
+        check("discovery: a discovered required custom layer gates the verdict",
+              report["required_layers"] == ["types", "lints", "proptests",
+                                            "floors", "quint"],
+              str(report["required_layers"]))
+
+        # A discovered plan that cannot be parsed is ERROR: falling back to the
+        # built-in layers would report unrun verification as a verdict.
+        broken = tmp / "broken"
+        shutil.copytree(MINICRATE, broken)
+        broken_plan = broken / ".fv" / "verification-plan.json"
+        broken_plan.parent.mkdir(parents=True, exist_ok=True)
+        broken_plan.write_text("{not json")
+        code, out = run(broken, "tested")
+        check("discovery: a malformed discovered plan is ERROR, not a "
+              "silently-legacy run",
+              code == 2 and "VERDICT: ERROR" in out and "malformed JSON" in out
+              and "--no-plan" in out, f"exit={code} {out[:300]}")
+
+        # Present but not a readable file is still a plan the project declared.
+        unreadable = tmp / "unreadable"
+        shutil.copytree(MINICRATE, unreadable)
+        (unreadable / ".fv" / "verification-plan.json").mkdir(parents=True)
+        code, out = run(unreadable, "tested")
+        check("discovery: an unreadable plan path fails closed",
+              code == 2 and "cannot read plan" in out, f"exit={code} {out[:300]}")
+
+        # --no-plan is the only way a present plan does not run.
         legacy = tmp / "legacy"
         shutil.copytree(MINICRATE, legacy)
         write_plan(legacy, {"types": {"required": True, "executions": [
             {"argv": ["false"], "cwd": ".", "timeout_seconds": 5}]}})
-        code, out = run(legacy, "tested")
+        code, out = run(legacy, "tested", "--no-plan")
         report = latest_report(legacy)
-        check("legacy: plan file on disk is inert without --plan",
-              code == 0 and "VERIFIED[tested]" in out and "plan" not in report
+        check("--no-plan: a present plan is deliberately not run",
+              code == 0 and "VERIFIED[tested]" in out
               and report["layers"]["types"]["detail"]["command"]
               == ["cargo", "check", "--quiet"], f"exit={code}")
-        check("legacy: required layers unchanged without a plan",
-              report["required_layers"] == ["types", "lints", "proptests", "floors"],
+        check("--no-plan: the report records the ignored plan, not silence",
+              report["plan"]["discovery"] == "disabled"
+              and report["plan"]["path"]
+              == str((legacy / ".fv" / "verification-plan.json").resolve())
+              and "layers" not in report["plan"], str(report["plan"]))
+        check("--no-plan: required layers are the legacy set",
+              report["required_layers"] == ["types", "lints", "proptests",
+                                            "floors"],
               str(report["required_layers"]))
+        code, out = run(broken, "tested", "--no-plan")
+        check("--no-plan: an intentional legacy run survives a broken plan",
+              code == 0 and "VERIFIED[tested]" in out, f"exit={code}")
+
+        # An explicit --plan overrides the discoverable one, and asking for
+        # both a plan and no plan is a usage error, not a precedence puzzle.
+        both = tmp / "both"
+        shutil.copytree(MINICRATE, both)
+        (both / "probe.py").write_text(PROBE)
+        blog = tmp / "both.log"
+        write_plan(both, {"types": {"required": True, "executions": [
+            probe(both, blog, "discovered")]}})
+        chosen = tmp / "chosen-plan.json"
+        chosen.write_text(json.dumps({"schema": PLAN_SCHEMA, "layers": {
+            "types": {"required": True,
+                      "executions": [probe(both, blog, "explicit")]}}}))
+        code, out = run(both, "tested", "--plan", str(chosen))
+        report = latest_report(both)
+        labels = [json.loads(line)["label"]
+                  for line in blog.read_text().splitlines()]
+        check("--plan overrides the discoverable plan",
+              labels == ["explicit"]
+              and report["plan"]["discovery"] == "explicit"
+              and report["plan"]["source"] == str(chosen),
+              f"{labels} {report['plan'].get('discovery')}")
+        code, out = run(both, "tested", "--plan", str(chosen), "--no-plan")
+        check("--plan and --no-plan together are rejected",
+              code == 2 and "not allowed with" in out, f"exit={code} {out[:200]}")
+
+        # No plan anywhere: the legacy runner, and the report says so instead
+        # of leaving the reader to infer it from a missing key.
+        bare = tmp / "bare"
+        shutil.copytree(MINICRATE, bare)
+        code, out = run(bare, "tested")
+        report = latest_report(bare)
+        check("no plan on disk: built-in defaults, recorded as absent",
+              code == 0 and report["plan"]["discovery"] == "absent"
+              and report["plan"]["searched"]
+              == str((bare / ".fv" / "verification-plan.json").resolve())
+              and report["layers"]["types"]["detail"]["command"]
+              == ["cargo", "check", "--quiet"],
+              f"exit={code} {report['plan']}")
 
 
 def test_runner() -> None:
@@ -1025,6 +1142,7 @@ def main() -> int:
         return 2
     test_runner()
     test_plan_runner()
+    test_plan_discovery()
     test_custom_plan_layers()
     test_launch_failures()
 

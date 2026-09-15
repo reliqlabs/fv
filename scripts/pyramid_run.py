@@ -55,11 +55,22 @@ A skipped required layer is a gating gap, not a footnote: there is no
 kani/verus with zero harnesses/annotations under a profile that requires
 them is INCOMPLETE (no bounded evidence is not evidence).
 
-VERIFICATION PLANS (--plan, fv-verification-plan/v1)
-    `--plan PATH` reads a declarative plan (conventionally
-    <crate>/.fv/verification-plan.json) whose `layers` map names the layers
-    whose commands the project declares instead of inheriting the built-in
-    defaults:
+VERIFICATION PLANS (fv-verification-plan/v1, auto-discovered)
+    A project's plan lives at <crate>/.fv/verification-plan.json, and once it
+    exists it is MANDATORY: with neither --plan nor --no-plan the runner
+    auto-discovers that path and executes it, so a migrated project cannot
+    silently keep running the built-in defaults its plan replaced. Plan
+    provenance is always reported — `plan.discovery` in the JSON report is
+    `explicit` (--plan PATH), `autodiscovered` (the conventional path),
+    `absent` (no plan on disk) or `disabled` (--no-plan) — and one stderr
+    line names the source of every run.
+      --plan PATH  execute this plan instead of the auto-discovered one.
+      --no-plan    deliberate legacy run: built-in defaults only, even when
+                   the project has a plan. This is the only way a present plan
+                   does not run. A plan that exists but is unreadable or
+                   malformed is ERROR (exit 2), never a silently-legacy run.
+    A plan's `layers` map names the layers whose commands the project declares
+    instead of inheriting the built-in defaults:
         {"schema": "fv-verification-plan/v1",
          "layers": {"types": {"required": true, "executions": [
             {"argv": ["cargo", "check", "--quiet"], "cwd": ".",
@@ -106,12 +117,14 @@ VERIFICATION PLANS (--plan, fv-verification-plan/v1)
     already requires: a plan can only tighten the verdict. A types failure
     invalidates everything downstream, so every required or declared layer
     that has not run — custom layers included — is recorded not_run.
-    Layers the plan does not name keep every built-in default, and without
-    --plan the runner is byte-for-byte the legacy runner.
+    Layers the plan does not name keep every built-in default, and when no
+    plan is in effect — none on disk, or --no-plan — the runner is
+    byte-for-byte the legacy runner.
 
 USAGE
     pyramid_run.py --crate <path> --profile tested|bounded|proved
-        [--skip <layer>]... [--fuzz-seconds 30] [--plan <path>] [--json]
+        [--skip <layer>]... [--fuzz-seconds 30] [--json]
+        [--plan <path> | --no-plan]
 """
 from __future__ import annotations
 
@@ -545,6 +558,33 @@ def load_plan(path: str | Path, root: Path) -> dict:
     return parse_plan(document, root, source=str(path))
 
 
+def discover_plan(crate: Path) -> Path | None:
+    """The conventional plan path when the project has one, else None.
+
+    Presence, not readability, is the test. A plan that exists but cannot be
+    read or parsed must reach load_plan and become an ERROR: falling back to
+    the built-in defaults would run the legacy pyramid under the name of a
+    plan the project already declared. A dangling symlink is `present` for
+    exactly that reason."""
+    candidate = crate / PLAN_RELATIVE
+    return candidate if candidate.exists() or candidate.is_symlink() else None
+
+
+def plan_banner(plan: dict) -> str:
+    """One stderr line naming where this run's layer commands came from."""
+    discovery = plan["discovery"]
+    if discovery == "absent":
+        return (f"plan: none ({plan['searched']} absent); "
+                "built-in layer defaults")
+    if discovery == "disabled":
+        ignored = plan["path"]
+        return ("plan: disabled by --no-plan; built-in layer defaults"
+                + (f" ({ignored} present, deliberately not run)"
+                   if ignored else ""))
+    return (f"plan: {discovery} {plan['source']} ({plan['schema']}; "
+            f"layers {', '.join(plan['layers']) or 'none'})")
+
+
 def run_plan_execution(execution: dict, root: Path) -> dict:
     """Execute one declared invocation with its declared cwd, timeout and env."""
     result = run_cmd(execution["argv"], root / execution["cwd"],
@@ -566,12 +606,21 @@ def main() -> int:
                     help="skip a layer (a skipped REQUIRED layer gates the "
                          "run to INCOMPLETE — visible, not forgiven)")
     ap.add_argument("--fuzz-seconds", type=int, default=30)
-    ap.add_argument("--plan", type=Path, default=None,
-                    help=f"{PLAN_SCHEMA} document (conventionally "
-                         f"{PLAN_RELATIVE}) declaring per-layer argv/cwd/"
-                         "timeout_seconds/env, for known pyramid layers and "
-                         "for custom layers the plan names itself; layers it "
-                         "does not name keep their built-in defaults")
+    plans = ap.add_mutually_exclusive_group()
+    plans.add_argument("--plan", type=Path, default=None,
+                       help=f"execute this {PLAN_SCHEMA} document instead of "
+                            f"the auto-discovered <crate>/{PLAN_RELATIVE}; a "
+                            "plan declares per-layer argv/cwd/timeout_seconds/"
+                            "env for known pyramid layers and for custom "
+                            "layers it names itself, and layers it does not "
+                            "name keep their built-in defaults")
+    plans.add_argument("--no-plan", action="store_true",
+                       help="deliberate legacy run: ignore <crate>/"
+                            f"{PLAN_RELATIVE} and use the built-in layer "
+                            "defaults. Without it a project plan is "
+                            "mandatory: auto-discovered when present, and "
+                            "ERROR when present but unusable, never a "
+                            "silently-legacy run")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -581,18 +630,41 @@ def main() -> int:
         print("\nVERDICT: ERROR", file=sys.stderr)
         return 2
 
+    # A plan the project already declared is not opt-in: it is discovered,
+    # and the only way not to run it is to say so with --no-plan.
+    discovered = discover_plan(crate)
+    if args.no_plan:
+        plan_report = {"discovery": "disabled",
+                       "path": str(discovered) if discovered else None}
+        plan_path = None
+    elif args.plan is not None:
+        plan_report = {"discovery": "explicit", "path": str(args.plan)}
+        plan_path = args.plan
+    elif discovered is not None:
+        plan_report = {"discovery": "autodiscovered", "path": str(discovered)}
+        plan_path = discovered
+    else:
+        plan_report = {"discovery": "absent", "path": None,
+                       "searched": str(crate / PLAN_RELATIVE)}
+        plan_path = None
+
     plan_layers: dict[str, dict] = {}
-    plan_report: dict | None = None
-    if args.plan is not None:
+    if plan_path is not None:
         try:
-            plan = load_plan(args.plan, crate)
+            plan = load_plan(plan_path, crate)
         except PlanError as error:
             print(f"ERROR: {error}", file=sys.stderr)
+            if plan_report["discovery"] == "autodiscovered":
+                print("this project declares a plan, so falling back to the "
+                      "built-in defaults would report unrun verification as a "
+                      "verdict: fix the plan, or pass --no-plan to run the "
+                      "legacy layers deliberately", file=sys.stderr)
             print("\nVERDICT: ERROR", file=sys.stderr)
             return 2
         plan_layers = plan["layers"]
-        plan_report = {"schema": plan["schema"], "source": plan["source"],
-                       "layers": plan_layers}
+        plan_report |= {"schema": plan["schema"], "source": plan["source"],
+                        "layers": plan_layers}
+    print(plan_banner(plan_report), file=sys.stderr)
     if shutil.which("cargo") is None:
         print("ERROR: cargo not on PATH", file=sys.stderr)
         print("\nVERDICT: ERROR", file=sys.stderr)
@@ -764,7 +836,9 @@ def main() -> int:
         "crate": str(crate),
         "profile": args.profile,
         "required_layers": required,
-        **({"plan": plan_report} if plan_report is not None else {}),
+        # Always present: every report says where its layer commands came
+        # from, including "no plan on disk" and "a plan was ignored".
+        "plan": plan_report,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "layers": layers,
         "floors": layers.get("floors", {}).get("detail", {}),

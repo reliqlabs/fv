@@ -51,10 +51,13 @@ rule is: if the component's `source_snapshot` no longer matches the tree, its
 records must be re-earned.
 
 `source_snapshot` is a **verified-input content snapshot**: `sha256:<hex>` over
-every file `git ls-files --cached --others --exclude-standard` reports that does
-not fall under a `.fv/verified-inputs.txt` exclusion prefix, hashed as
-path + NUL + content-hash per input in sorted path order (CONCEPTS.md, "The
-verified-input content snapshot"). Five consequences for reuse:
+every candidate `git ls-files --cached --others --exclude-standard` reports that
+the project's verified-input policy selects, hashed as path + NUL +
+content-hash per input in sorted path order (CONCEPTS.md, "The verified-input
+content snapshot"). The policy is `.fv/verified-inputs.txt`: an exclusion list
+(the historical shape, and what a file carrying no `mode:` directive means) or a
+`mode: include` allowlist that names the paths in scope, with nine structural
+output exclusions applying in either mode. Five consequences for reuse:
 
 - **Reuse is decided by content, not by commit identity.** A commit that
   rewrites history, a rebase, a fresh clone, or a second worktree does not
@@ -67,26 +70,38 @@ verified-input content snapshot"). Five consequences for reuse:
   `sha256:<hex>+dirty` and the record's result is FAIL. A `+dirty` binding is
   therefore not a weaker PASS to reuse; it is an unusable record, and the run
   has to be repeated on a settled tree.
-- **A reuse decision must read the binding mode, not just the verdict.** Gate B
-  discloses which freshness discipline produced its verdict:
-  `VERIFIED[profile=...; binding=recomputed]` means the snapshot and intent
-  hash were recomputed and matched, `binding=pinned` means an operator-supplied
-  `--expect-snapshot` / `--expect-intent` was compared instead, and
-  `binding=unbound` means `--allow-unbound` switched the comparison off. Only
-  `recomputed` is evidence that the records still match the tree, so a
-  pinned or unbound PASS is not a reuse license. The coverage dashboard, which
-  never recomputes, always reports `binding=not-recomputed`.
-- **The exclusion list is part of the binding's meaning.** FV's own generated
-  output (`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`), quarantined pre-FV
-  history (`.fv/history/`, `.colosseum/`), and a shadow migration's staging
-  tree (`.fv/.migrate-staging/`) are structural defaults, applied whether or
-  not a project file names them, so writing evidence never invalidates the
-  evidence being written, migrated history never perturbs a fresh run,
-  quarantining more legacy history later cannot retroactively stale a reusable
-  record, and a migration interrupted mid-apply cannot stale one either by
-  leaving its staging directory behind. Adding a project prefix changes which
-  files the snapshot covers, which changes the snapshot: it is a binding
-  change, and every record bound to the old input set is stale.
+- **A reuse decision must read the binding mode, not the verdict word.** Gate B
+  discloses its freshness discipline in the `binding` field of its report:
+  `recomputed` means the verified-input snapshot and the intent hash were
+  recomputed this run and matched, `pinned` means an operator-supplied
+  `--expect-snapshot` / `--expect-intent` was compared instead, and `unbound`
+  means `--allow-unbound` switched the comparison off. Only `recomputed` is
+  evidence that the records still match the tree, so a pinned or unbound PASS is
+  not a reuse license. The verdict token says so without reading the JSON: a
+  recomputed run keeps the plain `VERIFIED[profile=...]` form, while a pinned or
+  unbound run qualifies its scope
+  (`VERIFIED[profile=...; binding=pinned]`, `VERIFIED[profile=...; binding=unbound]`).
+  The coverage dashboard recomputes nothing and never qualifies its scope; its
+  payload and `bindings:` summary line report `not-recomputed`, which is not a
+  reuse license either.
+- **The input policy is part of the binding's meaning.** FV's own generated
+  output (`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/changes/`,
+  `.fv/attacks/`, `.fv/code-adversarial/`), quarantined pre-FV history
+  (`.fv/history/`, `.colosseum/`), and a shadow migration's staging tree
+  (`.fv/.migrate-staging/`) are the nine structural exclusions, applied in
+  either policy mode whether or not a project file names them. So writing
+  evidence never invalidates the evidence being written; writing the change
+  record, attack log, or code-adversarial report that *describes* a verified
+  state afterwards does not stale that state's evidence; migrated history never
+  perturbs a fresh run; quarantining more legacy history later cannot
+  retroactively stale a reusable record; and a migration interrupted mid-apply
+  cannot stale one by leaving its staging directory behind. Everything else the
+  policy says is a binding input. Adding an exclusion prefix changes which files
+  the snapshot covers, which changes the snapshot: it is a binding change, and
+  every record bound to the old input set is stale. Editing a `mode: include`
+  allowlist is the same change from the other side, and it is self-announcing:
+  the allowlist selects the policy file itself, so the edit is already inside
+  the hash rather than silently re-scoping what the old evidence covers.
 - **The snapshot is whole-tree, so per-component reuse needs the boundary.**
   One project-wide hash cannot say *which* component moved. That is exactly what
   decomposition supplies: the per-component source set below is what makes the

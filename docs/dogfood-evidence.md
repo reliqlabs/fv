@@ -73,12 +73,29 @@ is the only producer of G1 records. It writes one record per claim at
 `.fv/evidence/raw/<claim_id>-<run_id>.log`, and binds both to the source and
 intent state it observed. Gate B consumes those records; prose does not.
 
+A complete record set for one project ships beside this document and is
+machine-validated rather than illustrated:
+[`templates/evidence-records.example.json`](../templates/evidence-records.example.json)
+carries one single-execution invariant record and one multi-execution
+system-claim record over the obligation set
+[`templates/obligations.example.json`](../templates/obligations.example.json)
+declares. Every digest in those files is an angle-bracketed placeholder listed
+under `_materialization`, because a shipped file cannot carry a digest over a
+tree and a toolchain that exist only where the run happened, and Gate B rejects
+a record that keeps one. `tests/r37_evidence_examples.py` performs the
+materialization the example declares - its project layout, its raw logs, a real
+executable digest per launched binary, then the bindings recomputed over all of
+it in a temporary git project - and asserts that Gate B answers
+`VERIFIED[profile=producer-trusted-execution]` at its default recomputed
+discipline, plus that a placeholder digest, a tampered log, a cohort missing a
+required tool, and a moved verified input each stop it.
+
 A record is `{ claim_id, required, evidence_class, result, scope, bindings,
 waiver }`. Its `bindings` object carries, in this order:
 
 | Binding | Meaning |
 |---|---|
-| `source_snapshot` | `sha256:<hex>` verified-input content snapshot, with a `+dirty` suffix when a non-excluded path was modified around the run |
+| `source_snapshot` | `sha256:<hex>` verified-input content snapshot, with a `+dirty` suffix when git reported a selected verified input as modified around the run |
 | `intent_path` | repo-relative canonical target the record is bound to |
 | `intent_hash` | SHA-256 over that target's bytes |
 | `obligation_manifest_hash` | SHA-256 over `.fv/obligations.json` bytes |
@@ -208,33 +225,70 @@ kind's allowed set is therefore disclosed, not rejected.
 ### The verified-input snapshot
 
 `source_snapshot` is not a commit id. It is `sha256:<hex>` computed over the
-project's verified inputs: every tracked-or-untracked, unignored file
-(`git ls-files --cached --others --exclude-standard -z`) minus the exclusion
-prefixes, sorted by UTF-8 path bytes, hashed as repo-relative POSIX path, NUL,
-file-content SHA-256 hex, newline. Symlinked candidates and candidates resolving
-outside the project root are rejected.
+project's verified inputs. The candidate set is every tracked-or-untracked,
+unignored file (`git ls-files --cached --others --exclude-standard -z`); the
+project's verified-input policy decides which candidates are inputs; the
+selected paths are sorted by UTF-8 path bytes and hashed as repo-relative POSIX
+path, NUL, file-content SHA-256 hex, newline. A symlinked candidate, a
+non-regular file (FIFO, socket, device node), and a candidate resolving outside
+the project root are rejected; a tracked-but-deleted path and a submodule
+gitlink are skipped.
 
-Exclusion prefixes are the always-applied structural defaults
-`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/history/`,
-`.fv/.migrate-staging/` and `.colosseum/`, unioned with
-`.fv/verified-inputs.txt`, whose blank and `#` lines are ignored and whose
-directory entries end in `/`. A project's file only ever *adds* prefixes; it
-cannot drop a default. That is what makes evidence production self-stable
-(writing and committing a record cannot move the snapshot the record is bound
-to), keeps quarantined pre-FV history under `.fv/history/` from perturbing a
-fresh run, and keeps a migration's staging tree under `.fv/.migrate-staging/`
-out of the binding. The defaults live in `fv_project.DEFAULT_EXCLUSIONS` and
-are mirrored in `tools/evidence-run.ts`, so the gate and the producer hash the
-same input set.
+The policy is `.fv/verified-inputs.txt`, whose blank and `#` lines are ignored
+and whose directory entries end in `/`. Its first non-comment line may be a
+`mode:` directive — `mode: exclude` or `mode: include`, with `mode:include` and
+interior padding parsing the same — and a directive anywhere else in the file is
+a rejection rather than a path entry, so a mode declared halfway down can never
+apply to the entries above it. Both modes share one path grammar: a
+trailing-slash entry matches a literal path prefix, and a bare entry matches the
+path itself or the subtree beneath that whole directory component, so `build`
+never matches `buildout.bin`.
 
-The producer snapshots before and after the cohort and compares; Gate B
-recomputes the current snapshot and compares again. So a record is fresh only
-while the verified inputs it was produced against are byte-identical.
+- **Exclusion mode** is the historical shape, what a file carrying no directive
+  means, and what an absent file means. Declared entries drop candidates from
+  the snapshot; every other candidate is an input.
+- **Include mode** inverts the selection: only candidates under a declared entry
+  are inputs. An include policy naming no path is rejected rather than read as
+  selecting nothing, and the policy file selects itself — the allowlist gains
+  `.fv/verified-inputs.txt` when it does not already name it — so revising the
+  allowlist moves the snapshot and stales the evidence bound to the old input
+  set instead of silently re-scoping what that evidence covers.
+
+Nine structural exclusions apply in either mode, and no project file can drop
+one: `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/changes/`,
+`.fv/attacks/`, `.fv/code-adversarial/`, `.fv/history/`,
+`.fv/.migrate-staging/`, `.colosseum/`. They are applied before selection, so an
+allowlist naming `.fv/` cannot pull generated output back in. That is what makes
+evidence production self-stable: writing and committing a record cannot move the
+snapshot the record is bound to, and writing a change record (`.fv/changes/`),
+an attack log (`.fv/attacks/`), or a code-adversarial report
+(`.fv/code-adversarial/`) *after* the evidence run does not stale the evidence
+those reports describe. The same defaults keep quarantined pre-FV history under
+`.fv/history/` and `.colosseum/` from perturbing a fresh run, and keep a
+migration's staging tree under `.fv/.migrate-staging/` out of the binding.
+
+The defaults, the mode grammar, and the selection rule live in `fv_project.py`
+(`DEFAULT_EXCLUSIONS`, `parse_policy`, `InputPolicy.selects`) and are mirrored in
+`tools/evidence-run.ts`, so the gate and the producer hash the same input set.
+`fv_project.py policy --json` prints the resolved mode, the declared prefixes,
+the structural prefixes, the include-mode selectors, and the effective
+exclusions.
+
+The producer snapshots before and after the cohort and compares, counting as
+dirt only a git-reported modification of a *selected* input: a change confined
+to generated FV output, or to a file an include policy does not name, is not
+dirt. Gate B recomputes the current snapshot and compares again. So a record is
+fresh only while the verified inputs it was produced against are byte-identical.
 
 ### A single-execution invariant record
 
 One command, one execution, one raw log. Angle-bracketed values are
 placeholders: the producer writes real digests and the gate recomputes them.
+A record of this shape with every placeholder materialized, and with the whole
+set gate-validated, is the `A1` record of
+[`templates/evidence-records.example.json`](../templates/evidence-records.example.json);
+it binds `.fv/intent.md` and a two-obligation manifest rather than this
+project's.
 
 ```json
 {
@@ -298,7 +352,10 @@ executable (`cargo`), which is why `tool` names the evidence tool
 ### A multi-execution system claim record
 
 A system claim is discharged by a cohort, not by one command. Declare it in
-`.fv/obligations.json` beside the invariants and witnesses it composes:
+`.fv/obligations.json` beside the invariants and witnesses it composes.
+[`templates/obligations.example.json`](../templates/obligations.example.json)
+is the shipped manifest, declaring the obligation set whose `S1` cohort the
+shipped record set discharges:
 
 ```json
 {
@@ -498,25 +555,45 @@ Both consumers of these records answer in one line, and neither ever prints a
 bare `VERIFIED`:
 
 ```
-VERDICT: VERIFIED[profile=producer-trusted-execution; binding=recomputed]
-VERDICT: VERIFIED[profile=bounded; binding=not-recomputed] (waived: W1)
+VERDICT: VERIFIED[profile=producer-trusted-execution]
+VERDICT: VERIFIED[profile=bounded] (waived: W1)
+VERDICT: VERIFIED[profile=producer-trusted-execution; binding=pinned]
+VERDICT: VERIFIED[profile=producer-trusted-execution; binding=unbound]
 ```
 
-`profile` is the slash-joined set of profiles the judged records declare.
-`binding` is what the tool did about freshness, and it is the field to read
-before trusting the rest:
+`profile` is the slash-joined set of profiles the judged records declare. The
+freshness discipline is named `binding`, and it is the thing to read before
+trusting the rest — but only a weaker-than-default discipline reaches the
+verdict scope:
 
-| `binding` | Emitted by | Meaning |
+- Gate B's default run (neither `--expect-snapshot`/`--expect-intent` nor
+  `--allow-unbound`) recomputes the verified-input snapshot and the intent hash
+  itself, and emits the established `VERIFIED[profile=...]` token unchanged. A
+  consumer matching that token keeps reading recomputed runs exactly as before.
+- A pinned or unbound Gate B run qualifies the scope: `; binding=pinned` when
+  operator-supplied expectations were compared instead of recomputed, and
+  `; binding=unbound` when `--allow-unbound` switched the source and intent
+  comparison off. A CI step that greps for the unqualified
+  `VERIFIED[profile=...]` form therefore keeps matching evidence-bound runs and
+  stops matching those two, instead of silently accepting all three alike.
+- `coverage_dashboard.py` never qualifies its scope. It recomputes nothing, so
+  minting a `binding` value in the scope would read as a freshness discipline it
+  ran; its token stays `VERIFIED[profile=...]`, the same one it has always
+  emitted.
+
+Every JSON payload names the binding regardless of the scope. Gate B's report
+carries `binding: recomputed | pinned | unbound`; the dashboard's payload and
+its `bindings:` summary line both carry `not-recomputed`.
+
+| `binding` value | Where it appears | Meaning |
 |---|---|---|
-| `recomputed` | Gate B | the verified-input snapshot and the intent hash were recomputed this run and matched |
-| `pinned` | Gate B | `--expect-snapshot` / `--expect-intent` supplied the values; nothing was recomputed |
-| `unbound` | Gate B | `--allow-unbound`: source and intent binding skipped entirely |
-| `not-recomputed` | `coverage_dashboard.py` | a read-only view over records; it recomputes nothing by design |
+| `recomputed` | Gate B report JSON only, never the scope | the verified-input snapshot and the intent hash were recomputed this run and matched |
+| `pinned` | Gate B report JSON and verdict scope | `--expect-snapshot` / `--expect-intent` supplied the values; nothing was recomputed |
+| `unbound` | Gate B report JSON and verdict scope | `--allow-unbound`: source and intent binding skipped entirely |
+| `not-recomputed` | `coverage_dashboard.py` payload and `bindings:` summary line, never the scope | a read-only view over records; it recomputes nothing by design |
 
 Waived claims are listed after the bracket so the scope stays a machine-readable
-field list. A CI step that greps the banner can therefore tell an evidence-bound
-VERIFIED from one earned with the freshness checks switched off, which the bare
-`VERIFIED[profile=...]` form could not express.
+field list.
 
 `coverage_dashboard.py` renders the same records per claim. Its statuses are
 `PASS`, `FAIL`, `INCOMPLETE`, `missing-record`, `duplicate-record`, `invalid`,
@@ -535,8 +612,9 @@ derivation from `executions[0]`.
 The only Gate B checks it does not run are the artifact reads — path
 containment, digest recomputation, and PASS markers — which need the repository
 root, plus snapshot and intent freshness, which needs the current tree. That is
-what `binding=not-recomputed` says, and it is why the dashboard cannot report
-coverage for a record Gate B rejects without reading the repository.
+what the dashboard's `not-recomputed` binding discloses, and it is why the
+dashboard cannot report coverage for a record Gate B rejects without reading the
+repository.
 
 Two limits are shared rather than closed, and they are limits of the invocation,
 not of one tool:
@@ -622,6 +700,9 @@ regenerate anything.
 3. Produce the per-claim records with `fv_evidence_run` - one per invariant and
    witness, one cohort per system claim - and list them under
    `evidence_records`, with `parser_schema_version` and the snapshot they share.
+   [`templates/evidence-records.example.json`](../templates/evidence-records.example.json)
+   and [`templates/obligations.example.json`](../templates/obligations.example.json)
+   are a validated record set and its obligation manifest to compare against.
 4. Record `verified_input_snapshot` per repo, the repo-relative `intent.path`
    and its `dispatch_target_spec`, and `verification_plan.path` when the project
    declares its layers.

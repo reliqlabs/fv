@@ -78,7 +78,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import check_evidence_records  # noqa: E402  the gate the manifest must satisfy
-import fv_project  # noqa: E402  the exclusion parser the new list must satisfy
+import fv_project  # noqa: E402  the policy parser the migrated list must satisfy
 import pyramid_run  # noqa: E402  the runner the migrated plan must satisfy
 
 MIGRATE = REPO / "scripts" / "fv_migrate.py"
@@ -427,6 +427,7 @@ def check_mapping(tmp: Path) -> None:
         ".colosseum/obligations.json": ".fv/obligations.json",
         ".colosseum/g1-claims.json": ".fv/obligations.json",
         ".colosseum/evidence/runs/layer-runs.json": ".fv/verification-plan.json",
+        ".colosseum/verified-inputs.txt": ".fv/verified-inputs.txt",
     }
     for source, destination in expected.items():
         artifact = artifact_of(report, source)
@@ -434,7 +435,7 @@ def check_mapping(tmp: Path) -> None:
               artifact is not None and artifact["classification"] == MAPPED
               and artifact["destination"] == destination,
               str(artifact))
-    check("exactly those five artifacts are mapped",
+    check("exactly those six artifacts are mapped",
           sorted(a["source"] for a in report["artifacts"] if a["classification"] == MAPPED)
           == sorted(expected),
           str(sorted(a["source"] for a in report["artifacts"] if a["classification"] == MAPPED)))
@@ -609,32 +610,58 @@ def check_history(tmp: Path) -> None:
 
 
 def check_verified_inputs(tmp: Path) -> None:
-    """The include list is history; the exclusion list is written fresh."""
+    """The legacy include list is translated into FV include mode, not inverted."""
     root = tmp / "inputs"
     scaffold(root)
     code, report, err = report_of(root, "--apply")
     artifact = artifact_of(report, ".colosseum/verified-inputs.txt")
-    check("the legacy include list is preserved history, not mapped",
-          code == 0 and artifact is not None and artifact["classification"] == PRESERVED,
-          str(artifact))
-    check("the legacy include list survives verbatim",
+    check("the legacy include list is mapped to the FV policy, not just history",
+          code == 0 and artifact is not None and artifact["classification"] == MAPPED
+          and artifact["destination"] == ".fv/verified-inputs.txt",
+          f"exit={code} {artifact} {err[-200:]}")
+    check("the legacy include list still survives verbatim as history",
           (root / ".fv/history/colosseum/verified-inputs.txt").read_text() == VERIFIED_INPUTS)
 
-    text = (root / ".fv/verified-inputs.txt").read_text()
-    prefixes = fv_project.parse_exclusions(text)
-    check("the new exclusion list parses under fv_project",
-          all(prefix in prefixes for prefix in fv_project.DEFAULT_EXCLUSIONS),
-          str(prefixes))
-    check("imported history is excluded from the verified-input snapshot",
-          ".fv/history/" in prefixes, str(prefixes))
-    check("no legacy include entry is copied into the exclusion list",
-          not {"crates", "quint", "proofs", "Cargo.toml", "docs/intent.md"} & set(prefixes),
-          str(prefixes))
-    check("the exclusion list explains the inversion",
-          "include list" in text and "history" in text)
-    check("loaded exclusions cover the legacy tree and imported history",
-          fv_project.is_excluded(".colosseum/ledger.md", prefixes)
-          and fv_project.is_excluded(".fv/history/colosseum/ledger.md", prefixes))
+    policy = fv_project.load_policy(root)
+    check("the migrated policy is include mode",
+          policy.mode == fv_project.MODE_INCLUDE, policy.mode)
+    selectors = set(policy.selectors())
+    check("every legacy source root is carried across verbatim",
+          {"crates", "quint", "proofs", "Cargo.toml"} <= selectors, sorted(selectors))
+    check("the legacy manifest entry binds the FV artifact its content migrated to",
+          ".fv/obligations.json" in selectors
+          and not [entry for entry in selectors if entry.startswith(".colosseum/")],
+          sorted(selectors))
+    check("the canonical target and the migrated plan are bound",
+          {"docs/intent.md", ".fv/verification-plan.json"} <= selectors, sorted(selectors))
+    check("the policy binds itself, so revising it invalidates bound evidence",
+          policy.selects(".fv/verified-inputs.txt"), sorted(selectors))
+    check("a source a layer reads is selected",
+          policy.selects("crates/contract/src/lib.rs") and policy.selects("docs/intent.md"))
+    check("nothing outside the translated list is selected",
+          not policy.selects("README.md") and not policy.selects(".colosseum/ledger.md")
+          and not policy.selects(".fv/history/colosseum/ledger.md"))
+    check("the policy explains the translation",
+          "include" in (root / ".fv/verified-inputs.txt").read_text())
+
+    # Blocking cases: a policy that binds nothing a layer reads would leave
+    # evidence fresh across every source edit, so it is refused outright.
+    for name, legacy, expected in (
+        ("history-only", "# legacy\n.colosseum/evidence\n.colosseum/attacks/\n",
+         "selects nothing any layer reads"),
+        ("comment-only", "# nothing in scope\n#\n", "declares no entries"),
+        ("malformed", "crates\n/etc/passwd\n", "not a parseable verified-input policy"),
+    ):
+        blocked = tmp / f"inputs-{name}"
+        scaffold(blocked)
+        (blocked / ".colosseum/verified-inputs.txt").write_text(legacy)
+        code, report, err = report_of(blocked, "--apply")
+        check(f"a {name} legacy include list blocks the migration",
+              code == 1 and report.get("status") == "blocked"
+              and any(expected in entry for entry in report.get("unsupported", [])),
+              f"exit={code} {report.get('unsupported')}")
+        check(f"nothing is written for a {name} legacy include list",
+              not (blocked / ".fv/verified-inputs.txt").exists())
 
 
 # --------------------------------------------------------------------------
@@ -2134,9 +2161,8 @@ def check_killed_apply_residue(tmp: Path) -> None:
     check("the stranded residue sits under one fixed prefix",
           len({"/".join(path.split("/")[:2]) for path in residue}) == 1,
           str(sorted({"/".join(path.split("/")[:2]) for path in residue})))
-    check("the migrated project's own exclusion list covers it too",
-          all(fv_project.is_excluded(path, fv_project.load_exclusions(root))
-              for path in residue))
+    check("the migrated project's own policy selects none of it either",
+          not [path for path in residue if fv_project.load_policy(root).selects(path)])
 
     stranded_before = {path: (root / path).read_bytes() for path in residue}
     runs_before = {path.split("/")[2] for path in residue}

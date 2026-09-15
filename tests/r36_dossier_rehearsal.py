@@ -13,8 +13,8 @@ backticked `code:`/`kani:` citations bound to 12-hex line hashes, a
 `colosseum-obligations` claim list of C-01..C-09, a `colosseum-g1-claims`
 map with per-claim layers and `<layer>:<target>` required targets (one of
 them a Rust `::` path, as the real project spells its Verus targets), an
-include-list `verified-inputs.txt` (semantically inverted from FV's
-exclusion list), a `colosseum-layer-runs` v2 manifest whose commands are
+include-list `verified-inputs.txt` (the shape FV include mode translates
+rather than inverts), a `colosseum-layer-runs` v2 manifest whose commands are
 semicolon-joined shell strings, and the historical attacks / changes /
 code-adversarial / classifications / verify / evidence / scripts trees
 (including a non-UTF-8 `.pyc`, which a byte-faithful copier must survive).
@@ -47,6 +47,10 @@ What this suite holds the migration to:
     survives in `legacy_id`;
   * legacy G1 records are history, never live v3 records, and imported
     bytes are never verified inputs;
+  * the legacy include list is translated into an FV include policy, not
+    replaced by a broad exclusion list: every source root survives, the
+    legacy manifest entries bind the FV artifacts they migrated to, and the
+    policy binds itself;
   * the staging residue a hard-killed apply strands moves no verified-input
     snapshot, asserted against the real git-backed snapshot this project
     has rather than against a parsed exclusion list;
@@ -1296,26 +1300,45 @@ def check_plan(project: Path, report: dict, probe_log: Path) -> None:
 
 
 def check_verified_inputs(project: Path) -> None:
-    text = (project / ".fv" / "verified-inputs.txt").read_text()
-    exclusions = fv_project.parse_exclusions(text)
-    check("the exclusion list carries the FV defaults",
-          set(FV_DEFAULT_EXCLUSIONS) <= set(exclusions), exclusions)
-    check("imported history is excluded too",
-          HISTORY_EXCLUSION in exclusions, exclusions)
-    check("in-flight migration staging is excluded too",
-          STAGING_EXCLUSION in exclusions, exclusions)
-    check("the legacy include list is not reused as exclusion semantics",
-          not (set(LEGACY_INCLUDE_LIST) & set(exclusions)),
-          sorted(set(LEGACY_INCLUDE_LIST) & set(exclusions)))
+    """The legacy include list becomes an FV include policy, not an exclusion list."""
+    policy = fv_project.load_policy(project)
+    check("the migrated policy declares include mode",
+          policy.mode == fv_project.MODE_INCLUDE, policy.mode)
+    selectors = set(policy.selectors())
+    source_roots = {entry for entry in LEGACY_INCLUDE_LIST
+                    if not entry.startswith(".colosseum/")}
+    check("every legacy source root is carried across verbatim",
+          source_roots <= selectors, sorted(source_roots - selectors))
+    check("the legacy manifest entries bind the FV artifacts they migrated to",
+          ".fv/obligations.json" in selectors
+          and ".fv/verification-plan.json" in selectors
+          and not [entry for entry in selectors if entry.startswith(".colosseum/")],
+          sorted(selectors))
+    check("the policy binds itself, so revising it moves the snapshot",
+          policy.selects(fv_project.VERIFIED_INPUTS_RELATIVE), sorted(selectors))
+    check("the structural output exclusions still apply under include mode",
+          set(FV_DEFAULT_EXCLUSIONS) <= set(policy.exclusions())
+          and HISTORY_EXCLUSION in policy.exclusions()
+          and STAGING_EXCLUSION in policy.exclusions(),
+          policy.exclusions())
     legacy_copy = project / HISTORY_ROOT / "verified-inputs.txt"
-    check("the legacy include list survives as history",
+    check("the legacy include list survives verbatim as history",
           legacy_copy.is_file()
           and legacy_copy.read_bytes()
           == (project / ".colosseum" / "verified-inputs.txt").read_bytes())
     inputs = resolver(project, "inputs")
     paths = {entry["path"] for entry in inputs} if isinstance(inputs, list) else set()
-    check("the snapshot still binds the sources a layer reads",
+    check("the snapshot binds the sources a layer reads",
           {"docs/intent.md", "quint/dossier.qnt"} <= paths, sorted(paths)[:8])
+    check("the snapshot binds the policy itself",
+          fv_project.VERIFIED_INPUTS_RELATIVE in paths, sorted(paths)[:8])
+    check("the snapshot binds the migrated manifests",
+          {".fv/obligations.json", ".fv/verification-plan.json"} <= paths, sorted(paths)[:8])
+    # The reason the legacy project wrote an include list, preserved by the
+    # translation: a tracked file no layer reads cannot stale a record.
+    check("a tracked path the policy does not name is not a verified input",
+          "README.md" not in paths and not policy.selects("README.md"),
+          sorted(paths)[:8])
     check("no imported or legacy byte is a verified input",
           not [path for path in paths
                if path.startswith(".colosseum/") or path.startswith(".fv/history/")],

@@ -10,8 +10,11 @@ Two contracts live here so producers, gates, and scaffolding agree byte for byte
 * the canonical verification target is ``.fv/dispatch.json`` ->
   ``omp_native.target_spec``, defaulting to ``.fv/intent.md``, always resolved
   under the project root;
-* the verified-input snapshot is a deterministic content hash over git's
-  tracked-and-unignored candidate set minus the declared exclusion prefixes.
+* the verified-input snapshot is a deterministic content hash over the candidate
+  set git reports, filtered by the project's verified-input policy: an exclusion
+  list (the historical shape, and the default when no mode is declared) or an
+  explicit ``mode: include`` allowlist. Structural output exclusions apply in
+  either mode.
 
 Import-safe: no module-level side effects. Gate and producer copies installed
 under ``<project>/.fv/scripts`` import this file from their own directory.
@@ -24,6 +27,7 @@ import json
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 DISPATCH_RELATIVE = ".fv/dispatch.json"
@@ -31,10 +35,26 @@ VERIFIED_INPUTS_RELATIVE = ".fv/verified-inputs.txt"
 DEFAULT_TARGET_SPEC = ".fv/intent.md"
 # Generated FV output, plus quarantined legacy history and in-flight migration
 # staging: excluding these structurally keeps writing evidence, writing a verification
-# report, quarantining legacy history, or a killed migration's staging residue from
-# invalidating the evidence bound to the snapshot. Mirrored in tools/evidence-run.ts.
-DEFAULT_EXCLUSIONS = (".fv/evidence/", ".fv/verify/", ".fv/panels/", ".fv/history/",
+# report, writing a lifecycle report (a change record, an attack log, a code-adversarial
+# report), quarantining legacy history, or a killed migration's staging residue from
+# invalidating the evidence bound to the snapshot. Applied under an include policy too,
+# so an allowlist naming ``.fv/`` cannot pull generated output back in. Mirrored in
+# tools/evidence-run.ts.
+DEFAULT_EXCLUSIONS = (".fv/evidence/", ".fv/verify/", ".fv/panels/", ".fv/changes/",
+                      ".fv/attacks/", ".fv/code-adversarial/", ".fv/history/",
                       ".fv/.migrate-staging/", ".colosseum/")
+# Verified-input policy modes. ``exclude`` is the historical shape and the mode a file
+# with no directive carries, so every list written before include mode existed keeps its
+# meaning. Mirrored in tools/evidence-run.ts.
+MODE_EXCLUDE = "exclude"
+MODE_INCLUDE = "include"
+POLICY_MODES = (MODE_EXCLUDE, MODE_INCLUDE)
+# A mode directive is the first non-comment line or nothing. ``mode: include`` is the
+# canonical spelling; ``mode:include`` and interior padding parse the same. A line whose
+# casefolded form starts with this prefix but names no known mode is rejected rather
+# than read as a path entry, so ``Mode: Include`` cannot silently become an allowlist
+# entry that matches nothing. Mirrored in tools/evidence-run.ts.
+MODE_DIRECTIVE_PREFIX = "mode:"
 SNAPSHOT_PREFIX = "sha256:"
 # Characters Python's ``str.splitlines``/``str.strip`` treat as line breaks or
 # whitespace while JavaScript's ``split("\n")``/``trim`` do not. An exclusion list
@@ -185,16 +205,16 @@ def _is_control(char: str) -> bool:
     return code <= 0x1F or 0x7F <= code <= 0x9F
 
 
-def parse_exclusions(text: str) -> list[str]:
-    """Parse a verified-input exclusion list into normalized prefixes.
+def _reject_ambiguous_characters(text: str) -> None:
+    """Reject every character the two parsers would read differently.
 
     One rule, mirrored in ``tools/evidence-run.ts``: LF and CRLF separate
     entries, and every other control character, plus a byte-order mark, is
     rejected outright rather than stripped or re-interpreted. Python and
     JavaScript disagree about which of them break lines, which of them ``strip``,
     and whether a BOM survives decoding, so accepting one would let the gate and
-    the producer derive different exclusion sets from a single list. Every other
-    Unicode character is kept verbatim: a non-ASCII path is a legal entry.
+    the producer derive different input sets from a single policy file. Every
+    other Unicode character is kept verbatim: a non-ASCII path is a legal entry.
     """
     lineno = 1
     for index, char in enumerate(text):
@@ -212,60 +232,221 @@ def parse_exclusions(text: str) -> list[str]:
         if _is_control(char):
             raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: "
                                f"control character {char!r}; use LF-separated entries")
-    prefixes: list[str] = []
-    for lineno, raw in enumerate(text.splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("./"):
-            line = line[2:]
-        if not line or line in (".", "/"):
-            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: entry excludes the whole project")
-        if Path(line).is_absolute():
-            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: absolute entry {line!r}")
-        if ".." in Path(line).parts:
-            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: entry escapes project root: {line!r}")
-        if line not in prefixes:
-            prefixes.append(line)
-    return prefixes
 
 
-def load_exclusions(project_root: str | Path) -> list[str]:
-    """Declared exclusions unioned with the always-applied defaults.
+def _directive_value(line: str) -> str | None:
+    """The mode a directive line names, or ``None`` when it is not a directive.
 
-    The defaults keep evidence, verification, panel, quarantined-history, and
-    migration-staging outputs out of the snapshot so writing evidence,
-    quarantining legacy history, or abandoning a migration mid-apply can never
-    invalidate the evidence being written; a project list only adds prefixes, so
-    it cannot restore a default into the snapshot. The bytes are decoded as
-    strict UTF-8 with no newline translation: ``read_text`` would rewrite a lone
-    ``\\r`` to ``\\n`` and hide from ``parse_exclusions`` exactly the terminator
-    it exists to reject, and a decode failure is a rejection here rather than a
-    replacement character.
+    The prefix is matched case-insensitively over exactly as many characters as
+    it has, so the recognition is length-stable in both languages, and the value
+    is compared against ``POLICY_MODES`` verbatim afterwards: a line that looks
+    like a directive but names no known mode is a rejection, never a path entry.
     """
-    root = resolve_project_root(project_root)
-    prefixes = list(DEFAULT_EXCLUSIONS)
-    listing = root / VERIFIED_INPUTS_RELATIVE
-    if listing.is_file():
-        try:
-            text = listing.read_bytes().decode("utf-8")
-        except (OSError, UnicodeDecodeError) as error:
-            raise ProjectError(f"cannot read {VERIFIED_INPUTS_RELATIVE}: {error}") from error
-        for prefix in parse_exclusions(text):
-            if prefix not in prefixes:
-                prefixes.append(prefix)
-    return prefixes
+    head = line[:len(MODE_DIRECTIVE_PREFIX)].lower()
+    if head != MODE_DIRECTIVE_PREFIX:
+        return None
+    return line[len(MODE_DIRECTIVE_PREFIX):].strip()
 
 
-def is_excluded(relative: str, exclusions: list[str] | tuple[str, ...]) -> bool:
-    """True when ``relative`` falls under an exclusion prefix."""
-    for prefix in exclusions:
+def mode_directive(mode: str) -> str:
+    """The canonical directive line for ``mode``, without its newline."""
+    if mode not in POLICY_MODES:
+        raise ProjectError(f"unknown verified-input policy mode {mode!r}")
+    return f"{MODE_DIRECTIVE_PREFIX} {mode}"
+
+
+def matches_prefixes(relative: str, prefixes: list[str] | tuple[str, ...]) -> bool:
+    """True when ``relative`` falls under one of ``prefixes``.
+
+    One path-matching rule for both modes: a trailing-slash entry matches a
+    literal path prefix, and a bare entry matches the path itself or the subtree
+    beneath that whole directory component, so ``build`` never matches
+    ``buildout.bin``. Mirrored in ``tools/evidence-run.ts``.
+    """
+    for prefix in prefixes:
         if prefix.endswith("/"):
             if relative.startswith(prefix):
                 return True
         elif relative == prefix or relative.startswith(prefix + "/"):
             return True
     return False
+
+
+# One rule, two sides of a policy. The exclusion name predates include mode and is what
+# the gates and migration tooling already call.
+is_excluded = matches_prefixes
+
+
+@dataclass(frozen=True)
+class InputPolicy:
+    """How a project's git candidates become its verified inputs.
+
+    ``mode`` is ``exclude`` (the historical shape, and what a file with no
+    directive means) or ``include``. ``prefixes`` are the declared repo-relative
+    file-or-directory entries in file order, deduped, under one path grammar for
+    both modes. ``structural`` are the generated-output prefixes that apply in
+    either mode and that no project file can drop.
+
+    Under ``include`` the policy file selects itself, so revising the allowlist
+    moves the snapshot and invalidates the evidence bound to the old one instead
+    of silently re-scoping what evidence covers. An include policy naming no path
+    is rejected: it would select a single file, the policy, and bind evidence to
+    nothing a layer reads.
+    """
+
+    mode: str
+    prefixes: tuple[str, ...] = ()
+    structural: tuple[str, ...] = DEFAULT_EXCLUSIONS
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "prefixes", tuple(self.prefixes))
+        object.__setattr__(self, "structural", tuple(self.structural))
+        if self.mode not in POLICY_MODES:
+            raise ProjectError(f"unknown verified-input policy mode {self.mode!r}")
+        if self.mode == MODE_INCLUDE and not self.prefixes:
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}: {mode_directive(MODE_INCLUDE)} "
+                               f"names no path; list the paths in scope or drop the directive")
+
+    def selectors(self) -> tuple[str, ...]:
+        """Include-mode allowlist with the policy file self-bound; empty otherwise."""
+        if self.mode != MODE_INCLUDE:
+            return ()
+        if VERIFIED_INPUTS_RELATIVE in self.prefixes:
+            return self.prefixes
+        return (*self.prefixes, VERIFIED_INPUTS_RELATIVE)
+
+    def exclusions(self) -> list[str]:
+        """Exclusion prefixes that apply: structural, plus declared under exclude mode."""
+        prefixes = list(self.structural)
+        if self.mode == MODE_EXCLUDE:
+            for prefix in self.prefixes:
+                if prefix not in prefixes:
+                    prefixes.append(prefix)
+        return prefixes
+
+    def selects(self, relative: str) -> bool:
+        """True when candidate ``relative`` is a verified input under this policy.
+
+        Structural exclusions are applied first in both modes, so an allowlist
+        entry can never pull generated FV output back into the snapshot and make
+        writing a report stale the evidence that report describes.
+        """
+        if matches_prefixes(relative, self.structural):
+            return False
+        if self.mode == MODE_INCLUDE:
+            return matches_prefixes(relative, self.selectors())
+        return not matches_prefixes(relative, self.prefixes)
+
+    def render(self, header: str = "") -> str:
+        """This policy as file text that parses back to an equal policy."""
+        return render_policy(self, header)
+
+
+def render_policy(policy: InputPolicy, header: str = "") -> str:
+    """Render ``policy`` as ``.fv/verified-inputs.txt`` text.
+
+    The mode directive is always written, in both modes: a file that declares its
+    own mode cannot be misread as the other one after an edit, and ``parse_policy``
+    reads the result back to an equal policy. ``header`` is emitted verbatim ahead
+    of the directive and is expected to carry only comment and blank lines.
+    """
+    if header and not header.endswith("\n"):
+        header += "\n"
+    body = f"{mode_directive(policy.mode)}\n"
+    body += "".join(f"{prefix}\n" for prefix in policy.prefixes)
+    return header + body
+
+
+def parse_policy(text: str) -> InputPolicy:
+    """Parse verified-input policy text into an ``InputPolicy``.
+
+    A ``mode:`` directive is legal only as the first non-comment line; anywhere
+    else it is a rejection rather than a path entry, so a mode declared halfway
+    down a file can never apply to the entries above it. With no directive the
+    policy is exclusion mode, which is what every list written before include
+    mode existed means. Mirrored in ``tools/evidence-run.ts``.
+    """
+    _reject_ambiguous_characters(text)
+    mode: str | None = None
+    prefixes: list[str] = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        value = _directive_value(line)
+        if value is not None:
+            if mode is not None or prefixes:
+                raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: mode directive must be "
+                                   f"the first non-comment line")
+            if value not in POLICY_MODES:
+                raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: unknown mode {value!r}; "
+                                   f"write {mode_directive(MODE_INCLUDE)!r} or "
+                                   f"{mode_directive(MODE_EXCLUDE)!r}")
+            mode = value
+            continue
+        if mode is None:
+            mode = MODE_EXCLUDE
+        if line.startswith("./"):
+            line = line[2:]
+        if not line or line in (".", "/"):
+            verb = "selects" if mode == MODE_INCLUDE else "excludes"
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: "
+                               f"entry {verb} the whole project")
+        if Path(line).is_absolute():
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: absolute entry {line!r}")
+        if ".." in Path(line).parts:
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: entry escapes project root: {line!r}")
+        if line not in prefixes:
+            prefixes.append(line)
+    return InputPolicy(mode or MODE_EXCLUDE, tuple(prefixes))
+
+
+def parse_exclusions(text: str) -> list[str]:
+    """Declared exclusion prefixes from exclusion-mode policy text.
+
+    Include-mode text is a rejection, not an empty exclusion list: a caller that
+    asked for exclusions would otherwise treat an allowlist as "excludes nothing"
+    and hash the whole repository. Such callers want ``parse_policy``.
+    """
+    policy = parse_policy(text)
+    if policy.mode != MODE_EXCLUDE:
+        raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}: declares "
+                           f"{mode_directive(policy.mode)!r}; use parse_policy")
+    return list(policy.prefixes)
+
+
+def load_policy(project_root: str | Path) -> InputPolicy:
+    """The project's verified-input policy; exclusion mode with no entries when absent.
+
+    The bytes are decoded as strict UTF-8 with no newline translation:
+    ``read_text`` would rewrite a lone ``\\r`` to ``\\n`` and hide from
+    ``parse_policy`` exactly the terminator it exists to reject, and a decode
+    failure is a rejection here rather than a replacement character.
+    """
+    root = resolve_project_root(project_root)
+    listing = root / VERIFIED_INPUTS_RELATIVE
+    if not listing.is_file():
+        return InputPolicy(MODE_EXCLUDE)
+    try:
+        text = listing.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ProjectError(f"cannot read {VERIFIED_INPUTS_RELATIVE}: {error}") from error
+    return parse_policy(text)
+
+
+def load_exclusions(project_root: str | Path) -> list[str]:
+    """Exclusion prefixes that apply to the project, defaults included.
+
+    The defaults keep evidence, verification, panel, lifecycle-report,
+    quarantined-history, and migration-staging outputs out of the snapshot so
+    writing evidence, writing a change record or attack log, quarantining legacy
+    history, or abandoning a migration mid-apply can never invalidate the
+    evidence being written; a project list only adds prefixes, so it cannot
+    restore a default into the snapshot. Under ``mode: include`` only the
+    structural defaults are exclusions and selection is the allowlist's, so what
+    the snapshot covers is ``load_policy``'s answer, never this one's.
+    """
+    return load_policy(project_root).exclusions()
 
 
 def _file_digest(path: Path) -> str:
@@ -295,16 +476,40 @@ def candidate_paths(project_root: str | Path) -> list[str]:
     return list(dict.fromkeys(name for name in names.split("\0") if name))
 
 
+def order_inputs(paths: list[str] | tuple[str, ...]) -> list[str]:
+    """Snapshot order: UTF-8 byte-wise, not code-unit-wise.
+
+    A JavaScript runtime's default string comparison orders by UTF-16 code unit,
+    which puts every astral-plane path (leading surrogate U+D800..U+DBFF) ahead
+    of U+E000..U+FFFF, the reverse of UTF-8 byte order. Both ends sort on UTF-8
+    bytes so one repository hashes to one snapshot; mirrored by
+    ``orderVerifiedInputs`` in ``tools/evidence-run.ts``.
+    """
+    return sorted(paths, key=lambda name: name.encode("utf-8"))
+
+
 def snapshot_entries(
     project_root: str | Path,
     exclusions: list[str] | tuple[str, ...] | None = None,
+    policy: InputPolicy | None = None,
 ) -> list[tuple[str, str]]:
-    """Sorted ``(repo-relative POSIX path, content sha256)`` verified inputs."""
+    """Sorted ``(repo-relative POSIX path, content sha256)`` verified inputs.
+
+    Selection comes from ``policy``, else from the project's declared policy. An
+    explicit ``exclusions`` list is the historical call shape and is honoured as
+    a literal exclusion set, defaults included or not exactly as given, so a
+    caller can still ask what dropping one structural prefix would do.
+    """
     root = resolve_project_root(project_root)
-    prefixes = list(load_exclusions(root) if exclusions is None else exclusions)
-    selected = [name for name in candidate_paths(root) if not is_excluded(name, prefixes)]
+    if exclusions is not None:
+        if policy is not None:
+            raise ProjectError("pass either exclusions or policy, not both")
+        policy = InputPolicy(MODE_EXCLUDE, tuple(exclusions), ())
+    elif policy is None:
+        policy = load_policy(root)
+    selected = [name for name in candidate_paths(root) if policy.selects(name)]
     entries: list[tuple[str, str]] = []
-    for relative in sorted(selected, key=lambda name: name.encode("utf-8")):
+    for relative in order_inputs(selected):
         path = root / relative
         resolved = Path(_normalize(path))
         if not _contained(root, resolved):
@@ -333,10 +538,11 @@ def snapshot_entries(
 def content_snapshot(
     project_root: str | Path,
     exclusions: list[str] | tuple[str, ...] | None = None,
+    policy: InputPolicy | None = None,
 ) -> str:
     """Deterministic ``sha256:<hex>`` snapshot of the project's verified inputs."""
     digest = hashlib.sha256()
-    for relative, content_hash in snapshot_entries(project_root, exclusions):
+    for relative, content_hash in snapshot_entries(project_root, exclusions, policy):
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(content_hash.encode("ascii"))
@@ -354,7 +560,8 @@ def is_content_snapshot(value: object) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("target", "snapshot", "inputs", "exclusions"))
+    parser.add_argument("command",
+                        choices=("target", "snapshot", "inputs", "exclusions", "policy"))
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -377,9 +584,21 @@ def main(argv: list[str] | None = None) -> int:
             entries = snapshot_entries(root)
             payload = [{"path": path, "sha256": digest} for path, digest in entries]
             plain = "\n".join(f"{digest}  {path}" for path, digest in entries)
+        elif args.command == "policy":
+            policy = load_policy(root)
+            payload = {
+                "project_root": str(root),
+                "mode": policy.mode,
+                "prefixes": list(policy.prefixes),
+                "structural": list(policy.structural),
+                "selectors": list(policy.selectors()),
+                "exclusions": policy.exclusions(),
+            }
+            plain = policy.render()
         else:
-            payload = load_exclusions(root)
-            plain = "\n".join(load_exclusions(root))
+            exclusions = load_exclusions(root)
+            payload = exclusions
+            plain = "\n".join(exclusions)
     except ProjectError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2

@@ -39,6 +39,9 @@ INVENTORY
         `.colosseum/g1-claims.json`             -> `.fv/obligations.json`
         `.colosseum/evidence/runs/layer-runs.json`
                                                 -> `.fv/verification-plan.json`
+        `.colosseum/verified-inputs.txt`         -> `.fv/verified-inputs.txt`
+                                                   (translated, and also kept
+                                                   verbatim under history)
     preserved-history
         every other regular file, byte-for-byte, under
         `.fv/history/colosseum/<path relative to .colosseum>`. That includes
@@ -148,10 +151,48 @@ VERIFICATION PLAN
 
 VERIFIED INPUTS
     Legacy `verified-inputs.txt` is an include list: its entries name the paths
-    in scope. `.fv/verified-inputs.txt` is an exclusion list, the exact
-    opposite, and inverting an include list would mean enumerating the
-    complement of the repository. The legacy list is therefore preserved as
-    history and FV's conservative defaults are written instead.
+    in scope. FV include mode means exactly that, so the list is translated
+    rather than inverted -- inverting it would mean enumerating the complement
+    of the repository, which is what the legacy project adopted an include list
+    to avoid. `.fv/verified-inputs.txt` is written with `mode: include` as its
+    first non-comment line, and every legacy entry is carried across:
+
+      - a source root (`crates`, `quint`, `proofs`, `Cargo.toml`,
+        `Cargo.lock`, ...) is kept verbatim, since both files grade paths the
+        same way;
+      - an entry naming a legacy manifest binds the FV artifact that
+        manifest's content migrated to -- `.colosseum/obligations.json` and
+        `.colosseum/g1-claims.json` bind `.fv/obligations.json`,
+        `.colosseum/evidence/runs/layer-runs.json` binds
+        `.fv/verification-plan.json` -- because the legacy tree is
+        structurally excluded and its own bytes become history. The mapping is
+        read from this run's inventory, so an entry only ever binds an
+        artifact this migration actually wrote;
+      - an entry naming legacy bytes that migrate to history alone binds
+        nothing and is reported as a `#<entry>` deviation row, rather than
+        silently narrowing the policy;
+      - the elected canonical target is bound whether or not the legacy list
+        named it, since it is the document every migrated evidence record
+        binds to, and so are whichever of `.fv/obligations.json` and
+        `.fv/verification-plan.json` this run wrote: FV reads them to decide
+        what each layer must discharge and what command discharges it, which
+        is what the legacy list bound `.colosseum/obligations.json` for;
+      - `.fv/verified-inputs.txt` binds itself, so editing the policy
+        invalidates the evidence bound to it.
+
+    The emitted bytes are read back through the same parser the gate and the
+    producer use before they are planned: a lost mode directive would
+    republish the policy as an exclusion list binding the whole repository
+    minus a few source roots. A legacy list that is not valid UTF-8, does not
+    parse under the path grammar, declares no entries at all, or whose every
+    entry translates to nothing is unsupported and blocks the migration. The
+    last case is the one worth stating: the policy would still bind the
+    canonical target and the migrated manifests, so it would be a valid
+    include policy, and the evidence bound to it would survive every edit to
+    the sources a layer actually decides on. The exact legacy list is
+    preserved verbatim at `.fv/history/colosseum/verified-inputs.txt` whatever
+    the translation did with it. A legacy tree that recorded no include list at
+    all has nothing to translate and gets FV's conservative exclusion defaults.
 
 APPLY
     `--apply` is all-or-nothing. Preflight refuses a destination whose path
@@ -310,18 +351,49 @@ CLAIMS_DOCUMENT_KEYS = frozenset({
     "schema", "version", "claims", "profile", "environment_policy",
 })
 
-VERIFIED_INPUTS_HEADER = (
+# Written only when the legacy tree recorded no include list at all: there is
+# nothing to translate, so the migrated project starts from FV's conservative
+# exclusion defaults.
+VERIFIED_INPUTS_EXCLUSION_HEADER = (
     "# Verified-input exclusion prefixes for the FV evidence content snapshot.\n"
-    "# Blank lines and # comments are ignored; directory prefixes end in /.\n"
+    "# The mode directive below is the first non-comment line; the entries under\n"
+    "# it are the paths the snapshot does not bind. Blank lines and # comments\n"
+    "# are ignored; directory prefixes end in /.\n"
     "#\n"
-    "# Migrated from .colosseum/verified-inputs.txt, which was an include list:\n"
-    "# its entries named the paths in scope, the opposite of what this file\n"
-    "# means. Inverting an include list would mean enumerating the complement of\n"
-    "# the repository, so the legacy list is kept verbatim as history at\n"
-    "# .fv/history/colosseum/verified-inputs.txt and this file starts from FV's\n"
-    "# conservative defaults. Imported history is excluded: those bytes are a\n"
-    "# record of past runs, not an input any layer reads.\n"
+    "# The legacy tree recorded no .colosseum/verified-inputs.txt, so there was\n"
+    "# no include list to translate and this file starts from FV's conservative\n"
+    "# defaults. Imported history is excluded: those bytes are a record of past\n"
+    "# runs, not an input any layer reads.\n"
 )
+
+# Written whenever the legacy tree did record an include list. The legacy file
+# and FV include mode mean the same thing, so the entries are translated, not
+# inverted: inverting would mean enumerating the complement of the repository.
+VERIFIED_INPUTS_INCLUDE_HEADER = (
+    "# Verified-input include policy for the FV evidence content snapshot.\n"
+    "# The mode directive below is the first non-comment line; the entries under\n"
+    "# it are the only paths the snapshot binds. Blank lines and # comments are\n"
+    "# ignored; directory prefixes end in /.\n"
+    "#\n"
+    "# Translated from .colosseum/verified-inputs.txt, which was already an\n"
+    "# include list: FV include mode means the same thing, so each legacy entry\n"
+    "# is carried across rather than inverted into the complement of the\n"
+    "# repository. An entry naming a legacy manifest binds the FV artifact its\n"
+    "# content migrated to instead, because the legacy bytes themselves become\n"
+    "# snapshot-excluded history. The exact legacy list is kept verbatim at\n"
+    "# .fv/history/colosseum/verified-inputs.txt.\n"
+    "#\n"
+    "# This file binds itself, so editing the policy invalidates the evidence\n"
+    "# bound to it. FV's structural output exclusions still apply before include\n"
+    "# matching, so no FV or legacy output can stale a record.\n"
+)
+
+# FV artifacts this migration authors that verification itself reads: the
+# obligation manifest says what each layer must discharge and the plan says
+# what command discharges it. A translated include policy binds whichever of
+# them the run wrote, on the same ground the legacy list bound
+# `.colosseum/obligations.json`: editing one changes what a layer decides.
+MIGRATED_VERIFIED_ARTIFACTS = (".fv/obligations.json", ".fv/verification-plan.json")
 
 OBLIGATIONS_NOTE = (
     "Migrated by scripts/fv_migrate.py. Each system claim is a legacy "
@@ -820,21 +892,205 @@ class Migration:
 
     # ---- verified inputs -------------------------------------------------
 
-    def _migrate_verified_inputs(self) -> None:
-        # Both explicit entries are structural defaults, so `_dedup` normally
-        # drops them; they are named anyway because this migrator is what
-        # quarantines legacy history under one and what strands residue under
-        # the other, and a project list may only ever add prefixes.
-        prefixes = [*fv_project.DEFAULT_EXCLUSIONS, HISTORY_EXCLUSION, STAGING_EXCLUSION]
-        body = "".join(f"{prefix}\n" for prefix in _dedup(prefixes))
-        self._plan_write(".fv/verified-inputs.txt", (VERIFIED_INPUTS_HEADER + body).encode("utf-8"))
-        relative = f"{LEGACY_DIRNAME}/{LEGACY_VERIFIED_INPUTS}"
-        if relative in self._legacy_files:
-            self._preserved(
-                relative,
-                "include list, semantically inverted from .fv/verified-inputs.txt: kept verbatim as "
-                "history while FV's conservative exclusion defaults are written fresh",
+    def _live_destination(self, source: str) -> str | None:
+        """The live `.fv` artifact one legacy file's content migrated into.
+
+        Read out of this migration's own inventory rather than from a second
+        table of legacy-to-FV paths: an include entry must bind whatever this
+        run actually wrote, and an inventory row is the only thing that knows
+        it. `.fv/dispatch.json` is excluded because it is the declaration of
+        the target, not a document a layer reads; the entry that named the
+        legacy intent binds the elected target itself instead.
+        """
+        for artifact in self.artifacts:
+            if artifact.classification != MAPPED or "#" in artifact.source:
+                continue
+            if artifact.source != source or artifact.destination is None:
+                continue
+            if artifact.destination == ".fv/dispatch.json":
+                continue
+            if artifact.destination in self._writes:
+                return artifact.destination
+        return None
+
+    def _translate_include_entry(self, entry: str) -> tuple[str | None, str]:
+        """The FV path one legacy include entry binds, plus why it binds it.
+
+        A path outside `.colosseum/` is a source root and is kept verbatim:
+        legacy include mode and FV include mode mean the same thing, so there
+        is nothing to translate about `crates` or `Cargo.lock`. A path inside
+        `.colosseum/` cannot stay: the legacy tree is structurally excluded
+        from the snapshot, and its bytes become history. Such an entry binds
+        the FV artifact its content migrated to, or nothing at all, and
+        nothing at all is reported rather than silently narrowing the policy.
+        """
+        if entry != LEGACY_DIRNAME and not entry.startswith(LEGACY_DIRNAME + "/"):
+            return entry, ""
+        legacy_path = entry.rstrip("/") or entry
+        if legacy_path == f"{LEGACY_DIRNAME}/{LEGACY_INTENT}":
+            if self.target_spec is not None:
+                return self.target_spec, ""
+            return None, (
+                "names the legacy intent entrypoint, and this migration elected no dispatch "
+                "target, so there is no canonical document for the entry to bind"
             )
+        destination = self._live_destination(legacy_path)
+        if destination is not None:
+            return destination, ""
+        # The bare legacy directory has no `_history_path` of its own: its
+        # files land under the history root, and that is what the entry named.
+        history = (HISTORY_RELATIVE if legacy_path == LEGACY_DIRNAME
+                   else self._history_path(legacy_path))
+        return None, (
+            f"names legacy bytes this migration preserves under {history} rather than mapping "
+            "to a live FV artifact, and imported history is structurally excluded from the "
+            "snapshot: a record of past runs is not an input a layer reads, so the translated "
+            "policy binds nothing for this entry"
+        )
+
+    def _migrate_verified_inputs(self) -> None:
+        relative = f"{LEGACY_DIRNAME}/{LEGACY_VERIFIED_INPUTS}"
+        if relative not in self._legacy_files:
+            # Nothing to translate. Both explicit prefixes are structural
+            # defaults, so `_dedup` normally drops them; they are named anyway
+            # because this migrator is what quarantines legacy history under
+            # one and what strands residue under the other, and an
+            # exclusion-mode project list may only ever add prefixes.
+            prefixes = _dedup([*fv_project.DEFAULT_EXCLUSIONS, HISTORY_EXCLUSION,
+                               STAGING_EXCLUSION])
+            policy = fv_project.InputPolicy(fv_project.MODE_EXCLUDE, tuple(prefixes))
+            self._plan_write(
+                fv_project.VERIFIED_INPUTS_RELATIVE,
+                policy.render(header=VERIFIED_INPUTS_EXCLUSION_HEADER).encode("utf-8"),
+            )
+            return
+
+        data = self._read_bytes(relative)
+        if data is None:
+            return
+        try:
+            legacy = fv_project.parse_policy(data.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            self._unsupported(
+                relative,
+                f"not valid UTF-8 ({error}): the entries cannot be read as paths, and a "
+                "replacement character in a translated policy would bind a path that does "
+                "not exist",
+            )
+            return
+        except fv_project.ProjectError as error:
+            self._unsupported(
+                relative,
+                f"not a parseable verified-input policy ({error}): the same grammar governs "
+                "the translated FV policy, so an entry FV would reject cannot be carried "
+                "across as one",
+            )
+            return
+        if not legacy.prefixes:
+            self._unsupported(
+                relative,
+                "declares no entries: an include list naming nothing binds nothing, and a "
+                "policy translated from it would narrow the snapshot to the canonical target "
+                "alone while every layer's real inputs went unbound. Record the paths the "
+                "layers read, or delete the file to migrate onto FV's exclusion defaults",
+            )
+            return
+
+        selected: list[str] = []
+        rewrites: list[str] = []
+        # Paths the translation binds that the legacy list did not name.
+        bound: list[str] = []
+        # Entries that bind nothing, held back until the translation is known
+        # to produce a policy: a deviation row describes part of a mapped
+        # file, and a blocked translation maps nothing.
+        dropped: list[tuple[str, str]] = []
+        for entry in legacy.prefixes:
+            translated, refusal = self._translate_include_entry(entry)
+            if translated is None:
+                dropped.append((entry, refusal))
+                continue
+            if translated != entry:
+                rewrites.append(f"{entry} -> {translated}")
+            if translated not in selected:
+                selected.append(translated)
+        if not selected:
+            self._unsupported(
+                relative,
+                "every entry names legacy bytes that migrate to snapshot-excluded history, so "
+                "the translation selects nothing any layer reads: the policy would bind only "
+                "the artifacts this migration authored, and the evidence bound to it would "
+                "survive every edit to the sources a layer actually decides on. Name the "
+                "sources in the legacy list, or delete it to migrate onto FV's exclusion "
+                "defaults; inverting the list into exclusions is not the fallback, since that "
+                "would enumerate the complement of the repository",
+            )
+            return
+        # The canonical target is bound whether or not the legacy list named
+        # it: it is the document every migrated evidence record binds to, so a
+        # policy that left it unselected would let the trust root change under
+        # evidence that still validated. The two migrated manifests are bound
+        # on the same ground -- FV reads them to decide what a layer must
+        # discharge and what command discharges it, which is what the legacy
+        # list bound `.colosseum/obligations.json` for. Only those this run
+        # actually wrote are named; an unwritten one would be an entry
+        # matching nothing.
+        for artifact in (self.target_spec, *MIGRATED_VERIFIED_ARTIFACTS):
+            if artifact is None or artifact in selected:
+                continue
+            if artifact in MIGRATED_VERIFIED_ARTIFACTS and artifact not in self._writes:
+                continue
+            selected.append(artifact)
+            bound.append(artifact)
+
+        try:
+            policy = fv_project.InputPolicy(fv_project.MODE_INCLUDE, tuple(selected))
+        except fv_project.ProjectError as error:
+            raise MigrationError(
+                f"{fv_project.VERIFIED_INPUTS_RELATIVE}: the translated include policy over "
+                f"{selected} is invalid ({error})"
+            ) from error
+        rendered = policy.render(header=VERIFIED_INPUTS_INCLUDE_HEADER)
+        # The emitted bytes are read back through the same parser the gate and
+        # the producer use, not trusted: the mode directive is one line whose
+        # loss would silently republish this policy as an exclusion list that
+        # binds the whole repository minus a handful of source roots.
+        try:
+            written = fv_project.parse_policy(rendered)
+        except fv_project.ProjectError as error:
+            raise MigrationError(
+                f"{fv_project.VERIFIED_INPUTS_RELATIVE}: the translated policy does not parse "
+                f"({error})"
+            ) from error
+        if written.mode != fv_project.MODE_INCLUDE or written.prefixes != policy.prefixes:
+            raise MigrationError(
+                f"{fv_project.VERIFIED_INPUTS_RELATIVE}: the translated policy reads back as "
+                f"{written.mode} mode over {list(written.prefixes)}, not include mode over "
+                f"{list(policy.prefixes)}"
+            )
+        if fv_project.VERIFIED_INPUTS_RELATIVE not in written.selectors():
+            raise MigrationError(
+                f"{fv_project.VERIFIED_INPUTS_RELATIVE}: the translated policy does not bind "
+                "itself, so a policy edit would not invalidate the evidence bound to it"
+            )
+        self._plan_write(fv_project.VERIFIED_INPUTS_RELATIVE, rendered.encode("utf-8"))
+        self._mapped(
+            relative,
+            fv_project.VERIFIED_INPUTS_RELATIVE,
+            f"legacy include list translated to FV include mode over {len(policy.prefixes)} "
+            f"entr{'y' if len(policy.prefixes) == 1 else 'ies'} "
+            f"({', '.join(policy.prefixes)}): both files mean the same thing, so source roots "
+            "are kept verbatim instead of inverted into exclusions"
+            + (f"; legacy manifest paths rebound to the FV artifacts their content migrated to "
+               f"({'; '.join(rewrites)})" if rewrites else "")
+            + (f"; {', '.join(bound)} bound beyond the legacy list: the canonical target and "
+               "the migrated manifests are what FV reads to decide what each layer must "
+               "discharge and what command discharges it" if bound else "")
+            + f"; {fv_project.VERIFIED_INPUTS_RELATIVE} binds itself, so editing the policy "
+            "invalidates the evidence bound to it. The exact legacy list is kept verbatim as "
+            "history",
+        )
+        for entry, refusal in dropped:
+            self._deviation(f"{relative}#{entry}", fv_project.VERIFIED_INPUTS_RELATIVE, refusal)
 
     # ---- obligations -----------------------------------------------------
 

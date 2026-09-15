@@ -63,10 +63,12 @@ Checks:
    ("barkani:") or inside a Rust path (`#[kani::proof]`) are not
    coverage. A `Depends on:` block ends at a
    blank line, a heading, or any non-entry line, so an unrelated later
-   bullet list is never counted as trust-chain links; across a blank
-   line only a list indented deeper than the header continues (see
-   find_trust_chain_links for that boundary and the reason it is drawn
-   there rather than reopening the block for any later bullet).
+   bullet list is never counted as trust-chain links. Two shapes cross a
+   blank: the header's own paragraph break (header, blank, then the
+   first list, indented or flush), and, once entries have been read, a
+   list indented deeper than the header (see find_trust_chain_links for
+   that boundary and the reason it is drawn there rather than reopening
+   the block for any later bullet).
    Per-link misses and unparseable bodies WARN by default and fail
    under --strict-kani (use once your ledger's kani annotations are
    complete). Zero parsed `kani:` annotations in the whole ledger
@@ -502,54 +504,73 @@ def find_trust_chain_links(lines: list[str]) -> set[int]:
     trust-chain links — inflating the link count and fabricating per-link
     Kani failures on bullets that are not links at all.
 
-    The one continuation across a blank line is a loose list nested under
-    the header: entries indented strictly deeper than the header keep the
-    block open. A bullet back at (or left of) the header's indentation
-    starts a new list and is not a link.
+    Two shapes survive a blank line, and they are not one rule:
 
-    That last sentence is the contract choice, not an oversight, and it
-    is the one shape where this function trades away a true link. A
-    post-blank bullet at the header's own indentation is ambiguous: it
-    reads equally as a further entry of an unindented loose list or as
-    the first bullet of the next prose list. Only one reading can be
-    taken, and reopening the block for it is the old behaviour — a blank
-    line would never close anything, so every later bullet in the
-    section would be counted as a trust-chain link and hard-fail
-    per-link Kani coverage on lines that are not links. Closing is
-    preferred because its failure mode is bounded and visible: the
-    reported "Trust-chain links" total falls below the number of entries
-    actually written, and indenting the entries under the header (the
-    convention of skills/fv-compose/SKILL.md Step 3, which every
-    in-repo ledger follows) restores them. The residual exposure is
-    fail-open — an unindented post-blank entry escapes the per-link Kani
-    check — and is accepted here rather than moved onto every ordinary
-    bullet list in the ledger. tests/r1_r21_r27_ledger_gates.py pins
-    both halves of the trade.
+    * Before the first entry, the blank is the header's own paragraph
+      break: `**Depends on:**`, blank, then the list. That is the
+      flagship Markdown dossier, and the list that follows opens the
+      block whether it is indented under the header or flush with it.
+      Nothing has been claimed as a link yet, so there is no earlier
+      entry for a later list to be mistaken for: the first list after
+      the header IS the block. Only blanks are skipped — prose, a
+      heading, or any other nonblank non-entry line between header and
+      list still closes the block, so an unrelated list further down
+      the section is never reached.
+    * After the first entry, only a list indented strictly deeper than
+      the header keeps the block open. A bullet back at (or left of)
+      the header's indentation starts a new list and is not a link.
+
+    That second rule is the contract choice, not an oversight, and it is
+    the one shape where this function trades away a true link. A
+    post-blank bullet at the header's own indentation, once entries have
+    already been read, is ambiguous: it reads equally as a further entry
+    of an unindented loose list or as the first bullet of the next prose
+    list. Only one reading can be taken, and reopening the block for it
+    is the old behaviour — a blank line would never close anything, so
+    every later bullet in the section would be counted as a trust-chain
+    link and hard-fail per-link Kani coverage on lines that are not
+    links. Closing is preferred because its failure mode is bounded and
+    visible: the reported "Trust-chain links" total falls below the
+    number of entries actually written, and indenting the entries under
+    the header (the convention of skills/fv-compose/SKILL.md Step 3,
+    which every in-repo ledger follows) restores them. The residual
+    exposure is fail-open — an unindented post-blank entry, after a
+    first entry has been seen, escapes the per-link Kani check — and is
+    accepted here rather than moved onto every ordinary bullet list in
+    the ledger. tests/r1_r21_r27_ledger_gates.py pins both halves of the
+    trade, plus the flagship header-blank-list dossier shape.
     """
     links: set[int] = set()
     header_indent: int | None = None
+    seen_entry = False
     index = 0
     total = len(lines)
     while index < total:
         text = lines[index]
         if is_depends_header(text):
             header_indent = indent_width(text)
+            seen_entry = False
         elif header_indent is not None:
             if not text.strip():
                 nxt = index + 1
                 while nxt < total and not lines[nxt].strip():
                     nxt += 1
-                loose_continuation = (
-                    nxt < total
-                    and LINK_LINE_RE.match(lines[nxt]) is not None
-                    and indent_width(lines[nxt]) > header_indent
-                )
-                if not loose_continuation:
+                continues = False
+                if nxt < total and LINK_LINE_RE.match(lines[nxt]) is not None:
+                    entry_indent = indent_width(lines[nxt])
+                    # Deeper is always a nested loose list; flush is the
+                    # header's paragraph break only while no entry has
+                    # been read yet.
+                    continues = entry_indent > header_indent or (
+                        not seen_entry and entry_indent == header_indent
+                    )
+                if not continues:
                     header_indent = None
             elif is_heading(text) or LINK_LINE_RE.match(text) is None:
                 header_indent = None
             else:
                 links.add(index + 1)
+                seen_entry = True
         index += 1
     return links
 

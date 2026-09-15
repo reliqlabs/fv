@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "_source": "Shipped example obligation manifest for the ranked-choice tabulation project templates/evidence-records.example.json carries records for. It declares the complete required obligation set - one invariant and one system claim composing it - so the paired record set is complete: every id below has a record beside it. A project's manifest lives at .fv/obligations.json, and its bytes are what every record's bindings.obligation_manifest_hash binds, so editing this file (reformatting included) stales the evidence produced against it.",
+  "_consumers": "Gate B (scripts/check_evidence_records.py) reads invariants[].id, witnesses[].id, and system_claims[] - each claim's depends_on and required_evidence. scripts/obligation_check.py reads the quint-facing half of the same file (intent_path, spec_dir, main_file, module, init, step, invariants[].name, invariants[].definition_sha256, transitions, bounds); those fields are omitted here so the example stays about the evidence set. Semantics: docs/dogfood-evidence.md.",
+  "invariants": [
+    {
+      "id": "A1",
+      "name": "inv_no_tied_elimination",
+      "statement": "No candidate is eliminated while tied for the minimum tally"
+    }
+  ],
+  "witnesses": [],
+  "_witnesses_note": "Empty on purpose: a witness declared here without a record would read as INCOMPLETE, and this example ships a complete record set. A real project declares its reachability witnesses here, each with its own record, and may name them in a system claim's depends_on.",
+  "system_claims": [
+    {
+      "id": "S1",
+      "statement": "Protocol model, proved tally core, and contract entry point agree on eliminated-candidate ordering",
+      "depends_on": ["A1"],
+      "required_evidence": ["quint", "verus", "cargo-kani"]
+    }
+  ],
+  "_system_claims_note": "required_evidence names evidence tool IDs, matched against the `tool` of each execution in the claim's cohort: S1 PASSes only when quint, verus, and cargo-kani each appear as a PASS execution of S1's record. depends_on names declared invariants and witnesses only, never another claim, and those obligations still carry their own records - S1 passing does not discharge A1."
+}

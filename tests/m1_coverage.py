@@ -80,7 +80,7 @@ ALL_CLAIMS = "B1,B2,B3,B4,W1,S1"
 # so this suite proves the token-discipline rule itself, not just that
 # --check happens to pass on inputs that were never going to trip it.
 BARE_VERIFIED = re.compile(r"VERIFIED(?!\[)")
-# VERIFIED[<field>; <field>] optionally followed by the waiver suffix.
+# VERIFIED[<field>(; <field>)*] optionally followed by the waiver suffix.
 SCOPED_VERDICT = re.compile(
     r"^VERIFIED\[(?P<scope>[^\]]*)\](?: \(waived: (?P<waived>[^)]*)\))?$")
 
@@ -213,10 +213,11 @@ def record(claim_id: str, *, result: str = "PASS",
 def verdict_parts(verdict: str) -> dict:
     """A verdict banner split into the parts the two tools must agree on.
 
-    They disagree on `binding` by construction — Gate B recomputes the
-    snapshot, is pinned to one, or is told to skip it, while the dashboard
-    never recomputes anything — so the binding mode is compared separately,
-    never folded into the equality."""
+    `binding` is the scope field Gate B adds only for a weaker freshness
+    discipline: it is absent from a recomputed Gate B run and from every
+    dashboard verdict, which state their mode in the payload instead. So the
+    field is read here but compared separately, never folded into the equality.
+    """
     match = SCOPED_VERDICT.match(verdict)
     if match is None:
         return {"kind": verdict, "profiles": [], "waived": [], "binding": None}
@@ -306,12 +307,17 @@ def main() -> int:
     code, d2, err2 = run_json(records, "--require", "B1,W1")
     check("all-PASS subset (B1,W1): exit 0", code == 0)
     check("all-PASS subset: verdict is scoped VERIFIED[...]",
-          d2.get("verdict") == "VERIFIED[profile=bounded; binding=not-recomputed]"
-          " (waived: W1)", f"verdict={d2.get('verdict')}")
-    check("all-PASS subset: verdict discloses that no binding was recomputed",
-          verdict_parts(d2.get("verdict", ""))["binding"] == "not-recomputed")
-    check("all-PASS subset: payload echoes the same binding mode",
-          d2.get("binding") == "not-recomputed")
+          d2.get("verdict") == "VERIFIED[profile=bounded] (waived: W1)",
+          f"verdict={d2.get('verdict')}")
+    # The scope carries the profile and nothing else: `binding` is Gate B's
+    # scope field, and a value minted here would read as a freshness
+    # discipline this view never runs. It says what it did not do in the
+    # payload instead, which is also where Gate B always names its own.
+    check("all-PASS subset: verdict scope mints no binding field",
+          verdict_parts(d2.get("verdict", ""))["binding"] is None,
+          f"verdict={d2.get('verdict')}")
+    check("all-PASS subset: payload discloses that no binding was recomputed",
+          d2.get("binding") == "not-recomputed", f"binding={d2.get('binding')!r}")
     check("all-PASS subset: verdict is never bare VERIFIED",
           not BARE_VERIFIED.search(d2.get("verdict", "")))
 
@@ -402,10 +408,11 @@ def main() -> int:
     # The dashboard imports check_evidence_records.py's schema and mirrors its
     # G2 verdict logic. Run both on identical inputs and require the verdicts
     # to agree on kind, profile and waivers, so a gate change that is not
-    # mirrored here fails loudly instead of drifting silently. `binding` is
-    # the one field that must differ: Gate B recomputes the snapshot, is
-    # pinned to one, or is told to skip it, while the dashboard never
-    # recomputes anything and says so.
+    # mirrored here fails loudly instead of drifting silently. The freshness
+    # discipline is the one thing that must differ, and it is compared off the
+    # scope: Gate B recomputes the snapshot, is pinned to one, or is told to
+    # skip it (and qualifies its scope for the weaker two), while the dashboard
+    # recomputes nothing and says so in its payload alone.
     # The shared fixture records predate the obligation-manifest binding and
     # carry a placeholder hash. Both tools now derive that expectation from the
     # manifest bytes they are handed and neither side of this comparison is told
@@ -451,9 +458,11 @@ def main() -> int:
                   f"gate={gv} rc={gate_code}")
             if dash_parts["kind"] == "VERIFIED":
                 check(f"both tools disclose their binding mode ({label})",
-                      dash_parts["binding"] == "not-recomputed"
+                      dj.get("binding") == "not-recomputed"
+                      and dash_parts["binding"] is None
                       and gate_parts["binding"] == "unbound",
-                      f"dashboard={dash_parts['binding']} gate={gate_parts['binding']}")
+                      f"dashboard={dj.get('binding')} scope={dash_parts['binding']} "
+                      f"gate={gate_parts['binding']}")
 
     # ── (h) system claims are reported, and only pass on a full cohort ──
     with tempfile.TemporaryDirectory() as raw_tmp:
@@ -918,9 +927,11 @@ def main() -> int:
               == {k: v for k, v in gate_base_parts.items() if k != "binding"},
               f"dashboard={baseline.get('verdict')} gate={gate_baseline}")
         check("parity baseline: binding modes are distinct and both disclosed",
-              base_parts["binding"] == "not-recomputed"
+              baseline.get("binding") == "not-recomputed"
+              and base_parts["binding"] is None
               and gate_base_parts["binding"] == "unbound",
-              f"dashboard={base_parts['binding']} gate={gate_base_parts['binding']}")
+              f"dashboard={baseline.get('binding')} scope={base_parts['binding']} "
+              f"gate={gate_base_parts['binding']}")
 
         # (label, mutation, claim whose row carries it, that row's dashboard
         # status, defect fragment both tools must name). A fragment is given

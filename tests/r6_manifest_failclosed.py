@@ -27,8 +27,9 @@ classified instead of hanging the hash; an exclusion list carrying a byte-order
 mark, a control character, or a line break the Python and TypeScript parsers
 would read differently is rejected outright while non-ASCII path entries stay
 legal; and v2 records still validate under explicit
---expect-snapshot/--allow-unbound, which the verdict scope discloses as
-binding=pinned/unbound rather than recomputed.
+--expect-snapshot/--allow-unbound, which the verdict scope qualifies with
+binding=pinned/unbound while the default recomputed run keeps the bare
+VERIFIED[profile=...] token and names its discipline in the report only.
 
 System-claim half: obligations.json may declare system_claims, which Gate B
 aggregates into the required-claim set with kind system_claim; a claim whose
@@ -490,11 +491,16 @@ def gate_checks(project: Path, snapshot: str) -> None:
           and report.get("expected_snapshot") == snapshot,
           f"{report.get('intent_path')!r} {report.get('expected_snapshot')!r}")
     # A VERIFIED that recomputed both bindings and one that was handed them, or told
-    # to skip them, are different claims: the scope has to say which one this is.
-    check("Gate B: recomputed freshness is disclosed as binding=recomputed",
-          "VERIFIED[profile=producer-trusted-execution; binding=recomputed]" in result.stderr
-          and report.get("binding") == "recomputed",
-          f"{result.stderr[-200:]} {report.get('binding')!r}")
+    # to skip them, are different claims, and only the weaker two say so in the scope.
+    # The default run keeps the established token verbatim, so a consumer matching
+    # VERIFIED[profile=...] keeps accepting exactly the recomputed run; the report's
+    # `binding` field is where the discipline is always named.
+    check("Gate B: a recomputed run emits the unqualified profile scope",
+          report.get("verdict") == "VERIFIED[profile=producer-trusted-execution]"
+          and "VERDICT: VERIFIED[profile=producer-trusted-execution]\n" in result.stderr,
+          f"{report.get('verdict')!r} {result.stderr[-200:]}")
+    check("Gate B: recomputed freshness is disclosed in the report's binding field",
+          report.get("binding") == "recomputed", f"{report.get('binding')!r}")
 
     result = run_gate("--expect-snapshot", snapshot)
     check("Gate B: operator-pinned freshness is disclosed as binding=pinned",

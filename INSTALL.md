@@ -134,6 +134,31 @@ counts as live `fv-evidence-run/v3` evidence. Legacy verification layers without
 a built-in pyramid step, `quint` among them, become `fv-verification-plan/v1`
 custom layers instead of being dropped.
 
+Legacy `verified-inputs.txt` is an include list, and FV include mode means the
+same thing, so it is translated rather than inverted: the migrated policy
+declares `mode: include`, keeps every legacy source root verbatim, rebinds an
+entry naming a legacy manifest to the FV artifact its content migrated to, and
+additionally binds the elected canonical target, whichever of
+`.fv/obligations.json` and `.fv/verification-plan.json` the run wrote, and the
+policy file itself. An entry naming legacy bytes that migrate to history alone
+binds nothing and is reported as a deviation row; a legacy list that is not
+valid UTF-8, does not parse under the path grammar, declares no entries, or has
+no entry left to translate is `unsupported` and blocks. The exact legacy list is
+preserved under `.fv/history/colosseum/` either way, and a legacy tree with no
+include list gets FV's exclusion-mode defaults instead. The nine structural
+exclusion prefixes (`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`,
+`.fv/changes/`, `.fv/attacks/`, `.fv/code-adversarial/`, `.fv/history/`,
+`.fv/.migrate-staging/`, `.colosseum/`) apply in both modes and no project file
+can drop them.
+
+The migrated `.fv/verification-plan.json` is not optional configuration:
+`pyramid_run.py` auto-discovers it and executes it, so a migrated project cannot
+keep running the built-in layer defaults its plan replaced. A plan present but
+unreadable, malformed, or schema-invalid is exit 2 before any layer runs;
+`--no-plan` is the only deliberate way to run the built-in layers instead, and
+every report names its provenance in `plan.discovery` (`explicit`,
+`autodiscovered`, `absent`, `disabled`).
+
 The report (`fv-migration-report/v1`) carries `schema`, `project_root` (always
 `"."`), `target_spec` (the elected dispatch target), `requested_mode`, `mode`,
 `applied`, `status`, `error`, `counts`, `artifacts[]`, `writes[]`, `conflicts[]`,
@@ -158,17 +183,23 @@ ledger's citations only when the stub cites nothing. Blocking conditions beyond
 destination conflicts: an ambiguous dispatch target (two or more distinct cited
 canonical intents) or none at all, a directory under `.colosseum/` that cannot be
 listed, a claim whose `required_evidence` names a tool no migrated execution
-declares, a recorded command no argv represents (a shell operator, a leading
-`NAME=VALUE` assignment, or a shell builtin such as `cd`), and a destination path
-that crosses a symlink at any component, including `.fv` itself, or whose nearest
-existing parent directory is not writable.
+declares, a legacy `verified-inputs.txt` that cannot be translated into an
+include policy binding something a layer reads, a recorded command no argv
+represents (a shell operator, a leading `NAME=VALUE` assignment, or a shell
+builtin such as `cd`), and a destination path that crosses a symlink at any
+component, including `.fv` itself, or whose nearest existing parent directory is
+not writable.
 
 Run `fv_init.py` after `--apply` for the OMP-side settings. Without
-`--target-spec` it preserves the migrated `target_spec` and only appends missing
-exclusion defaults to `.fv/verified-inputs.txt`. Do not pass `--force` after a
-migration: it replaces FV-owned project state, including the migrated dispatch
-target. The `.fv/history/` exclusion prefix is structural, so `--force` cannot
-drop it.
+`--target-spec` it preserves the migrated `target_spec`, and it leaves a
+migrated include-mode `.fv/verified-inputs.txt` byte for byte, `--force`
+included: appending FV's exclusion prefixes to an allowlist would declare
+generated output to be verified input, and replacing it with the exclusion
+defaults would widen what every later record claims to cover. Only an
+exclusion-mode file gains the structural defaults it dropped. Do not pass
+`--force` after a migration: it replaces FV-owned project state, including the
+migrated dispatch target. The `.fv/history/` exclusion prefix is structural, so
+`--force` cannot drop it in either mode.
 
 Keep `.colosseum/` until parity is explicitly accepted: the required evidence
 cohorts re-run through `fv_evidence_run` and Gate A plus Gate B passing without
@@ -222,7 +253,7 @@ python3 "$FV_ROOT/scripts/check_dispatch_config.py" \
   /absolute/path/to/project/.fv/dispatch.json
 ```
 
-The doctor fails for missing extension configuration, package MCP wiring, package agents or skills, dispatch state, a missing or drifted OMP `panel.roles.fv-canonical` definition, an incompatible OMP bridge contract, or a panel with no available candidate at the required thinking policy. OMP compatibility is capability-based: its live version is recorded as provenance, the bridge-contract version and every capability required by `bom.json` must match, and additive capabilities are accepted. Use `--omp /absolute/path/to/omp` when verifying a source build or an executable outside `PATH`.
+The doctor fails for missing extension configuration, package MCP wiring, package agents or skills, dispatch state, a missing or drifted OMP `panel.roles.fv-canonical` definition, an incompatible OMP bridge contract, or a panel with no available candidate at the required thinking policy. It reports the project's verified-input policy by mode: `exclude` with the number of exclusion prefixes in force, or `include` with the number of selected paths, the policy file itself among them. It also fails when `.fv/verification-plan.json` is present but unusable, because `pyramid_run.py` auto-discovers that file and every verification run of the project would otherwise be ERROR; an absent plan is reported as the built-in defaults. OMP compatibility is capability-based: its live version is recorded as provenance, the bridge-contract version and every capability required by `bom.json` must match, and additive capabilities are accepted. Use `--omp /absolute/path/to/omp` when verifying a source build or an executable outside `PATH`.
 
 ## CI
 

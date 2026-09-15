@@ -48,8 +48,9 @@ The artifact reads — path containment, raw-output digest recomputation,
 PASS markers — need the repository root Gate B resolves, and so does
 snapshot and intent freshness, which is recomputed against the current
 tree. Those are the gate's alone: a record may therefore be INCOMPLETE
-there and PASS here, which the verdict scope discloses as
-`binding=not-recomputed`. That asymmetry is the only one; the reverse —
+there and PASS here, which this tool discloses as its `not-recomputed`
+binding mode in the payload and the summary line. That asymmetry is the
+only one; the reverse —
 covered here, rejected there — is what the shared rules and the shared
 manifest grammar rule out.
 
@@ -104,12 +105,16 @@ instead of rendering a partial required set.
 G2 HONESTY (this tool's own conformance obligation)
 
 Per G2, "VERIFIED" is never a bare token; it always carries a scope,
-e.g. `VERIFIED[profile=bounded; binding=not-recomputed]`. The `binding`
-field is what this view did *not* do: it reads records, it never recomputes
-the verified-input snapshot or the intent hash, so it can never be mistaken
-for Gate B's `binding=recomputed`. Individual claim rows never render as
-"verified" either — a claim's row shows its evidence_class and result
-(PASS/FAIL/INCOMPLETE/missing-record/duplicate-record/invalid/
+e.g. `VERIFIED[profile=bounded]`. The scope stays the profile alone, the
+same token this view has always emitted, because `binding` is a Gate B
+wire field: minting a value of it here would read as a freshness
+discipline this tool never runs. What this view did *not* do is stated
+where it cannot be mistaken for that field. The `bindings:` summary line
+and the payload's own `binding` key both say `not-recomputed`, since it
+reads records and never recomputes the verified-input snapshot or the
+intent hash. Individual claim rows never
+render as "verified" either — a claim's row shows its evidence_class and
+result (PASS/FAIL/INCOMPLETE/missing-record/duplicate-record/invalid/
 unwaived-assumption/evidence-gap/dependency-gap), never an unqualified
 verdict word. `--check` scans this tool's own rendered output (table,
 verdict banner, and JSON payload) and exits nonzero if a bare `VERIFIED`
@@ -125,8 +130,9 @@ VERDICT (same G2 truth table as check_evidence_records.py; exit code)
                       cohort execution — without a waiver, or it is a system
                       claim with an evidence or dependency gap, or the
                       required-claims list is empty
-    VERIFIED[..] (0)  every required claim PASSes; scope names the profile
-                      and the binding mode, and every waived claim is listed
+    VERIFIED[..] (0)  every required claim PASSes; scope names the profile,
+                      the payload names the binding mode, and every waived
+                      claim is listed
     ERROR        (2)  unreadable records/manifest, a manifest whose claim
                       IDs cannot be read or that declares an obligation ID
                       the evidence producer could never write a record for,
@@ -189,9 +195,10 @@ PRODUCER_ARTIFACT = gate.PRODUCER_ARTIFACT
 SYSTEM_CLAIM = "system_claim"
 # Observed cohort result for a required_evidence tool that never ran.
 NO_EXECUTION = "no-execution"
-# Binding mode this tool reports in its verdict scope. Gate B's modes are
-# recomputed|pinned|unbound; the dashboard recomputes nothing, so it names a
-# mode of its own rather than borrowing one that would overstate the check.
+# Freshness discipline this tool reports in its payload and summary line, but
+# never in the verdict scope: Gate B's scope field carries recomputed|pinned|
+# unbound, and the dashboard recomputes nothing, so it states a mode of its own
+# outside that field rather than borrowing one that would overstate the check.
 BINDING_MODE = "not-recomputed"
 
 # Per-claim statuses that mean the claim is not covered by a passing
@@ -758,7 +765,11 @@ def compute_verdict(rows: list[dict], by_claim: dict[str, dict],
     if any(r["status"] in GAP_STATUSES for r in rows):
         return "INCOMPLETE", 3
     profiles = sorted({by_claim[r["claim_id"]]["bindings"]["profile"] for r in rows})
-    scope = f"profile={'/'.join(profiles)}; binding={BINDING_MODE}"
+    # The scope names the profile and nothing else. BINDING_MODE is disclosed in
+    # the payload and the summary line instead, so this token neither claims a
+    # freshness discipline it never ran nor invents a `binding` value that a
+    # Gate B consumer would have to learn to parse.
+    scope = f"profile={'/'.join(profiles)}"
     waived = sorted(r["claim_id"] for r in rows if r["waived"])
     verdict = f"VERIFIED[{scope}]"
     if waived:

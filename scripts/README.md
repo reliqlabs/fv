@@ -81,7 +81,8 @@ dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry ru
   only a sentence in a detail string.
 - Mapped: `ledger.md` verbatim, the elected intent as the dispatch target,
   `obligations.json` + `g1-claims.json` to `.fv/obligations.json` `system_claims`,
-  `evidence/runs/layer-runs.json` to `.fv/verification-plan.json`. Everything else
+  `evidence/runs/layer-runs.json` to `.fv/verification-plan.json`,
+  `verified-inputs.txt` to `.fv/verified-inputs.txt`. Everything else
   is preserved under `.fv/history/colosseum/`, byte-for-byte plus the executable
   bit; no other mode bit, ownership, timestamp, or empty legacy directory is
   represented. `.fv/history/` is a structural snapshot exclusion prefix, so
@@ -91,6 +92,21 @@ dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry ru
   cannot see it and every migrated obligation stays uncovered until an
   `fv-evidence-run/v3` record binds it. `.colosseum/` is read-only to the tool and
   is never deleted.
+- The legacy `verified-inputs.txt` is an include list, and FV include mode means
+  the same thing, so it is translated rather than inverted: the migrated policy
+  declares `mode: include`, keeps every legacy source root verbatim, rebinds an
+  entry naming a legacy manifest to the FV artifact its content migrated to
+  (`.colosseum/obligations.json` and `.colosseum/g1-claims.json` to
+  `.fv/obligations.json`), and additionally binds the elected canonical target,
+  whichever of `.fv/obligations.json` and `.fv/verification-plan.json` the run
+  wrote, and the policy file itself. An entry naming legacy bytes that migrate to
+  history alone binds nothing and is reported as a `#<entry>` deviation row. A
+  legacy list that is not valid UTF-8, does not parse under the path grammar,
+  declares no entries, or has no entry left to translate is `unsupported` and
+  blocks the migration: a policy binding only FV's own artifacts would keep every
+  record fresh across every source edit. The exact legacy list is preserved under
+  `.fv/history/colosseum/` either way, and a legacy tree with no include list gets
+  the exclusion-mode defaults instead.
 - Legacy layers with a pyramid equivalent are renamed (`proptest` to `proptests`);
   every other layer, `quint` included, becomes an `fv-verification-plan/v1` custom
   layer that runs after the built-in layers in lexical order. A layer any migrated
@@ -156,11 +172,15 @@ invariant and a worked multi-execution system claim, is in
 [`docs/dogfood-evidence.md`](../docs/dogfood-evidence.md).
 
 - Source binding is `bindings.source_snapshot`, a verified-input content snapshot
-  `sha256:<hex>` over every tracked-or-untracked, unignored, non-excluded file (`+dirty` suffix
-  when a non-excluded path is modified), not a commit id. Structural exclusion
-  prefixes: `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/history/`,
-  `.fv/.migrate-staging/`, `.colosseum/`, plus any listed in
-  `.fv/verified-inputs.txt`.
+  `sha256:<hex>` over every tracked-or-untracked, unignored, selected file (`+dirty` suffix
+  when a selected path is modified), not a commit id. Which files are selected comes from
+  `.fv/verified-inputs.txt`: with no `mode:` directive, or with `mode: exclude`, its entries
+  are exclusion prefixes and everything else git reports is a verified input; with
+  `mode: include` as its first non-comment line its entries are the allowlist, plus the
+  policy file itself, so revising the policy moves the snapshot. Structural exclusion
+  prefixes apply first in either mode and no project file can drop them:
+  `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/changes/`, `.fv/attacks/`,
+  `.fv/code-adversarial/`, `.fv/history/`, `.fv/.migrate-staging/`, `.colosseum/`.
 - Intent binding is `bindings.intent_path` (repo-relative canonical target, resolved from
   `.fv/dispatch.json` `omp_native.target_spec`, default `.fv/intent.md`) plus
   `bindings.intent_hash` over that file's bytes. `check_evidence_records.py --json` echoes the
