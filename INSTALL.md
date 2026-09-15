@@ -62,13 +62,13 @@ Only set optional binary variables for installed layers.
 ## Initialize a project
 
 ```bash
-python3 "$FV_ROOT/scripts/fv_init.py" /absolute/path/to/project
+uv run --script "$FV_ROOT/scripts/fv_init.py" /absolute/path/to/project
 ```
 
 Optional explicit intent/spec target:
 
 ```bash
-python3 "$FV_ROOT/scripts/fv_init.py" \
+uv run --script "$FV_ROOT/scripts/fv_init.py" \
   /absolute/path/to/project \
   --target-spec /absolute/path/to/project/.fv/intent.md
 ```
@@ -92,12 +92,17 @@ Start OMP in the initialized project:
 omp --cwd /absolute/path/to/project
 ```
 
-Then run:
+After adding or changing the extension root, run this in every already-running
+OMP session:
 
 ```text
-/mcp reload
+/reload-plugins
 /mcp test
 ```
+
+`/reload-plugins` rebuilds the session's skills, commands, hooks, tools,
+agents, and MCP snapshot. `/mcp reload` alone does not rediscover extension
+roots. New sessions discover the configured root at startup.
 
 Invoke skills only with the skill namespace:
 

@@ -42,7 +42,7 @@ Two things this is explicitly not:
 
    ```bash
    export REPLICATION_PROJECT=/tmp/fv-replication
-   python3 "$FV_ROOT/scripts/fv_init.py" "$REPLICATION_PROJECT"
+   uv run --script "$FV_ROOT/scripts/fv_init.py" "$REPLICATION_PROJECT"
    uv run --script "$FV_ROOT/scripts/fv_doctor.py" \
      --project "$REPLICATION_PROJECT" --json > doctor.json
    cat doctor.json

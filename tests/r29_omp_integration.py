@@ -91,6 +91,9 @@ def main() -> int:
         second = subprocess.run(command, capture_output=True, text=True)
         check("initializer first run succeeds", first.returncode == 0, first.stderr)
         check("initializer rerun succeeds", second.returncode == 0, second.stderr)
+        check("initializer tells existing sessions to reload the full extension snapshot",
+              "/reload-plugins" in first.stdout and "/mcp reload" not in first.stdout,
+              first.stdout)
 
         config = yaml.safe_load((project / ".omp" / "config.yml").read_text())
         extension_values = config["extensions"]

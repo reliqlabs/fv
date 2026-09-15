@@ -301,7 +301,7 @@ def main() -> int:
         print(f"  target_spec defaults to {target_spec}")
     print("\nNext steps:")
     print(f"  1. Export FV_ROOT={REPO} and optional proof-tool binary variables.")
-    print("  2. Start OMP in the project and run `/mcp reload`.")
+    print("  2. Start OMP in the project and run `/reload-plugins` in any session already open.")
     print("  3. Invoke workflows with `/skill:fv-*`.")
     print(f"  4. Run uv run --script {REPO / 'scripts' / 'fv_doctor.py'} --project {project}.")
     return 1 if errors else 0

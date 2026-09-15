@@ -13,16 +13,21 @@ FV is an OMP extension package. OMP discovers its `agents/`, `skills/`, `tools/`
 
 ```bash
 export FV_ROOT=/absolute/path/to/fv
-python3 "$FV_ROOT/scripts/fv_init.py" /absolute/path/to/project
+uv run --script "$FV_ROOT/scripts/fv_init.py" /absolute/path/to/project
 ```
 
 The initializer writes project state under `.fv/` and adds the FV checkout to `.omp/config.yml` `extensions:`. It does not copy package agents, skills, tools, or MCP definitions into the project.
 
-Start OMP in the project and reload MCP servers:
+After adding or changing the extension root, reload OMP's complete extension
+snapshot in every already-running session:
 
 ```text
-/mcp reload
+/reload-plugins
 ```
+
+This reloads skills, agents, tools, hooks, commands, and MCP. `/mcp reload`
+alone does not rediscover a newly added extension. New OMP sessions discover
+the configured root at startup.
 
 ## Workflow
 
