@@ -324,6 +324,7 @@ def check_toolchain(report: Report, project: Path, omp_command: str = "omp") -> 
     commands = {
         "omp": [omp or omp_command, "--version"],
         "quint": ["quint", "--version"],
+        "java": ["java", "-version"],
         "uv": ["uv", "--version"],
         "lean": ["lean", "--version"],
         "cargo-kani": ["cargo", "kani", "--version"],

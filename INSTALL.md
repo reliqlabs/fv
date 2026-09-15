@@ -11,7 +11,7 @@ FV is an OMP extension package. The checkout is the installation root; projects 
 
 Verification tools are incremental. Install only the layers required by the target:
 
-- Quint and its model-checking backend for protocol properties
+- Quint, its Apalache model-checking backend, and a Java runtime reachable as `java` for protocol properties
 - Kani for bounded Rust checks
 - Verus for deductive Rust verification
 - Charon and Aeneas for Rust-to-Lean extraction
