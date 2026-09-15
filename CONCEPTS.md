@@ -73,7 +73,7 @@ Canonical locations within a FV-managed project. Skills cite these; do not inven
 - `<project>/.fv/scripts/` — project-local copies of dispatch + CI-gate scripts
 - `<project>/.fv/verified-inputs.txt` — the verified-input **exclusion** list that defines the content snapshot (below)
 - `<project>/.fv/verification-plan.json` — optional `fv-verification-plan/v1` layer configuration read by `pyramid_run.py --plan`
-- `<project>/.fv/history/colosseum/` — quarantined pre-FV artifacts, byte-for-byte, written by `scripts/fv_migrate.py`; history, never live evidence
+- `<project>/.fv/history/colosseum/` — quarantined pre-FV artifacts, byte-for-byte, written by `scripts/fv_migrate.py`; history, never live evidence, and excluded from the content snapshot by a structural default rather than by a project declaration
 - `<fv>/agents/` — static OMP agents loaded from the extension package
 
 ## The trust ledger
@@ -81,7 +81,9 @@ Canonical locations within a FV-managed project. Skills cite these; do not inven
 A project's `.fv/ledger.md` records every cross-component trust claim with:
 - the named theorem
 - the tools that contribute (Quint property, Lean theorem, Verus annotation, Kani harness)
-- code-line citations for each link
+- code-line citations for each link, under a `Depends on:` header whose entries
+  are indented beneath it; the block ends at the first blank line, heading, or
+  nonblank non-entry line, so unrelated later bullets are not read as links
 - axiom inventory (which axioms each theorem's closure depends on)
 
 `fv-compose` maintains it. CI gates fail when a link drifts from executable code.
@@ -95,14 +97,25 @@ earned against rather than a commit plus a dirty flag.
 
 - **The input set is an exclusion list.** `.fv/verified-inputs.txt` holds
   path prefixes to *exclude* (blank and `#` lines ignored, directory entries
-  end in `/`). The built-in defaults are `.fv/evidence/`, `.fv/verify/`,
-  `.fv/panels/`, and `.colosseum/`; a project's file only ever *adds* prefixes
-  to them (a migrated project gets `.fv/history/` added, so quarantined history
-  cannot perturb the snapshot). Everything else that
+  end in `/`). Six prefixes are structural defaults, applied whether or not
+  any file declares them: `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`,
+  `.fv/history/`, `.fv/.migrate-staging/`, and `.colosseum/`. A project's file
+  only ever *adds* prefixes to them, so quarantined history and a migration's
+  staging tree cannot perturb the snapshot even after `fv_init --force`
+  rewrites the project file — the guarantee is a property of the defaults, not
+  of a line the migration happened to write. Everything else that
   `git ls-files --cached --others --exclude-standard` reports is a verified
   input. Exclusion, not inclusion, is the safe default: a newly added source
   file is in scope automatically, and only FV's own generated output and
-  quarantined history sit outside it.
+  quarantined history sit outside it. Entries are separated by LF or CRLF
+  only: any other break character the Python and TypeScript parsers would
+  split differently is rejected on both ends rather than yielding two
+  exclusion sets from one list.
+- **A verified input must be a regular file.** A tracked path whose worktree
+  entry is a symlink, a FIFO, or any other non-regular file is classified as
+  an error instead of being opened, so a snapshot can never block forever on
+  a reader that never arrives. Directory entries (submodule gitlinks) are
+  skipped; they are verified by their own repository.
 - **The snapshot is content, not identity.** `sha256:<hex>` over, for each
   input in sorted repo-relative POSIX-path order, the path, a NUL byte, the
   file's content SHA-256 in hex, and a newline. Symlinks and paths resolving
@@ -117,9 +130,20 @@ earned against rather than a commit plus a dirty flag.
   two executions of one run, the record's snapshot is written as
   `sha256:<hex>+dirty` and its result is FAIL. Evidence earned against a moving
   tree is unusable by construction rather than quietly weaker.
-- **The gate recomputes it.** Gate B computes the current snapshot and, by
-  default, requires an exact match; `--expect-snapshot` and `--allow-unbound`
-  are the explicit, visible ways to validate a record against something else.
+- **The gate recomputes it, and says so.** Gate B computes the current
+  snapshot and, by default, requires an exact match; `--expect-snapshot`,
+  `--expect-intent`, and `--allow-unbound` are the explicit, visible ways to
+  validate a record against something else. Which discipline ran is part of
+  the verdict rather than a flag only the operator saw:
+  `VERIFIED[profile=...; binding=recomputed]` for the default,
+  `binding=pinned` when a snapshot or intent hash was supplied instead of
+  recomputed, and `binding=unbound` under `--allow-unbound`. A reader who
+  greps the banner can no longer mistake a pinned or unbound run for an
+  evidence-bound one. The coverage dashboard, which reads records and never
+  recomputes anything, says `binding=not-recomputed` for the same reason.
+  A record whose snapshot carries the `+dirty` marker cannot PASS in any
+  comparison mode, so the producer's honesty marker is enforced rather than
+  advisory.
 - **It is portable.** Two clones or worktrees with the same content produce the
   same snapshot, so evidence earned in one is checkable in another. This is
   what makes a G1 record a transferable artifact instead of a claim about one
@@ -145,24 +169,109 @@ whose `bindings.executions` array holds one entry per command, each with its
 tool, evidence class, argv, repo-relative cwd, toolchain digests, raw-output
 path and hash, result, and run ID. A single-command record is a cohort of one.
 
-Two rules make a cohort a real conjunction rather than a bag of results:
+Three rules make a cohort a real conjunction rather than a bag of results:
 
 1. **A cohort's verdict is atomic.** The record PASSes only when *every*
    execution PASSes and every binding — snapshot, intent hash, manifest hash —
    held still across the whole run. A partially-passing cohort is a FAIL
-   record, not a partial credit.
-2. **A system claim PASSes only under full tool coverage.** Every ID in
+   record, not a partial credit. The obligation/class compatibility table
+   applies per execution too, so a witness-only class cannot hide inside an
+   invariant's cohort, and an `externally-assumed` or `unverified` class
+   anywhere in the record — declared class or any execution's — needs a
+   waiver to PASS.
+   The record-level class is *not* ranked against its executions: there is no
+   total strength ordering over evidence classes, and inventing one would put
+   a synthetic lattice between an obligation and its evidence. Admissibility
+   is checked per execution against the obligation kind, and every execution's
+   class is disclosed — the coverage dashboard reports
+   `by_execution_evidence_class` and `assumed_executions` beside the record
+   classes — so a record class that overstates its cohort inside one kind's
+   allowed set is visible rather than silently accepted as the cohort's class.
+2. **One artifact discharges one execution.** Each execution commits to its
+   own raw-output path and hash; two executions of a cohort may not cite the
+   same artifact, and no two claims in a run may cite one either. A record
+   written under the producer profile must name the artifact the producer
+   would have written, `.fv/evidence/raw/<claim_id>-<run_id>.log`, so a
+   single passing log cannot be pointed at from everywhere.
+3. **A system claim PASSes only under full tool coverage.** Every ID in
    `required_evidence` must appear among the cohort's PASS executions. The
-   coverage dashboard names the two ways this fails: `coverage-gap` (a required
-   tool never PASSed, or carries no cohort at all, or some other execution in
-   the cohort did not PASS) and `dependency-gap` (the cohort fully PASSes but a
-   `depends_on` obligation is itself uncovered).
+   coverage dashboard names the two ways this fails: `evidence-gap` (a
+   required tool never PASSed, or carries no cohort at all, or some other
+   execution in the cohort did not PASS) and `dependency-gap` (the cohort
+   fully PASSes but a `depends_on` obligation is itself uncovered). Judging a
+   system claim through `--require` pulls its `depends_on` obligations into
+   the required set, so a composition is never reported VERIFIED while its
+   parts went unexamined.
 
 Because the claim is a conjunction, **anything that invalidates one member
 invalidates the claim.** A content-snapshot change, a re-run of a single tool
 that now FAILs, a dropped tool from the cohort, or a `depends_on` obligation
 losing its own evidence each take the system claim out of PASS; it is re-earned
 by re-running the cohort, not by patching the one execution that moved.
+
+## Shadow migration of a legacy tree
+
+A **shadow migration** brings a pre-FV `.colosseum` project under FV without
+touching it: `scripts/fv_migrate.py PROJECT [--apply]` reads the legacy tree,
+writes only under `.fv/`, and leaves `.colosseum/` byte-identical as the
+auditable original for everything the translation cannot carry. Dry run is the
+default. Every legacy file is classified exactly once as `mapped`,
+`preserved-history`, or `unsupported`, and any `unsupported` row or
+destination conflict blocks the run rather than producing a partial `.fv/`.
+
+- **The write is staged, and a failed write rolls back.** `--apply` builds
+  every destination under `.fv/.migrate-staging/<pid>-<random>/` in full, then
+  moves each into place with `os.replace`, which does not follow a symlink at
+  the final name. A destination that already exists is moved aside into the
+  same staging tree first, so putting it back is a rename of its own inode and
+  carries its mode, ownership and timestamps along with its bytes. A failure
+  part-way through the moves rolls back every destination already moved, and
+  the report is printed even when the apply fails — each write's action says
+  what happened to it (`written`, `rolled-back`, `failed`, `lost`,
+  `pending`), `lost` being a destination whose original could not be renamed
+  back and is therefore absent — because the report is the only enumeration of
+  what landed. Preflight refuses a destination whose path
+  crosses a symlink at *any* component (`.fv` itself included) and a
+  destination directory that is not writable, so the common failures block
+  with zero writes. A completed apply and a completed rollback both remove the
+  staging tree; a rollback that could not put a destination back keeps it
+  deliberately, because the aside-moved original inode is then the only copy of
+  the replaced bytes, and the error names the retained directory. A migration
+  killed outright also leaves one `.fv/.migrate-staging/<pid>-<random>/`
+  directory behind. Either way the residue is snapshot-excluded, never collides
+  with a later run, and is safe to delete once its contents are accounted for.
+  Nothing garbage-collects it: a sweep would have to decide that another
+  process's staging tree is dead, and guessing that wrong would delete a live
+  migration's bytes or a rollback's only surviving originals.
+- **The dispatch target is elected from a declaration, never from prose
+  frequency.** The legacy pointer stub decides first; the ledger's citations
+  decide only when the stub cites nothing. Two or more surviving candidates,
+  or none at all, are `unsupported` and block. The elected `target_spec` is a
+  top-level field of the migration report, so a dry-run consumer can check
+  the decision without parsing a detail string.
+- **Legacy evidence becomes history, not evidence.** v1/v2 records under
+  `.colosseum/evidence/` are preserved byte-for-byte under
+  `.fv/history/colosseum/<path>` and never placed where Gate B would read
+  them as live `fv-evidence-run/v3` evidence. `.fv/history/` is a structural
+  snapshot exclusion, so quarantining them cannot invalidate fresh evidence.
+- **A lossy translation names what it dropped.** Migrated obligation ids are
+  normalized into the shape the evidence producer can discharge, with the
+  legacy string kept in `legacy_id` and any collision or empty normalization
+  blocking. Claim keys with no typed slot survive under `legacy_fields` and
+  are named in a `#claims.<id>` deviation row; a merged layer, a dropped
+  document key, and an adopted `dispatch.json` route are each reported the
+  same way. Silence is never the record of a translation choice.
+- **A claim whose evidence the migrated plan cannot produce blocks the
+  migration.** Every `required_evidence` tool is checked back against the
+  translated plan; a tool no migrated execution produces is `unsupported`,
+  including the case where the legacy tree recorded no run manifest at all and
+  the plan therefore declares nothing. A legacy project with claims but no
+  recorded runs is consequently unmigratable until either its runs are
+  recorded in `.colosseum/evidence/runs/layer-runs.json` or the claims stop
+  naming layers nothing can run. That is the intended direction: the
+  alternative is a migrated manifest whose claims can never be discharged,
+  which reads as "evidence missing" rather than "this claim was never
+  runnable here".
 
 ## Trust-assumption categories
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -28,8 +29,24 @@ from pathlib import Path
 DISPATCH_RELATIVE = ".fv/dispatch.json"
 VERIFIED_INPUTS_RELATIVE = ".fv/verified-inputs.txt"
 DEFAULT_TARGET_SPEC = ".fv/intent.md"
-DEFAULT_EXCLUSIONS = (".fv/evidence/", ".fv/verify/", ".fv/panels/", ".colosseum/")
+# Generated FV output, plus quarantined legacy history and in-flight migration
+# staging: excluding these structurally keeps writing evidence, writing a verification
+# report, quarantining legacy history, or a killed migration's staging residue from
+# invalidating the evidence bound to the snapshot. Mirrored in tools/evidence-run.ts.
+DEFAULT_EXCLUSIONS = (".fv/evidence/", ".fv/verify/", ".fv/panels/", ".fv/history/",
+                      ".fv/.migrate-staging/", ".colosseum/")
 SNAPSHOT_PREFIX = "sha256:"
+# Characters Python's ``str.splitlines``/``str.strip`` treat as line breaks or
+# whitespace while JavaScript's ``split("\n")``/``trim`` do not. An exclusion list
+# carrying one parses differently in the gate and the producer, which would silently
+# hash different input sets, so both ends reject it instead.
+AMBIGUOUS_LINE_CHARS = "\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+# A byte-order mark survives Python's ``utf-8`` decode as this character, while the
+# WHATWG decode a JavaScript runtime performs drops a leading one, so one list would
+# yield two exclusion sets with nothing to attribute the difference to. Rejected
+# anywhere in the file by both ends rather than stripped by either: a BOM inside an
+# entry is not a path character. Mirrored in tools/evidence-run.ts.
+BOM_CHAR = "\ufeff"
 _READ_CHUNK = 1 << 20
 
 
@@ -110,8 +127,10 @@ def resolve_target(project_root: str | Path, target_spec: str | Path | None = No
 
     ``target_spec`` defaults to the declared ``omp_native.target_spec`` and then
     to ``.fv/intent.md``. Relative specs resolve under the project root; an
-    absolute spec is accepted only when it lands inside the project root. The
-    result is an existing regular file; anything else is a ``ProjectError``.
+    absolute spec is accepted only when it lands inside the project root. ``~``
+    is never expanded: a spec whose first component starts with it is rejected on
+    both ends, so the producer and this resolver bind the same file. The result
+    is an existing regular file; anything else is a ``ProjectError``.
     """
     root = resolve_project_root(project_root)
     spec = target_spec if target_spec is not None else declared_target_spec(root)
@@ -119,7 +138,9 @@ def resolve_target(project_root: str | Path, target_spec: str | Path | None = No
         spec = DEFAULT_TARGET_SPEC
     if not str(spec).strip():
         raise ProjectError("target_spec is empty")
-    raw = Path(str(spec)).expanduser()
+    raw = Path(str(spec))
+    if raw.parts and raw.parts[0].startswith("~"):
+        raise ProjectError(f"target_spec must not start with '~': {spec}")
     candidate = raw if raw.is_absolute() else root / raw
     resolved = Path(_normalize(candidate))
     if not _contained(root, resolved):
@@ -149,8 +170,48 @@ def target_hash(project_root: str | Path, target: str | Path | None = None) -> s
 intent_hash = target_hash
 
 
+def _is_control(char: str) -> bool:
+    """True for a C0 control, DEL, or a C1 control character.
+
+    No control character is a legal exclusion-list character. LF, and the CR of a
+    CRLF pair, separate entries; ``AMBIGUOUS_LINE_CHARS`` are reported as
+    terminators; every remaining control is either stripped by one side's
+    whitespace rule only (``\\x1f``), invisible inside an entry (``\\t``), or
+    unrepresentable in a path (``\\x00``). Characters above U+009F are kept
+    verbatim, so a path with non-ASCII components is a legal entry. Mirrored in
+    ``tools/evidence-run.ts``.
+    """
+    code = ord(char)
+    return code <= 0x1F or 0x7F <= code <= 0x9F
+
+
 def parse_exclusions(text: str) -> list[str]:
-    """Parse a verified-input exclusion list into normalized prefixes."""
+    """Parse a verified-input exclusion list into normalized prefixes.
+
+    One rule, mirrored in ``tools/evidence-run.ts``: LF and CRLF separate
+    entries, and every other control character, plus a byte-order mark, is
+    rejected outright rather than stripped or re-interpreted. Python and
+    JavaScript disagree about which of them break lines, which of them ``strip``,
+    and whether a BOM survives decoding, so accepting one would let the gate and
+    the producer derive different exclusion sets from a single list. Every other
+    Unicode character is kept verbatim: a non-ASCII path is a legal entry.
+    """
+    lineno = 1
+    for index, char in enumerate(text):
+        if char == "\n":
+            lineno += 1
+            continue
+        if char == "\r" and text[index + 1:index + 2] == "\n":
+            continue
+        if char in AMBIGUOUS_LINE_CHARS or char == "\r":
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: "
+                               f"ambiguous line terminator {char!r}; use LF")
+        if char == BOM_CHAR:
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: byte-order mark "
+                               f"U+FEFF; write the list as UTF-8 without a BOM")
+        if _is_control(char):
+            raise ProjectError(f"{VERIFIED_INPUTS_RELATIVE}:{lineno}: "
+                               f"control character {char!r}; use LF-separated entries")
     prefixes: list[str] = []
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -172,16 +233,22 @@ def parse_exclusions(text: str) -> list[str]:
 def load_exclusions(project_root: str | Path) -> list[str]:
     """Declared exclusions unioned with the always-applied defaults.
 
-    The defaults keep evidence, verification, and panel outputs out of the
-    snapshot so writing evidence can never invalidate the evidence being
-    written; a project list only adds prefixes.
+    The defaults keep evidence, verification, panel, quarantined-history, and
+    migration-staging outputs out of the snapshot so writing evidence,
+    quarantining legacy history, or abandoning a migration mid-apply can never
+    invalidate the evidence being written; a project list only adds prefixes, so
+    it cannot restore a default into the snapshot. The bytes are decoded as
+    strict UTF-8 with no newline translation: ``read_text`` would rewrite a lone
+    ``\\r`` to ``\\n`` and hide from ``parse_exclusions`` exactly the terminator
+    it exists to reject, and a decode failure is a rejection here rather than a
+    replacement character.
     """
     root = resolve_project_root(project_root)
     prefixes = list(DEFAULT_EXCLUSIONS)
     listing = root / VERIFIED_INPUTS_RELATIVE
     if listing.is_file():
         try:
-            text = listing.read_text(encoding="utf-8")
+            text = listing.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise ProjectError(f"cannot read {VERIFIED_INPUTS_RELATIVE}: {error}") from error
         for prefix in parse_exclusions(text):
@@ -239,17 +306,23 @@ def snapshot_entries(
     entries: list[tuple[str, str]] = []
     for relative in sorted(selected, key=lambda name: name.encode("utf-8")):
         path = root / relative
-        if path.is_symlink():
-            raise ProjectError(f"verified input is a symlink: {relative}")
         resolved = Path(_normalize(path))
         if not _contained(root, resolved):
             raise ProjectError(f"verified input escapes project root: {relative}")
-        if path.is_dir():
-            # Submodule gitlink: its content is verified by its own repository.
-            continue
-        if not path.exists():
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
             # Tracked but deleted in the worktree; the absence is the change.
             continue
+        if stat.S_ISLNK(mode):
+            raise ProjectError(f"verified input is a symlink: {relative}")
+        if stat.S_ISDIR(mode):
+            # Submodule gitlink: its content is verified by its own repository.
+            continue
+        if not stat.S_ISREG(mode):
+            # A FIFO, socket, or device node has no content to hash, and opening
+            # one can block forever: classify it instead of hanging the snapshot.
+            raise ProjectError(f"verified input is not a regular file: {relative}")
         try:
             entries.append((relative, _file_digest(path)))
         except OSError as error:

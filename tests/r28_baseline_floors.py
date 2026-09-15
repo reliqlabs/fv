@@ -39,12 +39,20 @@ required:true joining the G2 gating set (and required:false never gating),
 --skip, and a types failure marking every required or declared custom layer
 not_run without running an invocation.
 
+The failure-containment half covers commands that cannot run at all: an absent
+executable, a non-executable file and a vanished cwd are structured `failed`
+executions (returncode -1 plus `launch_error`), never a traceback and never a
+missing report; a timeout is still reported as a timeout; a report that cannot
+be persisted is ERROR (exit 2) with the report still on stdout; and one
+evidence_tool id may name only one invocation plan-wide.
+
 Requires cargo. Exit 0 pass, 1 fail, 2 toolchain unavailable.
 """
 from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -204,6 +212,42 @@ def test_pure(mod) -> None:
                                             30, short_layer)
     check("fuzz_surface_check: duration below floor -> failed",
           status == "failed" and detail["below_floor"] == ["parse_input"], str(detail))
+
+
+def test_run_cmd(mod) -> None:
+    print("run_cmd failure containment (a launch failure is a result, not a crash)")
+    with tempfile.TemporaryDirectory(prefix="r28-runcmd-") as td:
+        root = Path(td)
+
+        absent = mod.run_cmd(["r28-definitely-not-a-binary"], root, timeout=5)
+        check("run_cmd: an absent executable returns a structured failure",
+              absent["returncode"] == -1
+              and "FileNotFoundError" in absent.get("launch_error", "")
+              and absent["command"] == ["r28-definitely-not-a-binary"],
+              str(absent))
+
+        vanished = mod.run_cmd([sys.executable, "-c", ""], root / "gone", timeout=5)
+        check("run_cmd: a cwd that no longer exists returns a structured failure",
+              vanished["returncode"] == -1 and "launch_error" in vanished,
+              str(vanished))
+
+        if os.geteuid() != 0:  # root ignores the executable bit
+            script = root / "not-executable.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o444)
+            denied = mod.run_cmd([str(script)], root, timeout=5)
+            check("run_cmd: a non-executable file returns a structured failure",
+                  denied["returncode"] == -1
+                  and "PermissionError" in denied.get("launch_error", ""),
+                  str(denied))
+
+        # The new launch-failure branch must not swallow the timeout branch:
+        # a timeout is still a timeout, and it is not a launch error.
+        slow = mod.run_cmd([sys.executable, "-c", "import time; time.sleep(30)"],
+                           root, timeout=1)
+        check("run_cmd: a timeout stays a timeout, not a launch error",
+              slow["returncode"] == -1 and slow.get("timeout") is True
+              and "launch_error" not in slow, str(slow))
 
 
 def write_plan(crate: Path, layers: dict) -> tuple[Path, dict]:
@@ -410,6 +454,41 @@ def test_plan_pure(mod) -> None:
                 root, "cwd escapes the crate root")
         rejects("plan: non-existent cwd rejected", {"layers": one(cwd="nope")},
                 root, "cwd is not a directory")
+
+        # evidence_tool names exactly one invocation: the runner keys each
+        # measured duration by it, so a repeated id would merge two recorded
+        # verifications into one witnessed tool instead of being rejected.
+        def witnessed(tool: str) -> dict:
+            return {"argv": ["true"], "cwd": ".", "timeout_seconds": 5,
+                    "evidence_tool": tool}
+
+        rejects("plan: the same evidence_tool twice in one cohort rejected",
+                {"layers": {"quint": {"required": True, "executions": [
+                    witnessed("quint"), witnessed("quint")]}}}, root,
+                "evidence_tool 'quint' is declared twice")
+        rejects("plan: the same evidence_tool across two layers rejected",
+                {"layers": {
+                    "types": {"required": True,
+                              "executions": [witnessed("cargo-check")]},
+                    "lints": {"required": True,
+                              "executions": [witnessed("cargo-check")]}}}, root,
+                "evidence_tool 'cargo-check' is declared twice")
+        cohort = mod.parse_plan(
+            {"layers": {"quint": {"required": True, "executions": [
+                witnessed("quint:run1.1"), witnessed("quint:run2.1"),
+                witnessed("quint")]}}}, root)
+        check("plan: distinct per-run evidence_tool ids in one cohort accepted",
+              [execution["evidence_tool"]
+               for execution in cohort["layers"]["quint"]["executions"]]
+              == ["quint:run1.1", "quint:run2.1", "quint"],
+              str(cohort["layers"]["quint"]["executions"]))
+        toolless = mod.parse_plan(
+            {"layers": {"quint": {"required": True, "executions": [
+                {"argv": ["true"], "cwd": ".", "timeout_seconds": 5},
+                {"argv": ["true"], "cwd": ".", "timeout_seconds": 5}]}}}, root)
+        check("plan: executions without an evidence_tool are not duplicates",
+              len(toolless["layers"]["quint"]["executions"]) == 2,
+              str(toolless["layers"]["quint"]["executions"]))
 
 
 def test_plan_runner() -> None:
@@ -815,9 +894,129 @@ def test_custom_plan_layers() -> None:
               labels(log) == ["types"], str(labels(log)))
 
 
+def test_launch_failures() -> None:
+    print("unrunnable plan commands (a failed layer and a report, never a crash)")
+    with tempfile.TemporaryDirectory(prefix="r28-launch-") as td:
+        tmp = Path(td)
+
+        def fixture(name: str) -> tuple[Path, Path]:
+            crate = tmp / name
+            shutil.copytree(MINICRATE, crate)
+            (crate / "probe.py").write_text(PROBE)
+            return crate, tmp / f"{name}.log"
+
+        def known(crate: Path, log: Path) -> dict:
+            return {
+                "types": {"required": True,
+                          "executions": [probe(crate, log, "types")]},
+                "lints": {"required": True,
+                          "executions": [probe(crate, log, "lints")]},
+                "proptests": {"required": True,
+                              "executions": [probe(crate, log, "proptests")]},
+            }
+
+        # A freshly migrated plan naming a tool this machine does not have:
+        # the layer fails, the passing layers keep their results, and the run
+        # reaches a verdict and a persisted report instead of a traceback.
+        crate, log = fixture("missingtool")
+        plan, _ = write_plan(crate, {
+            **known(crate, log),
+            "quint": {"required": True, "executions": [
+                {"argv": ["r28-quint-not-installed", "verify", "spec/p.qnt"],
+                 "cwd": ".", "timeout_seconds": 60,
+                 "evidence_tool": "quint-verify"}]},
+        })
+        code, out = run(crate, "tested", "--plan", str(plan))
+        reports = sorted((crate / ".fv" / "verify").glob("headless-*.json"))
+        check("launch failure: the run reports a verdict, not a traceback",
+              code == 1 and "FAILED" in out and "Traceback" not in out,
+              f"exit={code} {out[-400:]}")
+        check("launch failure: the report still lands", len(reports) == 1,
+              str([p.name for p in reports]))
+        if reports:
+            report = json.loads(reports[-1].read_text())
+            quint = report["layers"]["quint"]
+            execution = quint["detail"]["executions"][0]
+            check("launch failure: the layer is failed with a structured "
+                  "execution record",
+                  quint["status"] == "failed" and execution["returncode"] == -1
+                  and "FileNotFoundError" in execution.get("launch_error", ""),
+                  str(quint["detail"]))
+            rows = quint["detail"]["launch_errors"]
+            check("launch failure: launch_errors names the position, tool and "
+                  "argv0",
+                  len(rows) == 1
+                  and {k: v for k, v in rows[0].items() if k != "error"}
+                  == {"execution": 0, "evidence_tool": "quint-verify",
+                      "argv0": "r28-quint-not-installed"}
+                  and "FileNotFoundError" in rows[0]["error"],
+                  str(quint["detail"].get("launch_errors")))
+            check("launch failure: layers that ran keep their results",
+                  [report["layers"][layer]["status"]
+                   for layer in ("types", "lints", "proptests", "floors")]
+                  == ["passed", "passed", "passed", "passed"],
+                  str({k: v["status"] for k, v in report["layers"].items()}))
+            check("launch failure: a required unrunnable layer gates the verdict",
+                  report["verdict"] == "FAILED"
+                  and "quint" in report["required_layers"],
+                  f"{report['verdict']} {report['required_layers']}")
+
+        # A non-executable file is the same class of failure, and a
+        # required:false layer that cannot launch still never gates.
+        if os.geteuid() != 0:  # root ignores the executable bit
+            crate, log = fixture("notexecutable")
+            script = crate / "not-executable.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o444)
+            plan, _ = write_plan(crate, {
+                **known(crate, log),
+                "mutation": {"required": False, "executions": [
+                    {"argv": [str(script)], "cwd": ".", "timeout_seconds": 60,
+                     "evidence_tool": "mutants"}]},
+            })
+            code, out = run(crate, "tested", "--plan", str(plan))
+            report = latest_report(crate)
+            mutation = report["layers"]["mutation"]
+            check("launch failure: a non-executable command fails its layer "
+                  "with a permission error",
+                  mutation["status"] == "failed"
+                  and "PermissionError"
+                  in mutation["detail"]["launch_errors"][0]["error"],
+                  str(mutation["detail"].get("launch_errors")))
+            check("launch failure: a required:false unrunnable layer does not "
+                  "gate the verdict",
+                  code == 0 and "VERIFIED[tested]" in out
+                  and "mutation" not in report["required_layers"],
+                  f"exit={code} required={report['required_layers']}")
+
+        # Evidence that cannot be persisted is an infrastructure ERROR, and the
+        # report itself still reaches stdout rather than vanishing.
+        if os.geteuid() != 0:
+            crate, log = fixture("unwritable")
+            plan, _ = write_plan(crate, known(crate, log))
+            verify_dir = crate / ".fv" / "verify"
+            verify_dir.mkdir(parents=True)
+            verify_dir.chmod(0o500)
+            try:
+                code, out = run(crate, "tested", "--plan", str(plan), "--json")
+            finally:
+                verify_dir.chmod(0o700)
+            check("unpersistable report: ERROR exit 2, no traceback",
+                  code == 2 and "VERDICT: ERROR" in out
+                  and "cannot write the report" in out
+                  and "Traceback" not in out, f"exit={code} {out[-400:]}")
+            check("unpersistable report: the report still reaches stdout",
+                  json.loads(out[out.index("{"):out.rindex("}") + 1])["gate"]
+                  == "pyramid-headless", out[:200])
+            check("unpersistable report: nothing was written",
+                  not list(verify_dir.glob("headless-*.json")),
+                  str(list(verify_dir.iterdir())))
+
+
 def main() -> int:
     mod = load_runner()
     test_pure(mod)
+    test_run_cmd(mod)
     test_plan_pure(mod)
 
     if shutil.which("cargo") is None:
@@ -827,6 +1026,7 @@ def main() -> int:
     test_runner()
     test_plan_runner()
     test_custom_plan_layers()
+    test_launch_failures()
 
     print()
     if FAILURES:

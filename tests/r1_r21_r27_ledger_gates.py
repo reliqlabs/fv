@@ -18,7 +18,20 @@ suffixes. Citation parsing accepts every dossier form — backticked path,
 fully backticked `code: path:line@sha256:hash`, plain `code:`
 annotation, `**Depends on:**` block headers — keeps containment and
 content-hash checks on each, refuses prose and inline code as citations,
-and fails malformed `code:` annotations loudly.
+and fails malformed `code:` annotations loudly. `kani:` annotations are
+parsed against the coverage grammar, so a placeholder body
+(`n/a`/`none`/`TODO`/`n_a`/`pending`/`covered`/`-`), an unlocated bare
+word (`pass`/`fine`/`exempt`/`maybe`/`nothing`/`irrelevant`, and
+`merkle` too), a bare `kani: skipped`, a thin because-clause, and the
+text "kani:" inside another word or inside `#[kani::proof]` are not
+per-link coverage; every valid dossier form (`snake_case` harness,
+`module::harness`, cited location, a bare name beside a `<path>:<line>`
+locator, parenthesised bound, closed-list skip) still passes. A
+`Depends on:` block closes at a blank
+line or a heading, so a later unrelated bullet list is not counted as
+trust-chain links, while a loose list nested under the header is; a
+post-blank bullet at the header's own indentation is deliberately NOT
+reopened, and both sides of that trade are pinned here.
 
 Gate B (semantic evidence, check_evidence_records.py):
 R27: a G1 record missing any binding field (or the waiver key) is
@@ -159,6 +172,213 @@ def main() -> int:
         check("R21: link without kani fails under --strict-kani",
               code == 1 and "trust-chain link without" in out)
 
+        # ── F10: kani: bodies are parsed, not substring-matched ─────────
+        # A link line carrying `kani: n/a` satisfied the old substring
+        # test, so an entirely unmeasured link read as covered.
+        for placeholder in ("n/a", "none", "TODO", "-"):
+            vague = (f"Depends on:\n"
+                     f"- L1 at `src/guard.rs:2@sha256:{h}` kani: {placeholder}\n")
+            code, out = gate_a(root, vague)
+            check(f"F10: `kani: {placeholder}` is not per-link coverage",
+                  code == 0 and "trust-chain link without" in out
+                  and "naming neither a harness nor an explicit skip" in out,
+                  out[-300:])
+            code, out = gate_a(root, vague, "--strict-kani")
+            check(f"F10: `kani: {placeholder}` fails under --strict-kani",
+                  code == 1 and "trust-chain link without" in out, out[-300:])
+
+        code, out = gate_a(root, f"Depends on:\n- L1 at `src/guard.rs:2@sha256:{h}`"
+                                 f" kani: skipped\n", "--strict-kani")
+        check("F10: bare `kani: skipped` fails without a because-clause",
+              code == 1 and "without a `because <reason>` clause" in out,
+              out[-300:])
+        code, out = gate_a(root, f"Depends on:\n- L1 at `src/guard.rs:2@sha256:{h}`"
+                                 f" kani: skipped because tbd\n", "--strict-kani")
+        check("F10: `kani: skipped because <placeholder>` fails",
+              code == 1 and "no reviewable reason" in out, out[-300:])
+
+        # The text "kani:" inside another word or inside a Rust path is
+        # not an annotation: it covers no link and does not discharge the
+        # whole-ledger no-annotation check either.
+        embedded = (f"Depends on:\n"
+                    f"- L1 at `src/guard.rs:2@sha256:{h}` barkani: harness_check\n"
+                    f"- L2 at `src/guard.rs:5@sha256:{h5}` enforced by `#[kani::proof]`\n")
+        code, out = gate_a(root, embedded, "--strict-kani")
+        check("F10: `barkani:` and `#[kani::proof]` are not kani annotations",
+              code == 1 and "Kani annotations:  0" in out
+              and "ledger contains no `kani:` annotations" in out, out[-400:])
+
+        # Every valid dossier form keeps passing: a named harness, a
+        # `module::harness` path, the harness cited by location, a
+        # parenthesised bound, and closed-list or three-word skips.
+        valid_kani = (
+            "**Depends on:**\n"
+            f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+            f"  - L2 at `src/guard.rs:5@sha256:{h5}` kani: harnesses::harness_check\n"
+            f"  - L3 at `src/guard.rs:1@sha256:{h1}` kani: src/guard.rs:5\n"
+            f"  - L4 at `src/guard.rs:2@sha256:{h}` kani: invariants_hold "
+            f"(bounded: 10 ops, unwind 12)\n"
+            f"  - L5 at `src/guard.rs:2@sha256:{h}` kani: skipped because off-chain\n"
+            f"  - L6 at `src/guard.rs:2@sha256:{h}` kani: skipped because Verus-only\n"
+            f"  - L7 at `src/guard.rs:2@sha256:{h}` kani: skipped because the "
+            f"ghost counters are covered by the L1 harness\n"
+        )
+        code, out = gate_a(root, valid_kani, "--strict-kani")
+        check("F10: every valid dossier kani: form still passes",
+              code == 0 and "Kani annotations:  7" in out
+              and "Trust-chain links: 7" in out, out[-400:])
+
+        # ── N3: an unlocated bare word is not coverage ──────────────────
+        # An earlier pass accepted any identifier-shaped token absent
+        # from NON_HARNESS_TOKENS, so per-link Kani coverage was
+        # dischargeable by an arbitrary word — the closed list is an
+        # enumeration of remembered spellings, and `pass`, `fine`,
+        # `exempt`, `maybe`, `nothing`, `irrelevant` were never in it.
+        # Gate A holds no harness catalog, so nothing else in the
+        # pipeline could confirm the name. A bare single-segment token
+        # now needs a `<path>:<line>` locator beside it; the
+        # conventional `snake_case` and `module::harness` spellings stay
+        # accepted unlocated (asserted in valid_kani above), which is
+        # what keeps every existing ledger passing.
+        for word in ("pass", "fine", "exempt", "maybe", "nothing",
+                     "irrelevant", "somehow", "merkle", "verifyMerkle", "b2"):
+            bare = ("**Depends on:**\n"
+                    f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: {word}\n")
+            code, out = gate_a(root, bare, "--strict-kani")
+            check(f"N3: unlocated bare `kani: {word}` is not per-link coverage",
+                  code == 1 and "trust-chain link without" in out
+                  and "not coverage on its own" in out
+                  and "Kani annotations:  0" in out, out[-400:])
+            code, out = gate_a(root, bare)
+            check(f"N3: bare `kani: {word}` warns (not silently covers) by default",
+                  code == 0 and "not coverage on its own" in out
+                  and "Kani annotations:  0" in out, out[-400:])
+
+        # The same names ARE coverage once the annotation carries a
+        # locator that parses: plain, parenthesised-and-backticked, and
+        # content-bound forms all resolve to a place in the tree a
+        # reviewer can check, which is the evidence a bare word lacked.
+        located_names = (
+            "**Depends on:**\n"
+            f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: merkle at src/guard.rs:5\n"
+            f"  - L2 at `src/guard.rs:5@sha256:{h5}` kani: verifyMerkle "
+            f"(`src/guard.rs:2@sha256:{h}`)\n"
+            f"  - L3 at `src/guard.rs:1@sha256:{h1}` kani: b2 at "
+            f"src/guard.rs:5@sha256:{h5}\n"
+        )
+        code, out = gate_a(root, located_names, "--strict-kani")
+        check("N3: a bare harness name plus a locator is per-link coverage",
+              code == 0 and "Kani annotations:  3" in out
+              and "Trust-chain links: 3" in out, out[-400:])
+
+        # A non-parsing locator is no locator: the shape has to read as
+        # `<path>.<ext>:<line>`, not merely contain a colon and digits.
+        fake_locator = ("**Depends on:**\n"
+                        f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: merkle at 5:1\n")
+        code, out = gate_a(root, fake_locator, "--strict-kani")
+        check("N3: a bare name beside a prose ratio is still not coverage",
+              code == 1 and "not coverage on its own" in out, out[-400:])
+
+        for placeholder in ("none", "TODO", "n_a", "pending", "covered",
+                            "NOT_APPLICABLE", "_none_"):
+            vague = ("**Depends on:**\n"
+                     f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: {placeholder}\n")
+            code, out = gate_a(root, vague, "--strict-kani")
+            check(f"R3: bare `kani: {placeholder}` is still not coverage",
+                  code == 1 and "trust-chain link without" in out
+                  and "is a placeholder, not a harness name" in out,
+                  out[-300:])
+
+        # A placeholder is refused even beside a locator: a body that
+        # asserts absence names no harness however well it points at
+        # code, so the closed list outranks the locator allowance.
+        located_placeholder = (
+            "**Depends on:**\n"
+            f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: none at src/guard.rs:5\n")
+        code, out = gate_a(root, located_placeholder, "--strict-kani")
+        check("N3: a placeholder plus a locator is not coverage either",
+              code == 1 and "is a placeholder, not a harness name" in out,
+              out[-300:])
+
+        # The name-shape rule must not move the marker: "kani:" inside
+        # another word, or the Rust attribute path `kani::proof`, is
+        # still no annotation even when a harness name follows it.
+        embedded_bare = (
+            "**Depends on:**\n"
+            f"  - L1 at `src/guard.rs:2@sha256:{h}` barkani: merkle\n"
+            f"  - L2 at `src/guard.rs:5@sha256:{h5}` see `#[kani::proof]` on merkle\n"
+        )
+        code, out = gate_a(root, embedded_bare, "--strict-kani")
+        check("R3: `barkani:` and `kani::proof` are still not annotations",
+              code == 1 and "Kani annotations:  0" in out
+              and "ledger contains no `kani:` annotations" in out, out[-400:])
+
+        # ── F11: a Depends on: block closes at a blank line ─────────────
+        # The block used to survive a blank line, so the next bullet list
+        # was read as trust-chain links: an inflated count plus a
+        # fabricated per-link failure on bullets that are not links.
+        trailing_list = ("**Depends on:**\n"
+                         f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+                         "\n"
+                         "- unrelated follow-up bullet\n"
+                         "- another unrelated bullet\n")
+        code, out = gate_a(root, trailing_list, "--strict-kani")
+        check("F11: blank line closes the block; later bullets are not links",
+              code == 0 and "Trust-chain links: 1" in out
+              and "trust-chain link without" not in out, out[-400:])
+
+        section_break = ("Depends on:\n"
+                         f"- L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+                         "## Later section\n"
+                         "- a bullet belonging to the next section\n")
+        code, out = gate_a(root, section_break, "--strict-kani")
+        check("F11: a heading closes the block",
+              code == 0 and "Trust-chain links: 1" in out
+              and "trust-chain link without" not in out, out[-400:])
+
+        loose_block = ("**Depends on:**\n"
+                       f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+                       "\n"
+                       f"  - L2 at `src/guard.rs:5@sha256:{h5}` kani: harness_check\n"
+                       "\n"
+                       "- unrelated follow-up bullet\n")
+        code, out = gate_a(root, loose_block, "--strict-kani")
+        check("F11: a loose list nested under the header keeps both links",
+              code == 0 and "Trust-chain links: 2" in out
+              and "trust-chain link without" not in out, out[-400:])
+
+        # ── R1 (post-review): the blank-line close is a contract choice ──
+        # A post-blank bullet at the header's OWN indentation is not
+        # reopened, and this is the one shape where that costs a true
+        # entry. Reopening it would mean a blank line never closes a
+        # block — the F11 defect above, where every later bullet in the
+        # section counted as a link and hard-failed per-link Kani
+        # coverage. The chosen trade is bounded and visible: the reported
+        # link count falls below the entries actually written, and
+        # indenting them under the header (the fv-compose Step 3
+        # convention) restores every link. Both halves are asserted so
+        # the fail-open boundary cannot be relaxed silently.
+        flat_continuation = (
+            "**Depends on:**\n"
+            f"- L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+            "\n"
+            f"- L2 at `src/guard.rs:5@sha256:{h5}` kani: harness_check\n"
+        )
+        code, out = gate_a(root, flat_continuation, "--strict-kani")
+        check("R1: post-blank bullet at the header's indentation is not a link "
+              "(deliberate: one link, no fabricated failure)",
+              code == 0 and "Trust-chain links: 1" in out
+              and "trust-chain link without" not in out, out[-400:])
+        indented_continuation = (
+            "**Depends on:**\n"
+            f"  - L1 at `src/guard.rs:2@sha256:{h}` kani: harness_check\n"
+            "\n"
+            f"  - L2 at `src/guard.rs:5@sha256:{h5}` kani: harness_check\n"
+        )
+        code, out = gate_a(root, indented_continuation, "--strict-kani")
+        check("R1: indenting the continuation under the header restores the link",
+              code == 0 and "Trust-chain links: 2" in out, out[-400:])
+
         # ── dossier-shaped citation forms (explicit parser) ─────────────
         # A real fv-compose Step 3 dependency entry: bold block header,
         # `at` citations, one fully backticked `code:` annotation, one
@@ -249,8 +469,8 @@ def main() -> int:
     code, out = gate_b(valid, "--require", "B1,W1")
     check("Gate B: valid records for all required claims -> exit 0", code == 0,
           out[-300:])
-    check("Gate B: verdict is scoped VERIFIED[...], never bare",
-          "VERIFIED[profile=bounded]" in out
+    check("Gate B: verdict scope names the profile and the freshness binding",
+          "VERIFIED[profile=bounded; binding=unbound]" in out
           and "VERDICT: VERIFIED\n" not in out)
 
     r27 = json.loads(json.dumps(valid))
@@ -284,10 +504,12 @@ def main() -> int:
     code, out = gate_b(assumed, "--require", "B1,W1")
     check("Gate B: unwaived externally-assumed PASS -> INCOMPLETE",
           code == 3 and "without a waiver" in out)
-    assumed[0]["waiver"] = {"by": "reviewer", "rationale": "upstream gnark verifier accepted"}
+    assumed[0]["waiver"] = {"id": "W-B1-gnark", "approver": "reviewer",
+                            "scope": "upstream gnark verifier accepted as "
+                                     "externally-assumed for claim B1"}
     code, out = gate_b(assumed, "--require", "B1,W1")
     check("Gate B: waived assumption remains visibly qualified",
-          code == 0 and "VERIFIED[profile=bounded] (waived: B1)" in out)
+          code == 0 and "VERIFIED[profile=bounded; binding=unbound] (waived: B1)" in out)
 
     code, out = gate_b(valid, "--require", "")
     check("Gate B: empty required-claims list is an error, not a pass",

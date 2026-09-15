@@ -21,9 +21,13 @@ default, `--apply` writes only under `.fv/`, and `.colosseum/` is only ever read
 Legacy per-claim evidence is imported as history under `.fv/history/colosseum/`
 and never as live `fv-evidence-run/v3` evidence, so every migrated obligation
 stays uncovered until its evidence cohort is re-run and Gate A and Gate B pass.
-Nothing legacy is deleted; keep `.colosseum/` until parity is explicitly
-accepted. Commands and report semantics are in
-[QUICKSTART.md](./QUICKSTART.md#migrating-a-legacy-colosseum-project) and
+An apply is all-or-nothing: bytes are staged, moved into place, and rolled back
+on any failure, and the `fv-migration-report/v1` report enumerates what landed
+under each write's `action`. The dry run names the elected dispatch target in its
+own `target_spec` field, and anything the translation cannot carry honestly
+blocks the run instead of migrating quietly. Nothing legacy is deleted; keep
+`.colosseum/` until parity is explicitly accepted. Commands and report semantics
+are in [QUICKSTART.md](./QUICKSTART.md#migrating-a-legacy-colosseum-project) and
 [scripts/README.md](./scripts/README.md#legacy-migration-reports).
 
 ## Installing

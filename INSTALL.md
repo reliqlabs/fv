@@ -125,19 +125,50 @@ uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project --jso
 uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project --apply
 ```
 
-Exit 0 is `status: ok`, 1 is `status: blocked`, 2 a usage error or an unresolvable
-project root. `--apply` writes only under `.fv/`, refuses a blocked report, and is
-byte-idempotent on re-run. `.colosseum/` is only ever read: the migration never
-deletes legacy state and never copies a legacy evidence record into
-`.fv/evidence/`, so nothing migrated counts as live `fv-evidence-run/v3` evidence.
-Legacy verification layers without a built-in pyramid step, `quint` among them,
-become `fv-verification-plan/v1` custom layers instead of being dropped.
+Exit 0 is `status: ok`; 1 is `status: blocked` or an apply that failed and rolled
+back; 2 a usage error or an unresolvable project root. `--apply` writes only
+under `.fv/`, refuses a blocked report, and is byte-idempotent on re-run.
+`.colosseum/` is only ever read: the migration never deletes legacy state and
+never copies a legacy evidence record into `.fv/evidence/`, so nothing migrated
+counts as live `fv-evidence-run/v3` evidence. Legacy verification layers without
+a built-in pyramid step, `quint` among them, become `fv-verification-plan/v1`
+custom layers instead of being dropped.
+
+The report (`fv-migration-report/v1`) carries `schema`, `project_root` (always
+`"."`), `target_spec` (the elected dispatch target), `requested_mode`, `mode`,
+`applied`, `status`, `error`, `counts`, `artifacts[]`, `writes[]`, `conflicts[]`,
+and `unsupported[]`. A blocked `--apply` reports `requested_mode: apply`,
+`mode: dry-run`, `applied: false`. Each entry of `writes[]` carries an `action`:
+`create`, `identical`, `adopt`, `conflict` before an apply, and `written`,
+`rolled-back`, `failed`, `lost`, or `pending` after one. `lost` means rollback
+could not restore an original destination; the retained staging directory holds
+the recoverable original.
+
+`--apply` stages bytes under `.fv/.migrate-staging/<run>/` and moves them with
+`os.replace`. A failure rolls back every completed move and still prints the
+report, which is the only enumeration of what landed. The staging prefix is
+structurally excluded from verified-input snapshots, including after a hard kill.
+.fv/dispatch.json is the one destination adopted rather than refused:
+an existing route keeps every unrelated field and has only `project_root` and
+`target_spec` rewritten, so a project `fv_init` already initialized is migratable
+without moving the file aside.
+
+The dispatch target comes from the legacy pointer stub first and from the
+ledger's citations only when the stub cites nothing. Blocking conditions beyond
+destination conflicts: an ambiguous dispatch target (two or more distinct cited
+canonical intents) or none at all, a directory under `.colosseum/` that cannot be
+listed, a claim whose `required_evidence` names a tool no migrated execution
+declares, a recorded command no argv represents (a shell operator, a leading
+`NAME=VALUE` assignment, or a shell builtin such as `cd`), and a destination path
+that crosses a symlink at any component, including `.fv` itself, or whose nearest
+existing parent directory is not writable.
 
 Run `fv_init.py` after `--apply` for the OMP-side settings. Without
 `--target-spec` it preserves the migrated `target_spec` and only appends missing
 exclusion defaults to `.fv/verified-inputs.txt`. Do not pass `--force` after a
 migration: it replaces FV-owned project state, including the migrated dispatch
-target and the `.fv/history/` exclusion prefix.
+target. The `.fv/history/` exclusion prefix is structural, so `--force` cannot
+drop it.
 
 Keep `.colosseum/` until parity is explicitly accepted: the required evidence
 cohorts re-run through `fv_evidence_run` and Gate A plus Gate B passing without

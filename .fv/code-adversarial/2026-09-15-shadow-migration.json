@@ -1,0 +1,236 @@
+{
+  "scope": {
+    "authority": ".fv/changes/2026-09-15-colosseum-shadow-migration.md (user-authorized migration requirements, restated as a committed artifact)",
+    "reviewed": [
+      "scripts/fv_migrate.py (all 1161 lines)",
+      "scripts/pyramid_run.py plan path (112-160, 329-516, 532-738)",
+      "scripts/check_ledger_references.py (72-256, 259-426)",
+      "scripts/fv_init.py (40-168, 354-438)",
+      "scripts/fv_project.py (28-201)",
+      "scripts/check_evidence_records.py (399-490)",
+      "INSTALL.md migration section, QUICKSTART.md migration section, scripts/README.md, CONCEPTS.md:74-77",
+      "tests/r35_colosseum_migration.py, tests/r36_dossier_rehearsal.py (coverage mapping only)"
+    ],
+    "method": "Static clause-to-line audit plus grounded reproduction. Repository was never modified: no edits, no commits, no project test/lint/proof runs. Reproductions ran scripts/fv_migrate.py and imported pyramid_run.run_cmd against throwaway fixtures under a /tmp scratch tree, since deleted. Every trace below was observed, not inferred, unless marked [INFERENCE]."
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "high",
+      "lens": "who-controls; field-name fidelity",
+      "title": "Dispatch target is elected by mention frequency in legacy prose; the pointer stub that names the canonical intent is never read",
+      "location": "scripts/fv_migrate.py:429-459 (_ledger_intent), :471-497 (_migrate_intent)",
+      "violated_clause": "Authority §7: \".colosseum/intent.md (or a declared external canonical intent, e.g. a docs/intent.md the ledger references, reached through a legacy pointer stub) -> the dispatch target\". The stub is named as the route to the external intent; the code never opens it.",
+      "trace": "Fixture: .colosseum/intent.md = \"See docs/intent.md\"; .colosseum/ledger.md mentions docs/old-intent.md three times (in a \"Superseded:\" paragraph) and docs/intent.md once; both files exist. Observed dry run: exit 0, status ok, and the single intent row reads \".colosseum/intent.md | mapped | .fv/dispatch.json | ledger cites docs/old-intent.md, which exists: dispatch targets it instead of this entrypoint\". The migration selects the superseded document. _migrate_dispatch then writes target_spec: docs/old-intent.md, so every future fv-evidence-run/v3 record binds intent_path and the intent hash to the wrong file, and Gate B's containment check passes because the file is inside the root.",
+      "mechanism": "_ledger_intent regex-scans the ledger for [\\w./-]*intent\\.md, counts candidates, and returns min(counts, key=(-count, spec)) (line 459). Mention count in untrusted legacy prose is the entire decision procedure. .colosseum/intent.md's bytes are read only to be copied (line 487), never parsed for the pointer the authority names.",
+      "minimal_correction": "Parse the stub first: read .colosseum/intent.md and accept a candidate only when the stub itself cites it. Fall back to the ledger only when the stub names nothing, and make two or more distinct surviving ledger candidates an unsupported row (`.colosseum/ledger.md#intent`) that blocks, instead of a frequency vote. Frequency must never pick between trust roots.",
+      "test_gap": "tests/r36_dossier_rehearsal.py exercises the single-candidate stub case only; no fixture presents competing *intent.md mentions."
+    },
+    {
+      "id": "F2",
+      "severity": "high",
+      "lens": "commitment coverage; deferred-cannot-silently-succeed",
+      "title": ".colosseum/ byte-identity and the \"--apply writes only under .fv/\" invariant are both breakable through a symlinked .fv ancestor, with status ok",
+      "location": "scripts/fv_migrate.py:372-381 (_plan_write), :993-1014 (_preflight), :1050-1062 (apply)",
+      "violated_clause": "Authority bullet: \"--apply writes only under .fv/; .colosseum/ is read-only and stays byte-identical\". Authority §7: \".colosseum/ is only ever read and stays byte-identical.\"",
+      "trace": "Case A: project with .fv a symlink to a sibling directory outside the project. `--apply` -> exit 0, status ok, conflicts []. Files landed outside the project root entirely: dispatch.json, intent.md, obligations.json, verified-inputs.txt, history/colosseum/*. Case B: project with .fv a real directory and .fv/history a symlink to .colosseum/imported (target exists). `--apply` -> exit 0, status ok, conflicts []; SHA-256 tree digest of .colosseum changed; .colosseum/imported/colosseum/g1-claims.json and .colosseum/imported/colosseum/obligations.json now exist inside the legacy tree.",
+      "mechanism": "_plan_write validates only the literal string prefix `.fv/` (line 374). _preflight tests is_symlink() on the final destination (line 996) and, for a non-existent destination, walks parents rejecting only components that exist and are `not is_dir()` (line 1008) - a symlink to a directory answers is_dir() True, so every symlinked ancestor passes. apply() then does mkdir(parents=True, exist_ok=True) + write_bytes (lines 1059-1060), both of which follow symlinks. The migrator rejects symlinks everywhere else it touches them (:386 legacy root, :392 legacy entries, :503 dispatch, fv_project.resolve_target:127), so the omission is asymmetric rather than a considered exception.",
+      "minimal_correction": "In _preflight, for every planned path walk each component from the project root down and append a conflict for any component where `is_symlink()`; this covers .fv itself. In apply(), after mkdir, assert `destination.parent.resolve()` is contained in `(project/'.fv').resolve()` before writing, and open the final component with O_NOFOLLOW/O_EXCL semantics. Both are cheap and make the invariant structural rather than conventional.",
+      "test_gap": "r35 covers symlinks inside .colosseum (:988-989) and a symlink at the exact destination path (:1176); r36 copies fixtures with symlinks:True. No fixture places a symlink at an intermediate .fv component, which is why the existing before/after .colosseum digest assertions (r35:285-286, r36:866-868) never fire on this."
+    },
+    {
+      "id": "F3",
+      "severity": "medium-high",
+      "lens": "field-name fidelity; deferral-justification audit",
+      "title": "Legacy claim fields are silently dropped with no deviation row, contradicting both the retention promise and the lossy-translation contract",
+      "location": "scripts/fv_migrate.py:702-712 (retention), :567-580 (_legacy_claim_index), contract text at :29-33 and :61-62",
+      "violated_clause": "Authority §7: \"with scope, waiver, evidence_class, profile, and environment_policy retained rather than summarized\". Module contract :29-33: \"Sub-artifact rows (<file>#claims.<id>) are emitted only for an item inside a mapped file that deviates from its file's mapping, so a lossy translation names what it dropped instead of implying the file came across whole.\"",
+      "trace": "Fixture claim C-01 with required_targets [\"quint:invS7\"], layers [\"quint\"], scope: \"admission keeps root canonical\" (string), waiver: \"WAIVED pending Lean proof\" (string), status: \"waived\", notes: \"see attacks/2026-08-24\", evidence_class: 123, required_targets_optional: [\"kani:h1\"]. Observed `--apply`: exit 0, status ok, unsupported [], deviation rows []. The written system_claims entry is exactly {id, required, depends_on, required_evidence}: scope, waiver, status, notes, evidence_class and required_targets_optional are all gone, and the mapped detail still reads \"1 legacy claim(s) converted to system_claims\".",
+      "mechanism": "Retention is type-gated by isinstance with no else branch (scope :703/:709, evidence_class :705, waiver :711), and neither _legacy_claim_index nor _migrate_obligations ever compares the claim's key set against the keys it consumes. Compare pyramid_run.parse_plan, which rejects unknown keys at three levels (:457, :420, :487). A dropped waiver is the trust-relevant case: the legacy record of what was excluded from the claim disappears from the only artifact a later auditor reads.",
+      "minimal_correction": "In the per-claim loop, compute `unknown = set(claim) - CONSUMED_KEYS` and emit a `#claims.<id>` row (preserved-history classification with the dropped key names in the detail) whenever it is nonempty; emit the same row when scope/waiver/evidence_class are present but of an unretainable type. Keep it non-blocking for unknown keys, since the bytes survive in history, but never silent. Document-level `profile`/`environment_policy` of a non-string type (:745-748) need the same treatment.",
+      "test_gap": "Both fixtures use dict scope and dict waiver only (r35:153-157), so every retention assertion passes on the happy path and the drop path is untested."
+    },
+    {
+      "id": "F4",
+      "severity": "medium-high",
+      "lens": "clause-to-line; deferred-cannot-silently-succeed",
+      "title": "split_command accepts two shell constructs no argv represents: environment-assignment prefixes and cd segments",
+      "location": "scripts/fv_migrate.py:166-169 (SHELL_CHARACTERS), :303-331 (split_command), :899-918 (execution emission)",
+      "violated_clause": "Authority §7: \"a legacy layer command that no argv represents (any shell operator or expansion character - wrapping it back into sh -c would launder the shell the plan schema exists to exclude) ... is unsupported and blocks the migration\". Module contract :78-83 repeats it.",
+      "trace": "Fixture layer-runs with quint command \"PROPTEST_CASES=4096 quint verify spec.qnt\" and verus command \"cd crates/core; cargo verus verify\" (crates/core exists). Observed `--apply`: exit 0, status ok, unsupported [], no deviation row. Written plan: quint execution argv [\"PROPTEST_CASES=4096\",\"quint\",\"verify\",\"spec.qnt\"] - argv[0] is an environment assignment, and the plan schema's own `env` field (pyramid_run.py:397-413), which exists precisely to carry this, is left empty. verus becomes two executions, argv [\"cd\",\"crates/core\"] with evidence_tool \"verus:1\" and argv [\"cargo\",\"verus\",\"verify\"] with evidence_tool \"verus\", both cwd \".\" - the recorded command's working directory is silently discarded and cargo verus verify now runs at the project root rather than in crates/core. /usr/bin/cd exists on this platform (verified), so the discarded cd step executes, exits 0, and contributes a PASS execution under the evidence_tool id \"verus:1\".",
+      "mechanism": "Neither construct contains a character in SHELL_CHARACTERS, and shlex.split tokenizes both cleanly, so split_command returns argv lists. The migrator equates \"tokenizes into words\" with \"is representable as argv\", but a NAME=VALUE prefix and a cwd-mutating builtin are shell state changes, not argv. Splitting on \";\" and giving every segment the same cwd (:960) is only semantics-preserving for segments with no effect on shell state.",
+      "minimal_correction": "In split_command, refuse a first token matching ^[A-Za-z_][A-Za-z0-9_]*= (or lift it into the execution's env, which is exact and lossless), and refuse any segment whose argv[0] is a shell builtin whose effect does not survive process exit - cd, export, set, umask, shift, source, ., eval, exec, cd's aliases. Both become the existing unsupported-and-block path, which is what the authority requires for a command no argv represents.",
+      "test_gap": "r35's untranslatable-command mutations all inject characters from SHELL_CHARACTERS; no fixture uses an assignment prefix or a cd segment."
+    },
+    {
+      "id": "F5",
+      "severity": "medium",
+      "lens": "commitment coverage",
+      "title": "No completeness check from required_evidence back to the plan: a required tool with no recorded run migrates to status ok with no row",
+      "location": "scripts/fv_migrate.py:838-936 (_migrate_plan), :654-660 (layers accepted verbatim into required_evidence)",
+      "violated_clause": "Authority §7: \"every legacy layer keys the plan under its own id when it has no pyramid equivalent, so a layer named in any system_claim.required_evidence - quint in particular - migrates as a custom layer instead of being dropped or downgraded\". Authority bullet: \"no verification layer the legacy tree recorded is silently omitted from the migrated plan\".",
+      "trace": "Fixture: g1-claims C-01 with layers [\"quint\",\"verus\"]; layer-runs records only the verus run. Observed `--apply`: exit 0, status ok, unsupported [], deviation rows []. Written .fv/obligations.json system_claims[0].required_evidence == [\"quint\",\"verus\"]; written plan layers == [\"verus\"]. The migrated project declares a claim that needs quint evidence and a plan that can never produce it. The same shape occurs when the two legacy manifests disagree on spelling: a claim naming \"proptests\" with a recorded layer \"proptest\" yields plan key \"proptests\" but evidence_tool \"proptest\" (LEGACY_PLAN_LAYERS is applied to the plan key at :874 and deliberately not to evidence_tool at :909), so the required_evidence entry matches no execution.",
+      "mechanism": "The no-omission rule is enforced in one direction only (recorded layer -> plan, :884-895). The claim -> plan direction has no check at all. Downstream this surfaces as coverage_dashboard coverage-gap rather than a false PASS, so trust is not forged - but the migration reports ok and nothing names the gap, which is the reporting contract the module claims at :29-33.",
+      "minimal_correction": "After _migrate_plan builds document_layers, compute the set of emitted evidence_tool ids and, for every required_evidence entry of every migrated system_claim that is absent from it, emit a `.colosseum/g1-claims.json#claims.<id>` unsupported row naming the tool. It belongs in unsupported rather than a warning: a manifest whose required evidence no migrated plan can produce is exactly \"unrun verification presented as complete\" one artifact upstream. Ordering requires _migrate_plan to run before the row is emitted, or a third pass after both.",
+      "test_gap": "Neither r35 nor r36 constructs a required_evidence tool absent from layer-runs; r36 asserts only the positive direction (\"quint survives as a custom plan layer\")."
+    },
+    {
+      "id": "F6",
+      "severity": "medium",
+      "lens": "deferred-cannot-silently-succeed; who-controls",
+      "title": "_required_layers is computed before the nothing-converted return, defeating the documented \"no claim manifest => every layer required\" fallback; the result is a migrated plan whose custom layers never gate",
+      "location": "scripts/fv_migrate.py:717 (assignment), :733-741 (early return), :919-921 (required computation); composes with pyramid_run.py:576-581 and :334-339",
+      "violated_clause": "QUICKSTART.md: \"A layer named by any legacy claim that obligations.json marked required is written required: true, which puts it in the G2 gating set; when no legacy claim manifest exists, every migrated layer is required.\" Authority §5: \"A required: true custom layer joins the G2 required_layers set.\"",
+      "trace": "Case A - legacy tree with g1-claims.json but no obligations.json: observed `--apply` exit 0 status ok; written plan has quint {required: false} and verus {required: false}; system_claims[0].required == false. Case B - g1-claims.json and obligations.json both present with \"claims\": []: observed exit 0 status ok; no .fv/obligations.json is written at all, yet the plan's quint layer is required: false rather than the documented \"every migrated layer is required\", because line 717 sets _required_layers to an empty set before the line-741 return. Consequence, composed with pyramid_run: `required` in aggregate_verdict is profile-required layers union plan layers with required: true (pyramid_run.py:579-581), and only those gate (:334-339). Known layers are protected by the profile, but a migrated custom layer - quint, mutation, sanitizers - can run and FAIL while the runner prints VERIFIED[bounded] and exits 0. The r28 assertion \"plan run: required:false layer runs but does not gate\" confirms that semantics.",
+      "mechanism": "Two defects compose: (a) an empty _required_layers is indistinguishable from \"no claim manifest\" only because the sentinel is set too early, and (b) required is derived solely from the legacy `required` flag, while Gate B's load_manifest (check_evidence_records.py:463-471) treats every declared obligation as required regardless of that flag. The two sides of the migrated project therefore disagree about what gates.",
+      "minimal_correction": "Move line 717 below the line-741 return so the None sentinel survives a manifest that converted nothing. Then make the plan's required flag conservative in the same direction Gate B already is: a legacy layer named by any migrated claim (not only a `required` one) gets required: true, since Gate B will demand its evidence regardless. A layer named by no claim keeps the current behavior, and the mapped detail should name every layer written required: false so the operator sees which recorded verifications do not gate.",
+      "test_gap": "r35:791-794 asserts the required: false case is intended for a layer no required claim names, but no fixture omits obligations.json or uses an empty claims array."
+    },
+    {
+      "id": "F7",
+      "severity": "medium",
+      "lens": "deferred-cannot-silently-succeed",
+      "title": "A plan execution naming an absent executable aborts pyramid_run with a traceback and writes no report",
+      "location": "scripts/pyramid_run.py:342-357 (run_cmd), :519-529 (run_plan_execution), :591-614 (plan_layer), :712-728 (report write)",
+      "violated_clause": "Authority §5: \"every custom execution goes through the same argv/cwd/timeout/env validation and produces the same report shape ... a types failure marks every required or declared layer - custom included - not_run.\" A layer that produces no report row at all is outside that contract.",
+      "trace": "Verified directly: pyramid_run.run_cmd([\"definitely-not-a-binary-xyz\"], REPO, timeout=5) raises FileNotFoundError [Errno 2]. run_cmd catches only subprocess.TimeoutExpired (:355), plan_layer does not guard, and main() has no handler, so the exception escapes main and the report write at :725-728 never executes. A migrated plan whose custom quint layer names an uninstalled quint binary - the expected state of any freshly migrated project, and exactly the rehearsal QUICKSTART tells the operator to run - terminates the pyramid with a stack trace and produces no .fv/verify/ artifact for any layer, including the ones that already passed. Finding F4 reaches the same crash by a second route: argv[0] == \"PROPTEST_CASES=4096\".",
+      "mechanism": "Built-in layers are guarded by shutil.which before execution (cargo :567, cargo-fuzz :642, cargo-kani :676, verus :692). Plan-declared executions have no equivalent guard and no exception boundary, so the asymmetry is exactly at the surface the plan schema newly opened.",
+      "minimal_correction": "Catch OSError alongside subprocess.TimeoutExpired in run_cmd and return the same dict shape with returncode -1 plus an \"error\" field, so the layer records `failed` with a readable detail and the report still lands. Optionally pre-check shutil.which(argv[0]) per execution during parse_plan and record `skipped: <tool> not installed` for a required: false layer, mirroring the built-in behavior; a required layer must stay failed, not skipped.",
+      "test_gap": "r14 and r28 plan fixtures always use `true`, `false`, or a python probe that exists; no test declares a missing executable."
+    },
+    {
+      "id": "F8",
+      "severity": "medium",
+      "lens": "commitment coverage",
+      "title": "A legacy tree with no intent and no ledger migrates to status ok with no dispatch target, leaving an unusable project and no row saying so",
+      "location": "scripts/fv_migrate.py:471-497 (returns None), :499-501 (_migrate_dispatch returns immediately), :1030-1039 (build)",
+      "violated_clause": "Authority §7 mapping: \".colosseum/intent.md (or a declared external canonical intent ...) -> the dispatch target\". Module contract :27-29: \"Every source artifact is reported as exactly one of mapped, preserved-history, or unsupported; a run that cannot classify an artifact is a blocked run, never a partial write.\"",
+      "trace": "Fixture: .colosseum containing only g1-claims.json, obligations.json and evidence/runs/layer-runs.json. Observed `--apply`: exit 0, status ok; writes .fv/obligations.json, .fv/verification-plan.json, .fv/verified-inputs.txt and the history copies; no .fv/dispatch.json. Verified consequence: fv_project.resolve_target(project) raises ProjectError \"target_spec does not exist: .fv/intent.md\", so Gate B, the evidence producer and every skill fail on the migrated project. The report contains no unsupported row, no conflict, and no artifact row mentioning the absent target.",
+      "mechanism": "The target declaration is the only mapping with a silent no-op branch. Related reporting gap: even on the success path the chosen target_spec appears only inside a free-text detail string (:481-483) and, when .colosseum/intent.md is absent, in no row at all - the machine-readable report carries only the sha256 of the dispatch bytes, so a dry-run consumer cannot see which document the migration elected (F1 is what makes that consequential).",
+      "minimal_correction": "When _migrate_intent returns None, emit an unsupported row (`.colosseum#intent`) stating that no dispatch target could be established, which blocks with zero writes. Separately, add the resolved target_spec as a first-class field of the fv-migration-report/v1 object so the decision is machine-checkable in dry run.",
+      "test_gap": "No fixture omits both .colosseum/intent.md and a ledger-cited intent."
+    },
+    {
+      "id": "F9",
+      "severity": "medium",
+      "lens": "deferred-cannot-silently-succeed; upgrade/migration completeness",
+      "title": "apply() is not atomic and suppresses the report on OSError: partial .fv state with no enumeration of what landed",
+      "location": "scripts/fv_migrate.py:1050-1062 (apply), :1141-1152 (main), :993-1028 (_preflight)",
+      "violated_clause": "Authority §7: \"Any unsupported entry or destination conflict blocks the run before any write.\" The guarantee is stated for blocked runs only; a preflight-clean apply has no stated atomicity, and the CLI's failure mode hides the partial result.",
+      "trace": "Fixture with .fv/history pre-created mode 0o500 (no symlinks involved). Observed `--apply`: exit 1, stderr \"ERROR: [Errno 13] Permission denied: .../.fv/history/colosseum\", stdout empty - no report at all. Filesystem afterwards: .fv/dispatch.json written, everything else absent. A second reachable trace: .fv/history a dangling symlink makes mkdir(parents=True, exist_ok=True) raise FileExistsError [Errno 17] after dispatch.json has landed. In both cases main returns 1 at :1147 before the report is built at :1148, so the operator's only signal is one errno and they cannot tell which destinations were written.",
+      "mechanism": "_preflight validates content conflicts, symlinks and non-directory parents but never writability, and apply() writes destinations one at a time in sorted order with no staging and no rollback.",
+      "minimal_correction": "Build and print the report before returning on an apply error, with each write's action reflecting what actually happened (written / pending / failed), so the partial state is enumerated. Add a writability probe to _preflight (os.access on the nearest existing ancestor) so the common permission case blocks with zero writes like every other conflict. Full atomicity is not required and would be over-engineering; an honest report of the partial set is.",
+      "test_gap": "r35's blocked-apply assertions (\"a blocked apply writes no other destination\", :1161-1163) all take the preflight-blocked path; no test makes a preflight-clean apply fail mid-loop."
+    },
+    {
+      "id": "F10",
+      "severity": "medium",
+      "lens": "clause-to-line (Gate A)",
+      "title": "Per-link Kani coverage is satisfied by any occurrence of the substring \"kani:\" and by any body that does not start with \"skipped\"",
+      "location": "scripts/check_ledger_references.py:371-392, compare :251-256 and :88",
+      "violated_clause": "Authority §3 / :379-381: \"every entry line of a Depends on: block is a trust-chain link and must carry kani: (harness or explicit skip)\". \"kani: n/a\" is neither a harness nor an explicit skip.",
+      "trace": "The per-link test is the substring check `\"kani:\" not in text` (:387), so a link line carrying `kani: n/a`, `kani: none`, `kani: TODO`, `kani: -`, or the word \"kani:\" anywhere in prose passes even under --strict-kani. The justification requirement applies only to bodies literally starting with \"skipped\" (:375). KANI_RE (:109) also has no word-boundary guard, unlike CODE_MARK_RE (:88), so \"barkani: x\" increments n_kani and satisfies both the per-link check and the n_kani == 0 no-vacuous-pass check (:401-403). By contrast `axiom:` annotations are held to meaningful_justification (:364).",
+      "impact_on_migration": "A migrated .fv/ledger.md is legacy prose written before this rule existed. The authority notes Gate A's depends-block detection now fires on emphasized `**Depends on:**` blocks it previously skipped, which is exactly when a legacy ledger's placeholder kani: annotations start being read as coverage.",
+      "minimal_correction": "Parse the kani: body against the same standard as axiom:: accept a harness reference (an identifier or path:line citation) or `skipped because <reason>` with meaningful_justification; anything else is a failure naming the body. Add the negative lookbehind from CODE_MARK_RE to KANI_RE, and make the per-link test use that parse rather than a substring search."
+    },
+    {
+      "id": "F11",
+      "severity": "low-medium",
+      "lens": "clause-to-line (Gate A)",
+      "title": "A Depends on: block is never closed by a blank line, so later bullet lists are counted as trust-chain links",
+      "location": "scripts/check_ledger_references.py:382-392",
+      "violated_clause": "Authority §3: \"Depends on: block detection accepts the emphasized and heading forms ... so per-link Kani coverage actually runs on a real dossier-shaped ledger\". Over-extension past the block inflates n_links and fabricates link failures.",
+      "trace": "in_depends_block is cleared only by a nonblank line that is not a bullet (:391-392). A blank line leaves it set. Ledger shape \"**Depends on:**\" / \"- a  kani: h1\" / \"\" / \"- unrelated bullet\" therefore counts the unrelated bullet as a trust-chain link and emits \"trust-chain link without kani: harness reference or explicit skip\" - a warning by default, a hard failure under --strict-kani. Loose markdown lists (blank lines between items) and two adjacent lists with no intervening prose both hit it.",
+      "direction": "Fails closed (false FAIL, not false PASS), so trust is not forged; it is a correctness and noise defect that lands on exactly the legacy ledgers this migration imports.",
+      "minimal_correction": "Close the block on the second consecutive blank line, or on any blank line followed by a non-bullet, or - simplest and most predictable - track the header's list indentation and close when a bullet line dedents below it."
+    },
+    {
+      "id": "F12",
+      "severity": "low-medium",
+      "lens": "deferral-justification audit; idempotency",
+      "title": "An existing non-canonical .fv/dispatch.json always blocks; the documented \"keeps its route and has only those two fields rewritten\" path is unreachable",
+      "location": "scripts/fv_migrate.py:510-523 vs :1015-1028; QUICKSTART.md \"An existing dispatch.json keeps its route and has only those two fields rewritten\"",
+      "violated_clause": "Internal contradiction between the documented behavior and Authority §7's \"an existing destination with different content fails\". Both cannot hold for the same file.",
+      "trace": "Fixture with a pre-existing .fv/dispatch.json identical to the shipped example except target_spec: \"docs/other.md\". Observed dry run: exit 1, status blocked, conflicts [\".fv/dispatch.json: exists with different content (have sha256:0b8b75e8..., would write sha256:ee7db765...)\"]. The rewrite branch at :520-522 produces bytes that differ from the file on disk by construction, and _preflight then classifies that as a conflict. The only reachable existing-dispatch outcomes are `identical` (the already-canonical short-circuit at :514-519) and `blocked`.",
+      "impact": "Any project that already carries a dispatch.json whose target_spec differs - including every project previously initialized with fv_init - cannot be migrated without manually moving the file aside, and the conflict message says nothing about dispatch adoption. Cross-version idempotency has the same shape: the migrated dispatch.json is built from the fv checkout's scripts/dispatch.config.example.json (:524), which embeds a panel roster and `profile: canonical-4@sha256:...`, so an fv upgrade that touches the example turns a re-run on an already-migrated project into a permanent block.",
+      "minimal_correction": "Pick one contract. Either delete the dead rewrite branch and make the conflict message name the remedy (\"align omp_native.project_root/target_spec or move the file aside\"), or exempt .fv/dispatch.json from the byte-equality conflict rule and let the two-field rewrite apply, reporting it as a distinct `mapped` action such as `adopt` with the before/after target_spec in the detail. The second is closer to the documented intent and still touches only two fields."
+    },
+    {
+      "id": "F13",
+      "severity": "low-medium",
+      "lens": "commitment coverage; downgrade safety",
+      "title": "The .fv/history/ quarantine exclusion is not a frozen default, so the \"history cannot perturb the snapshot\" guarantee rests on a file fv_init --force overwrites",
+      "location": "scripts/fv_project.py:31 (DEFAULT_EXCLUSIONS), :172-190 (load_exclusions); scripts/fv_migrate.py:120, :531-534; scripts/fv_init.py:82-89",
+      "violated_clause": "Authority §8: \".fv/history/ is added to the verified-input exclusion list, so quarantined history cannot perturb the content snapshot that fresh evidence binds to.\"",
+      "trace": "DEFAULT_EXCLUSIONS is (.fv/evidence/, .fv/verify/, .fv/panels/, .colosseum/) - no .fv/history/. load_exclusions unions the frozen defaults with whatever the project file declares, so .fv/history/ exists only as a line the migrator wrote into .fv/verified-inputs.txt (:532). fv_init.install_verified_inputs with --force rewrites the file from the defaults alone (:84-89), dropping it; the quarantined tree, which git enumerates as untracked-but-not-ignored, then enters content_snapshot and every subsequent history change invalidates existing evidence bindings. Without --force the append-missing path (:96-105) preserves it correctly.",
+      "mitigation_present": "INSTALL.md and QUICKSTART.md both warn \"Do not pass --force after a migration: it replaces FV-owned project state, including the migrated dispatch target and the .fv/history/ exclusion prefix.\" The guarantee is therefore documented rather than enforced.",
+      "minimal_correction": "Add \".fv/history/\" to fv_project.DEFAULT_EXCLUSIONS. It is the same class of always-applied prefix as .fv/evidence/ and .colosseum/ - bytes that record past runs and are never an input any layer reads - and the union in load_exclusions makes the migrator's explicit line harmless and self-documenting afterwards. This also makes the hazard unreachable through fv_init --force."
+    },
+    {
+      "id": "F14",
+      "severity": "low",
+      "lens": "field-name fidelity",
+      "title": "Two independent recorded runs of one layer are merged into a single cohort and one is relabeled as a sub-step",
+      "location": "scripts/fv_migrate.py:882, :899-918",
+      "violated_clause": "Module contract :29-33 (a lossy translation must name what it changed). No authority clause covers duplicate layer entries.",
+      "trace": "Fixture layer-runs with two separate runs both of layer \"quint\" (commands \"quint verify a.qnt\" and \"quint verify b.qnt\"). Observed: one plan layer quint with executions tagged evidence_tool \"quint:1\" (a.qnt) and \"quint\" (b.qnt), status ok, no deviation row. The `<layer>:<index>` scheme and its rationale at :904-909 - \"a; b; c reports c's exit status, so the layer's recorded result came from its last segment\" - are specific to one command string's segments and do not hold for two independently recorded runs, where there is no last-segment semantics to inherit.",
+      "minimal_correction": "Either emit a `#layers.<name>` deviation row when a layer id appears in more than one run (the honest minimum), or key the index across runs so ids read `quint:run1.1`. The current labeling silently asserts a relationship between two recorded verifications that the legacy manifest does not state."
+    },
+    {
+      "id": "F15",
+      "severity": "low",
+      "lens": "commitment coverage; field-name fidelity",
+      "title": "Residual reporting and preservation gaps",
+      "location": "multiple",
+      "items": [
+        {
+          "claim": "A blocked `--apply` reports mode: \"dry-run\" (fv_migrate.py:1141, :1148) and, under --json, writes nothing to stderr. Verified: exit 1, mode \"dry-run\", status \"blocked\", stderr empty. An automation consumer cannot tell from the report whether --apply was requested.",
+          "fix": "Report the requested mode and a separate `applied` boolean."
+        },
+        {
+          "claim": "fv-migration-report/v1 embeds an absolute machine path in project_root (:1070, `self.project.as_posix()`), which sits awkwardly beside Authority §6's \"no absolute path enters a persisted trust artifact\". The report is printed, not persisted by the tool, but QUICKSTART has the operator capture it.",
+          "fix": "Emit the project root as \".\" or omit it, and keep the absolute path in the human text render only."
+        },
+        {
+          "claim": "History preservation copies bytes with write_bytes (:1060), so file modes are not preserved: a legacy executable helper under .colosseum/scripts/ arrives non-executable. Empty legacy directories are not represented under .fv/history/colosseum at all (walk only records files, :400-401).",
+          "fix": "State the limit in the module contract, which currently says \"byte-for-byte\", or copy modes with shutil.copystat semantics."
+        },
+        {
+          "claim": "The written .fv/verification-plan.json carries no provenance: layer-runs.json's document-level `generated` and `source_snapshot` (present in the r35 fixture at :193-194) and each run's recorded `exit_status` are dropped, and obligations.json's `migration` block has no counterpart in the plan. pyramid_run.parse_plan rejects unknown top-level keys (:457-460), so provenance cannot live in the plan file.",
+          "fix": "Carry the legacy source path and source_snapshot in the plan artifact's mapped detail, which already names the layer translations."
+        },
+        {
+          "claim": "evidence_claim_id's docstring cites `quint:inv/S7` vs `quint:inv-S7` as the collision example (:273-276), but `/` fails OBLIGATION_ID in _id_strings (:646) before normalization runs, so that pair blocks with a different message. Verified: \"required_targets is not a nonempty array of obligation ids\". Reachable collisions do exist (`verus:contract::state` vs `verus:contract-state`, `quint:.a` vs `quint:a`).",
+          "fix": "Use a reachable pair in the docstring."
+        },
+        {
+          "claim": "_legacy_claim_index accepts a document with no `schema` and no `version` key as the expected legacy schema (:555-562, both guarded by `is not None`), so an unrelated JSON file with a `claims` array migrates as a legacy manifest.",
+          "fix": "Deliberate leniency if intended; if so, say so at :555, since the module contract lists \"an unknown or malformed legacy schema\" as unsupported."
+        },
+        {
+          "claim": "An unreadable directory inside .colosseum raises OSError out of _scan's iterdir (:390), which main does not catch (:1135-1139 handles MigrationError only), producing a traceback rather than an unsupported row. Exit is still nonzero.",
+          "fix": "Wrap iterdir and emit an unsupported row for the directory."
+        },
+        {
+          "claim": "The migrated .fv/ledger.md is never checked to still resolve under the new root. Legacy citations relative to .colosseum/ become dangling. Gate A fails loudly (exit 1), so no false trust results, but `mapped` for the ledger means byte-preservation only.",
+          "fix": "Note it in the mapped detail, or run the parse-only half of Gate A's citation resolution during the dry run and report unresolvable citations as a `#citations` deviation row."
+        }
+      ]
+    }
+  ],
+  "verified_correct": [
+    "Id normalization and collision refusal behave exactly as the second corrective requirement specifies. Verified: `verus:contract::state` + `verus:contract-state` in one claim blocks with `.colosseum/g1-claims.json#ids.verus.contract-state: legacy ids [...] all normalize to the obligation id 'verus.contract-state'`, exit 1, zero writes; `quint:::` blocks with the empty-normalization row. Migrated ids match EVIDENCE_CLAIM_ID, legacy_id carries the exact legacy string, and check_evidence_records.load_manifest accepts the written manifest.",
+    "Old-evidence quarantine holds: nothing under .colosseum/evidence/ is ever routed to .fv/evidence/. The only .fv/evidence path in fv_migrate.py is in comments and detail strings.",
+    "Dry run is the default and writes nothing; `--apply` refuses a blocked migration (apply() raises on self.blocked, and main gates on not migration.blocked); exit codes are 0 ok / 1 blocked / 2 unresolvable project root, as documented.",
+    "Byte-idempotency on the happy path: a second `--apply` reports every destination `identical` and writes nothing, including .fv/dispatch.json via the already-canonical short-circuit that deliberately avoids a reformat-only rewrite.",
+    "Untranslatable-layer blocking is genuinely all-or-nothing for the characters it does detect: one bad layer produces no .fv/verification-plan.json write at all, not a partial plan.",
+    "The custom-layer correction is real end to end: a legacy `quint` layer keys the plan under `quint`, passes pyramid_run.parse_plan as a custom layer, runs after every known layer in lexical order, and reaches `not_run` on a types failure.",
+    "Verified-inputs inversion is handled as the authority requires: the legacy include list is preserved as history and FV's exclusion defaults are written fresh, with the rationale in the file header."
+  ],
+  "priority_order": [
+    "F2 and F1 are the two findings that break an authority invariant rather than a reporting contract, and both report status ok while doing so.",
+    "F4 and F6 are the two that let a migrated project present verification as complete when it is not: F4 rewrites a recorded command into a different one, F6 leaves migrated custom layers outside the gating set.",
+    "F3, F5, F8 and F9 are honest-reporting failures: the migration is lossy or incomplete and says nothing.",
+    "F7 and F10 sit downstream of the migrator but are reached by following the documented post-migration operator sequence."
+  ]
+}

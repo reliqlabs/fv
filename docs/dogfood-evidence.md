@@ -124,6 +124,50 @@ each execution's own log under that execution's own class, rejects a non-PASS
 execution beneath a PASS record, and rejects a cohort that repeats a `tool` ID
 because coverage would be ambiguous.
 
+Gate B judges the cohort, not only the record's declared fields:
+
+- Each execution's `evidence_class` must be admissible for the obligation's
+  kind, not merely the record's. A `test-witnessed` execution under an
+  invariant is rejected (`executions[i] incompatible evidence class ... for
+  obligation kind ...`) however strong the record calls itself.
+- Assumed evidence is assumed wherever it sits. If the record's class or any
+  execution's class is `externally-assumed` or `unverified`, the claim cannot
+  PASS without a waiver, and the message names every source
+  (`record=code-enforced` is not a defence for `verus=unverified`).
+- A `waiver` is a JSON object naming a nonempty `id`, `approver` and `scope`.
+  Bare `true` is rejected, and so is an object that omits or blanks any of the
+  three: `{"id": "WV-1"}` names a waiver nobody granted and nothing bounds, so
+  it cannot carry an assumption to a PASS. An attributable waiver still can,
+  and the verdict discloses it as `(waived: <claim>)`.
+- One artifact discharges one execution, and one execution of one claim. Two
+  executions may not cite the same `raw_output_path`; no two records in the
+  judged set may cite the same artifact either, so a single PASS log cannot
+  cover a second claim. Under `profile: producer-trusted-execution` each path
+  must be exactly `.fv/evidence/raw/<claim_id>-<execution run_id>.log`, the
+  name the producer writes. `fv-evidence-run/v2` records keep the legacy
+  tolerance and are exempt from the cross-record rule.
+- A PASS record may not be bound to a `+dirty` snapshot, in any comparison
+  mode. A FAIL record may: the dirt is why it failed.
+- A v3 cohort record must declare `profile: producer-trusted-execution`. v3 is
+  producer-written by construction, and any other profile would otherwise dodge
+  the producer artifact-naming and toolchain-identity rules keyed to it.
+- Record-asserted provenance is shape-checked. `profile` must be a bare token
+  (`[A-Za-z0-9][A-Za-z0-9._+/-]*`) because it is copied verbatim into the
+  verdict scope, `required_targets` must be a nonempty array of obligation IDs,
+  and `intent_hash`, `obligation_manifest_hash`, `environment_policy`,
+  `parser_schema_version` and `run_id` must be nonempty strings. For a v3
+  record `intent_path` must be one too: resolving it under the repository root
+  needs the tree, but whether it is a path at all is record text, so both tools
+  refuse a cohort record whose canonical target is an object or a list.
+- With `--manifest`, a record's `obligation_manifest_hash` must equal the SHA-256
+  of that manifest's bytes, and a v3 record's `required_targets` must equal the
+  manifest's complete required-obligation set. Both expectations are derived
+  from the manifest the run is judged against rather than read back off the
+  record. Gate B also accepts `--expect-manifest` to pin the hash by hand;
+  `coverage_dashboard.py` only derives it. Without `--manifest` there is no
+  declared obligation set, so neither comparison and no per-execution
+  obligation-kind check binds — on either tool.
+
 ### Invoking the producer
 
 `fv_evidence_run` always takes `claim_id`, `evidence_class` (the record-level
@@ -140,10 +184,26 @@ exactly one of two mutually exclusive forms; passing neither or both errors with
   `pass_marker` to the class marker. Top-level `cwd`, `tool`, and `pass_marker`
   are rejected in this form: they are per-execution.
 
-A per-entry `evidence_class` governs only that entry's PASS marker and its
-`executions[i].evidence_class` field. The record-level `evidence_class` stays
-whatever the top-level parameter said, which is why a cohort should pass the
-class of its first execution.
+A per-entry `evidence_class` governs that entry's PASS marker, its
+`executions[i].evidence_class` field, and its admissibility for the obligation
+kind. The record-level `evidence_class` stays whatever the top-level parameter
+said, which is why a cohort should pass the class of its first execution — and
+why declaring a strong record class over a weak execution buys nothing: the
+waiver rule and the compatibility table both read the executions.
+
+There is deliberately **no total strength ordering over evidence classes**, so
+a record-level class is never checked for being "at least as strong as" the
+cohort it heads. Nothing ranks `proof-discharged` against `bounded-checked`
+against `conformance-tested` in a way that survives a reader disagreeing with
+the ranking, and a synthetic lattice would sit between an obligation and its
+evidence while looking authoritative. Disclosure plus per-execution
+admissibility is what holds instead: every execution's class is recorded, each
+is checked against the obligation kind's allowed set, an assumed or unverified
+class anywhere in the cohort blocks PASS without a waiver, and the coverage
+dashboard reports `by_execution_evidence_class` and `assumed_executions` beside
+`by_evidence_class` so a cohort's weakest class is visible rather than hidden
+behind the record's. A record class that overstates its cohort *within* one
+kind's allowed set is therefore disclosed, not rejected.
 
 ### The verified-input snapshot
 
@@ -154,12 +214,18 @@ prefixes, sorted by UTF-8 path bytes, hashed as repo-relative POSIX path, NUL,
 file-content SHA-256 hex, newline. Symlinked candidates and candidates resolving
 outside the project root are rejected.
 
-Exclusion prefixes are the always-applied generated-output defaults
-`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.colosseum/` unioned with
+Exclusion prefixes are the always-applied structural defaults
+`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/history/`,
+`.fv/.migrate-staging/` and `.colosseum/`, unioned with
 `.fv/verified-inputs.txt`, whose blank and `#` lines are ignored and whose
-directory entries end in `/`. The defaults are what make evidence production
-self-stable: writing and committing a record cannot move the snapshot that
-record is bound to.
+directory entries end in `/`. A project's file only ever *adds* prefixes; it
+cannot drop a default. That is what makes evidence production self-stable
+(writing and committing a record cannot move the snapshot the record is bound
+to), keeps quarantined pre-FV history under `.fv/history/` from perturbing a
+fresh run, and keeps a migration's staging tree under `.fv/.migrate-staging/`
+out of the binding. The defaults live in `fv_project.DEFAULT_EXCLUSIONS` and
+are mirrored in `tools/evidence-run.ts`, so the gate and the producer hash the
+same input set.
 
 The producer snapshots before and after the cohort and compares; Gate B
 recomputes the current snapshot and compares again. So a record is fresh only
@@ -366,7 +432,11 @@ log.
   ERROR (exit 2), not a single failing claim.
 - Dependencies still need their own records. `S1` passing does not discharge
   `A1` or `W1`; every required obligation carries its own record, bound to the
-  same snapshot.
+  same snapshot. `--require S1` does not narrow that away: Gate B and
+  `coverage_dashboard.py` both expand a required system claim's `depends_on`
+  into the required set and report the expansion under `dependency_expansion`,
+  so a missing invariant record reads as INCOMPLETE rather than as nothing at
+  all.
 
 ### Listing the records in the manifest
 
@@ -421,6 +491,64 @@ record validates only under an explicit invocation:
 One expected snapshot applies to the whole record set, so a mixed v2/v3 set
 cannot be validated in one pass. Re-run the v2 claims through `fv_evidence_run`
 rather than loosening the gate for the v3 records around them.
+
+### Verdict banners
+
+Both consumers of these records answer in one line, and neither ever prints a
+bare `VERIFIED`:
+
+```
+VERDICT: VERIFIED[profile=producer-trusted-execution; binding=recomputed]
+VERDICT: VERIFIED[profile=bounded; binding=not-recomputed] (waived: W1)
+```
+
+`profile` is the slash-joined set of profiles the judged records declare.
+`binding` is what the tool did about freshness, and it is the field to read
+before trusting the rest:
+
+| `binding` | Emitted by | Meaning |
+|---|---|---|
+| `recomputed` | Gate B | the verified-input snapshot and the intent hash were recomputed this run and matched |
+| `pinned` | Gate B | `--expect-snapshot` / `--expect-intent` supplied the values; nothing was recomputed |
+| `unbound` | Gate B | `--allow-unbound`: source and intent binding skipped entirely |
+| `not-recomputed` | `coverage_dashboard.py` | a read-only view over records; it recomputes nothing by design |
+
+Waived claims are listed after the bracket so the scope stays a machine-readable
+field list. A CI step that greps the banner can therefore tell an evidence-bound
+VERIFIED from one earned with the freshness checks switched off, which the bare
+`VERIFIED[profile=...]` form could not express.
+
+`coverage_dashboard.py` renders the same records per claim. Its statuses are
+`PASS`, `FAIL`, `INCOMPLETE`, `missing-record`, `duplicate-record`, `invalid`,
+`unwaived-assumption`, `evidence-gap` (a required tool never PASSed, or an
+execution in the cohort did not PASS) and `dependency-gap` (the cohort PASSes
+but a `depends_on` obligation is not covered). It imports Gate B's schema module
+and applies every Gate B rule that needs no repository access: field presence,
+enums, waiver attribution, per-execution class compatibility, the
+assumed-evidence rule over record and executions, the `+dirty` PASS rejection,
+the `intent_path` shape check, the `obligation_manifest_hash` comparison,
+per-record and cross-record artifact identity, the producer artifact-naming
+rule, the v3 profile rule, the `required_targets`-equals-manifest rule, the
+producible obligation-id rule when loading a manifest, and the legacy bindings'
+derivation from `executions[0]`.
+
+The only Gate B checks it does not run are the artifact reads — path
+containment, digest recomputation, and PASS markers — which need the repository
+root, plus snapshot and intent freshness, which needs the current tree. That is
+what `binding=not-recomputed` says, and it is why the dashboard cannot report
+coverage for a record Gate B rejects without reading the repository.
+
+Two limits are shared rather than closed, and they are limits of the invocation,
+not of one tool:
+
+- Under `--require` with no `--manifest` there is no declared obligation set, so
+  the `obligation_manifest_hash` comparison, the `required_targets` comparison
+  and the obligation-kind checks do not bind in either tool. Name the manifest
+  to get them.
+- A `fv-evidence-run/v2` record keeps its own `profile` string, and that string
+  reaches the verdict scope verbatim in both tools. Only a cohort-schema record
+  is pinned to `producer-trusted-execution`, so a `VERIFIED[profile=...]` over
+  v2 records says what the record asserted, not what a producer earned.
 
 ### Verification plans
 

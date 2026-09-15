@@ -58,8 +58,26 @@ OBLIGATION_COLLECTIONS: tuple[tuple[str, str], ...] = (
     ("system_claims", "system_claim"),
 )
 CLAIM_DEPENDENCY_KINDS = frozenset({"invariant", "witness"})
+# An assumed or unverified class asserts nothing about the system: PASSing on it
+# requires an explicit waiver, wherever in the record the class appears.
+ASSUMED_CLASSES = frozenset({"externally-assumed", "unverified"})
+# A waiver authorizes assumed evidence, so it must be attributable: which
+# waiver, granted by whom, over what. Anything less names nobody.
+WAIVER_FIELDS = ("id", "approver", "scope")
 OBLIGATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
+# The evidence producer's claim_id grammar (fv_evidence_run). An obligation id
+# outside it can never have a record written for it, so a manifest declaring one
+# is unusable rather than merely unsatisfied.
+PRODUCER_CLAIM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 EVIDENCE_TOOL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]*")
+# The profile is record-asserted and lands verbatim in the verdict scope, so it
+# must not be able to forge a second scope field.
+PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]*")
+PRODUCER_PROFILE = "producer-trusted-execution"
+# Every producer artifact is named after the claim and the execution's own run id,
+# which is what binds one artifact to exactly one execution of one claim.
+PRODUCER_ARTIFACT = ".fv/evidence/raw/{claim_id}-{run_id}.log"
+DIRTY_SUFFIX = "+dirty"
 RESULTS = {"PASS", "FAIL", "INCOMPLETE"}
 TOP_FIELDS = ("claim_id", "required", "evidence_class", "result", "scope", "bindings", "waiver")
 BINDING_FIELDS = (
@@ -182,8 +200,33 @@ def _raw_artifact_defects(record: dict, repo_root: Path) -> list[str]:
     return _pass_artifact_defects(text, record["evidence_class"], override)
 
 
+class _Cohort:
+    """What a cohort entry is judged against, plus the cross-execution state.
+
+    ``seen_tools`` and ``seen_paths`` make coverage and artifacts one-to-one: a
+    tool may discharge at most one execution, and an artifact at most one
+    execution, so a single PASS log cannot stand in for a whole cohort.
+
+    Hand-written rather than a dataclass because this gate is also loaded
+    directly from its path (importlib, without a sys.modules entry), which is
+    where dataclasses' deferred annotation resolution breaks.
+    """
+
+    __slots__ = ("claim_id", "record_pass", "producer", "obligation_kind",
+                 "seen_tools", "seen_paths")
+
+    def __init__(self, claim_id: str, record_pass: bool, producer: bool,
+                 obligation_kind: str | None = None) -> None:
+        self.claim_id = claim_id
+        self.record_pass = record_pass
+        self.producer = producer
+        self.obligation_kind = obligation_kind
+        self.seen_tools: set[str] = set()
+        self.seen_paths: dict[str, int] = {}
+
+
 def _execution_defects(execution: object, index: int, repo_root: Path,
-                       record_pass: bool, seen_tools: set[str]) -> list[str]:
+                       cohort: _Cohort) -> list[str]:
     """One cohort entry: tool identity, argv, contained cwd, executable identity, artifact."""
     label = f"executions[{index}] "
     if not isinstance(execution, dict):
@@ -195,12 +238,20 @@ def _execution_defects(execution: object, index: int, repo_root: Path,
     tool = execution["tool"]
     if not isinstance(tool, str) or EVIDENCE_TOOL_ID.fullmatch(tool) is None:
         defects.append(f"{label}malformed evidence tool id {tool!r}")
-    elif tool in seen_tools:
+    elif tool in cohort.seen_tools:
         defects.append(f"{label}duplicate evidence tool {tool!r}: cohort coverage is ambiguous")
     else:
-        seen_tools.add(tool)
-    if execution["evidence_class"] not in EVIDENCE_CLASSES:
-        defects.append(f"{label}unknown evidence_class {execution['evidence_class']!r}")
+        cohort.seen_tools.add(tool)
+    evidence_class = execution["evidence_class"]
+    if evidence_class not in EVIDENCE_CLASSES:
+        defects.append(f"{label}unknown evidence_class {evidence_class!r}")
+    elif cohort.obligation_kind is not None:
+        # The record's declared class is not the strength of the evidence: each
+        # execution has to be admissible for the obligation it helps discharge.
+        compatible = OBLIGATION_EVIDENCE_COMPATIBILITY.get(cohort.obligation_kind, frozenset())
+        if evidence_class not in compatible:
+            defects.append(f"{label}incompatible evidence class {evidence_class!r} "
+                           f"for obligation kind {cohort.obligation_kind!r}")
     command = execution["command"]
     if (not isinstance(command, list) or not command
             or any(not isinstance(part, str) or not part for part in command)):
@@ -213,10 +264,22 @@ def _execution_defects(execution: object, index: int, repo_root: Path,
     result = execution["result"]
     if result not in RESULTS:
         defects.append(f"{label}unknown result {result!r}")
-    elif record_pass and result != "PASS":
+    elif cohort.record_pass and result != "PASS":
         defects.append(f"{label}result {result!r} cannot appear beneath a PASS record")
-    if not isinstance(execution["run_id"], str) or not execution["run_id"].strip():
+    run_id = execution["run_id"]
+    if not isinstance(run_id, str) or not run_id.strip():
         defects.append(f"{label}run_id is empty")
+    raw_relative = execution["raw_output_path"]
+    if isinstance(raw_relative, str) and raw_relative:
+        first = cohort.seen_paths.setdefault(raw_relative, index)
+        if first != index:
+            defects.append(f"{label}raw_output_path {raw_relative!r} duplicates "
+                           f"executions[{first}]: one artifact cannot discharge two executions")
+        if cohort.producer and isinstance(run_id, str):
+            expected = PRODUCER_ARTIFACT.format(claim_id=cohort.claim_id, run_id=run_id)
+            if raw_relative != expected:
+                defects.append(f"{label}raw_output_path {raw_relative!r} is not this run's "
+                               f"producer artifact {expected!r}")
     marker = execution.get("pass_marker")
     if "pass_marker" in execution and (not isinstance(marker, str) or not marker):
         defects.append(f"{label}pass_marker is empty")
@@ -226,21 +289,25 @@ def _execution_defects(execution: object, index: int, repo_root: Path,
                                             execution["raw_output_hash"], label)
     defects.extend(artifact_defects)
     if text is not None and result == "PASS":
-        defects.extend(_pass_artifact_defects(text, execution["evidence_class"], marker, label))
+        defects.extend(_pass_artifact_defects(text, evidence_class, marker, label))
     return defects
 
 
-def _cohort_defects(record: dict, repo_root: Path) -> list[str]:
+def _cohort_defects(record: dict, repo_root: Path, obligation_kind: str | None = None) -> list[str]:
     """Every execution of a v3 cohort, and the legacy bindings derived from its first."""
     bindings = record["bindings"]
     executions = bindings.get("executions")
     if not isinstance(executions, list) or not executions:
         return ["bindings.executions is not a nonempty array"]
     defects: list[str] = []
-    seen_tools: set[str] = set()
-    record_pass = record["result"] == "PASS"
+    cohort = _Cohort(
+        claim_id=record["claim_id"],
+        record_pass=record["result"] == "PASS",
+        producer=bindings.get("profile") == PRODUCER_PROFILE,
+        obligation_kind=obligation_kind,
+    )
     for index, execution in enumerate(executions):
-        defects.extend(_execution_defects(execution, index, repo_root, record_pass, seen_tools))
+        defects.extend(_execution_defects(execution, index, repo_root, cohort))
     if defects:
         return defects
     # A record whose legacy fields describe a different run than its cohort would
@@ -279,6 +346,148 @@ def _coverage_defects(record: dict, required_evidence: list[str]) -> list[str]:
     return [f"system claim missing PASS evidence from required tools {uncovered}"]
 
 
+def _waiver_defects(waiver: object) -> list[str]:
+    """A waiver is an attributable authorization, never a bare flag.
+
+    The waiver is the only thing that turns an assumed claim into a PASS, so it
+    has to record who allowed what: ``true`` names nobody, and an object
+    carrying an id alone excuses nothing an auditor could follow up. Pure record
+    text, which is why every consumer of these records applies it.
+    """
+    if not waiver:
+        return []
+    if not isinstance(waiver, dict):
+        return [f"waiver is not an object: {waiver!r}"]
+    missing = [field for field in WAIVER_FIELDS
+               if not isinstance(waiver.get(field), str) or not waiver[field].strip()]
+    if missing:
+        return [f"waiver is not attributable: {missing} missing or blank; an "
+                f"assumed claim is waived only by a nonempty id, approver, and "
+                f"scope: {waiver!r}"]
+    return []
+
+
+def _asserted_field_defects(bindings: dict, schema_v3: bool) -> list[str]:
+    """Record-asserted binding fields, judged for shape before anything reads them.
+
+    ``profile`` reaches the verdict scope verbatim, so a record must not be able
+    to inject a second scope field into it. ``required_targets`` is compared to
+    the manifest by ``v3_producer_defects`` for a cohort-schema record, and this
+    is the shape check that comparison relies on; for a pre-cohort record it stays
+    an unread assertion. ``intent_path`` is shape-checked here rather than beside
+    the containment check that needs a repository root: whether the canonical
+    target is a string at all is record text, and a consumer without the tree
+    must still refuse a cohort record whose target is an object. The rest is
+    provenance a later reader parses, and an ill-typed value there is drift, not
+    detail.
+    """
+    defects: list[str] = []
+    profile = bindings.get("profile")
+    if not isinstance(profile, str) or PROFILE_ID.fullmatch(profile) is None:
+        defects.append(f"malformed profile {profile!r}")
+    targets = bindings.get("required_targets")
+    if (not isinstance(targets, list) or not targets
+            or any(not isinstance(target, str) or OBLIGATION_ID.fullmatch(target) is None
+                   for target in targets)):
+        defects.append(f"required_targets is not a nonempty array of obligation ids: {targets!r}")
+    asserted = ("intent_hash", "obligation_manifest_hash", "environment_policy",
+                "parser_schema_version", "run_id")
+    # intent_path is the cohort schema's; a pre-cohort record never carried one.
+    for name in asserted + (("intent_path",) if schema_v3 else ()):
+        value = bindings.get(name)
+        if not isinstance(value, str) or not value.strip():
+            defects.append(f"binding field {name!r} is not a nonempty string: {value!r}")
+    return defects
+
+
+def dirty_snapshot_defects(record: dict) -> list[str]:
+    """A PASS record bound to a snapshot the producer watched move.
+
+    The ``+dirty`` marker is the producer reporting that a verified input changed
+    while the command ran, so it blocks a PASS in every comparison mode instead of
+    being advice a prefix match can wave through. It is a pure record-text rule,
+    which is why every consumer of these records applies it, repository access or
+    not.
+    """
+    snapshot = record["bindings"].get("source_snapshot")
+    if record["result"] != "PASS" or not isinstance(snapshot, str):
+        return []
+    if not snapshot.endswith(DIRTY_SUFFIX):
+        return []
+    return [
+        f"PASS record bound to a dirty snapshot {snapshot!r}: its verified inputs "
+        "moved during the run"
+    ]
+
+
+def manifest_binding(path: Path) -> str:
+    """The obligation-manifest expectation records are judged against.
+
+    The manifest is an explicit CLI input, so its hash is derivable by any
+    consumer holding it: deriving it needs no repository tree, and a consumer
+    that skips the derivation reports coverage for evidence bound elsewhere.
+    """
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def manifest_binding_defects(bindings: dict, expect_manifest: str | None) -> list[str]:
+    """A record bound to an obligation set other than the one being judged.
+
+    Evidence earned against a different manifest answers a different question,
+    so it is stale here however sound it was there. Record text compared against
+    a CLI input, which is why every consumer handed ``--manifest`` applies it.
+    """
+    declared = bindings.get("obligation_manifest_hash")
+    if not expect_manifest or declared == expect_manifest:
+        return []
+    return [
+        f"stale record: bound to obligation manifest {declared!r}, "
+        f"expected {expect_manifest!r}"
+    ]
+
+
+def v3_producer_defects(bindings: dict,
+                        expect_required_targets: tuple[str, ...] | None) -> list[str]:
+    """A cohort-schema record is producer-written: hold it to the producer's scope.
+
+    Only ``fv_evidence_run`` writes ``fv-evidence-run/v3``, and every rule that binds
+    a producer record - the per-execution artifact name, the resolved executable
+    identity behind the record-level bindings - keys off ``bindings.profile``. A v3
+    record declaring any other profile would keep the cohort schema's coverage power
+    while opting out of those rules, and would still put its own string into the
+    verdict scope, so the profile is pinned rather than trusted.
+
+    ``required_targets`` is record-asserted until something compares it. The producer
+    writes every obligation its manifest declares, so the expected set is threaded in
+    from the manifest this run was judged against and never read back off the record.
+    """
+    defects: list[str] = []
+    profile = bindings.get("profile")
+    if profile != PRODUCER_PROFILE:
+        defects.append(f"cohort-schema record declares profile {profile!r}, not the "
+                       f"producer profile {PRODUCER_PROFILE!r}")
+    declared = bindings.get("required_targets")
+    if expect_required_targets is None or not isinstance(declared, list):
+        return defects
+    if len(set(declared)) != len(declared):
+        defects.append(f"required_targets repeats an obligation id: {declared!r}")
+    expected = set(expect_required_targets)
+    missing = sorted(expected - set(declared))
+    unexpected = sorted(set(declared) - expected)
+    if missing or unexpected:
+        defects.append("required_targets is not the obligation manifest's required "
+                       f"set: missing {missing}, unexpected {unexpected}")
+    return defects
+
+
+def is_schema_v3(record: object) -> bool:
+    """True for a cohort-carrying record: the schema whose artifacts are per-execution."""
+    bindings = record.get("bindings") if isinstance(record, dict) else None
+    if not isinstance(bindings, dict):
+        return False
+    return bindings.get("parser_schema_version") == EVIDENCE_SCHEMA_V3 or "executions" in bindings
+
+
 def validate_record(
     record: dict,
     expect_snapshot: str | None,
@@ -288,6 +497,8 @@ def validate_record(
     repo_root: Path | None = None,
     obligation_kind: str | None = None,
     required_evidence: list[str] | None = None,
+    expect_intent_path: str | None = None,
+    expect_required_targets: tuple[str, ...] | None = None,
 ) -> list[str]:
     defects: list[str] = []
     if not isinstance(record, dict):
@@ -311,22 +522,24 @@ def validate_record(
     if not isinstance(bindings, dict):
         defects.append("bindings is not an object")
         return defects
-    schema_v3 = (bindings.get("parser_schema_version") == EVIDENCE_SCHEMA_V3
-                 or "executions" in bindings)
+    schema_v3 = is_schema_v3(record)
     expected_fields = BINDING_FIELDS + (V3_BINDING_FIELDS if schema_v3 else ())
     for field in expected_fields:
         if field not in bindings:
             defects.append(f"missing binding field {field!r}")
         elif bindings[field] in ("", [], {}) or (bindings[field] is None and field not in NULLABLE):
             defects.append(f"empty binding field {field!r}")
-    if bindings.get("profile") == "producer-trusted-execution" and not _valid_toolchain(
+    if bindings.get("profile") == PRODUCER_PROFILE and not _valid_toolchain(
         bindings.get("toolchain_digests")
     ):
         defects.append("producer evidence lacks resolved executable identity")
+    defects.extend(_asserted_field_defects(bindings, schema_v3))
+    defects.extend(_waiver_defects(record["waiver"]))
     if defects:
         return defects
+    snapshot = bindings.get("source_snapshot")
+    defects.extend(dirty_snapshot_defects(record))
     if expect_snapshot:
-        snapshot = bindings.get("source_snapshot")
         matched = isinstance(snapshot, str) and (
             snapshot == expect_snapshot if snapshot_exact else snapshot.startswith(expect_snapshot)
         )
@@ -345,23 +558,29 @@ def validate_record(
         defects.append(
             f"stale record: bound to intent {bindings.get('intent_hash')!r}, expected {expect_intent!r}"
         )
-    if expect_manifest and bindings.get("obligation_manifest_hash") != expect_manifest:
-        defects.append(
-            "stale record: bound to obligation manifest "
-            f"{bindings.get('obligation_manifest_hash')!r}, expected {expect_manifest!r}"
-        )
+    defects.extend(manifest_binding_defects(bindings, expect_manifest))
     if obligation_kind is not None:
         compatible = OBLIGATION_EVIDENCE_COMPATIBILITY.get(obligation_kind)
         if compatible is None or record["evidence_class"] not in compatible:
             defects.append(
                 f"incompatible evidence class {record['evidence_class']!r} for obligation kind {obligation_kind!r}"
             )
+    if schema_v3:
+        # Repository-free producer rules, applied wherever a v3 record is read.
+        defects.extend(v3_producer_defects(bindings, expect_required_targets))
     if schema_v3 and repo_root is not None:
         intent_path_defect = _contained_path_defect(repo_root, bindings.get("intent_path"),
                                                     "intent_path", "")
         if intent_path_defect is not None:
             defects.append(intent_path_defect)
-        defects.extend(_cohort_defects(record, repo_root))
+        elif expect_intent_path is not None and bindings.get("intent_path") != expect_intent_path:
+            # The hash is already compared; without this the path beside it is the one
+            # provenance field a reader would trust and nothing checks.
+            defects.append(
+                f"stale record: bound to intent path {bindings.get('intent_path')!r}, "
+                f"expected {expect_intent_path!r}"
+            )
+        defects.extend(_cohort_defects(record, repo_root, obligation_kind))
     # A v3 record's legacy artifact is its first execution's, already judged by the
     # class that produced it and pinned to these bindings by the derivation check.
     if (not schema_v3 and record["result"] == "PASS"
@@ -412,6 +631,13 @@ def _obligation_entries(manifest: dict, collection: str) -> list[tuple[str, dict
         claim_id = item.get("id")
         if not isinstance(claim_id, str) or OBLIGATION_ID.fullmatch(claim_id) is None:
             raise ManifestError(f"{collection}[{index}] has malformed id {claim_id!r}")
+        if PRODUCER_CLAIM_ID.fullmatch(claim_id) is None:
+            # An id the producer's claim_id grammar rejects can never have a record
+            # written for it, so it would read as missing-record forever.
+            raise ManifestError(
+                f"{collection}[{index}] id {claim_id!r} is not usable by the evidence "
+                "producer: obligation ids must match [A-Za-z0-9][A-Za-z0-9._-]*"
+            )
         entries.append((claim_id, item))
     return entries
 
@@ -430,7 +656,8 @@ def _id_list(claim_id: str, field: str, value: object, pattern: re.Pattern[str])
     return ids
 
 
-def _validate_system_claim(claim_id: str, claim: dict, kinds: dict[str, str]) -> list[str]:
+def _validate_system_claim(claim_id: str, claim: dict,
+                           kinds: dict[str, str]) -> tuple[list[str], list[str]]:
     """depends_on names declared invariants/witnesses; required_evidence names tool IDs.
 
     Confining dependencies to non-claim obligations is what makes a dependency
@@ -438,7 +665,8 @@ def _validate_system_claim(claim_id: str, claim: dict, kinds: dict[str, str]) ->
     claim, including itself), so the gate needs no cycle search. Widening
     depends_on to nested claims would require one.
     """
-    for dependency in _id_list(claim_id, "depends_on", claim.get("depends_on"), OBLIGATION_ID):
+    dependencies = _id_list(claim_id, "depends_on", claim.get("depends_on"), OBLIGATION_ID)
+    for dependency in dependencies:
         kind = kinds.get(dependency)
         if kind is None:
             raise ManifestError(
@@ -449,11 +677,15 @@ def _validate_system_claim(claim_id: str, claim: dict, kinds: dict[str, str]) ->
                 f"system_claim {claim_id!r} depends on {dependency!r} of kind {kind!r}: "
                 "depends_on names invariants and witnesses only"
             )
-    return _id_list(claim_id, "required_evidence", claim.get("required_evidence"), EVIDENCE_TOOL_ID)
+    evidence = _id_list(claim_id, "required_evidence", claim.get("required_evidence"),
+                        EVIDENCE_TOOL_ID)
+    return dependencies, evidence
 
 
-def load_manifest(path: Path) -> tuple[list[str], dict[str, str], dict[str, list[str]]]:
-    """Required claim IDs, their obligation kinds, and each system claim's evidence tools."""
+def load_manifest(
+    path: Path,
+) -> tuple[list[str], dict[str, str], dict[str, list[str]], dict[str, list[str]]]:
+    """Required claim IDs, their kinds, and each system claim's evidence and dependencies."""
     manifest = json.loads(path.read_text())
     if not isinstance(manifest, dict):
         raise ManifestError("manifest is not an object")
@@ -474,9 +706,11 @@ def load_manifest(path: Path) -> tuple[list[str], dict[str, str], dict[str, list
     # Dependencies may name obligations declared later in the file, so resolve
     # every claim only once the full kind map exists.
     claim_evidence: dict[str, list[str]] = {}
+    claim_depends: dict[str, list[str]] = {}
     for claim_id, item in system_claims:
-        claim_evidence[claim_id] = _validate_system_claim(claim_id, item, kinds)
-    return required, kinds, claim_evidence
+        claim_depends[claim_id], claim_evidence[claim_id] = _validate_system_claim(
+            claim_id, item, kinds)
+    return required, kinds, claim_evidence, claim_depends
 
 
 def current_source_snapshot(repo_root: Path) -> str:
@@ -488,6 +722,71 @@ def current_intent_binding(repo_root: Path) -> tuple[str, str]:
     """Canonical target's repo-relative path and content hash."""
     target = fv_project.resolve_target(repo_root)
     return fv_project.repo_relative(repo_root, target), fv_project.target_hash(repo_root)
+
+
+def _cited_artifacts(record: object) -> list[str]:
+    """Repo-relative raw artifacts a record commits to, deduped within the record."""
+    bindings = record.get("bindings") if isinstance(record, dict) else None
+    if not isinstance(bindings, dict):
+        return []
+    paths = [bindings.get("raw_output_path")]
+    executions = bindings.get("executions")
+    if isinstance(executions, list):
+        paths.extend(execution.get("raw_output_path") for execution in executions
+                     if isinstance(execution, dict))
+    return list(dict.fromkeys(path for path in paths if isinstance(path, str) and path))
+
+
+def cited_artifact_index(required: list[str],
+                         by_claim: dict[str, dict]) -> dict[str, set[str]]:
+    """Which required claims cite each raw artifact, over the whole judged run."""
+    cited: dict[str, set[str]] = {}
+    for claim_id in required:
+        for relative in _cited_artifacts(by_claim.get(claim_id)):
+            cited.setdefault(relative, set()).add(claim_id)
+    return cited
+
+
+def shared_artifact_defects(claim_id: str, record: object,
+                            cited: dict[str, set[str]]) -> list[str]:
+    """Artifacts this record cites that another required claim cites too.
+
+    One artifact cannot discharge two claims: whichever claim reads it second is
+    reading evidence earned elsewhere. Enforced for cohort-schema records, whose
+    artifacts are per-execution by construction; a pre-cohort record, which only
+    validates at all under an explicit freshness escape hatch, keeps the legacy
+    tolerance of one log cited by several claims.
+    """
+    if not is_schema_v3(record):
+        return []
+    defects: list[str] = []
+    for relative in _cited_artifacts(record):
+        shared = sorted(cited.get(relative, set()) - {claim_id})
+        if shared:
+            defects.append(f"raw artifact {relative!r} is also cited by claim(s) "
+                           f"{shared}: evidence cannot be shared between claims")
+    return defects
+
+
+def _assumed_evidence(record: dict) -> list[str]:
+    """Every place this record rests on an assumed or unverified class.
+
+    The record's declared class is not the strength of what ran: a cohort entry
+    can be ``unverified`` beneath a ``code-enforced`` record, so the waiver rule
+    has to quantify over the whole record.
+    """
+    sources: list[str] = []
+    if record.get("evidence_class") in ASSUMED_CLASSES:
+        sources.append(f"record={record['evidence_class']}")
+    bindings = record.get("bindings")
+    executions = bindings.get("executions") if isinstance(bindings, dict) else None
+    if isinstance(executions, list):
+        for index, execution in enumerate(executions):
+            if not isinstance(execution, dict) or execution.get("evidence_class") not in ASSUMED_CLASSES:
+                continue
+            tool = execution.get("tool") if isinstance(execution.get("tool"), str) else index
+            sources.append(f"{tool}={execution['evidence_class']}")
+    return sources
 
 
 def main() -> int:
@@ -508,10 +807,20 @@ def main() -> int:
         manifest_required: list[str] = []
         obligation_kinds: dict[str, str] = {}
         claim_evidence: dict[str, list[str]] = {}
+        claim_depends: dict[str, list[str]] = {}
+        # The complete declared obligation set, captured before --require narrows the
+        # judged set: a producer record asserts every target its manifest declared, so
+        # the expectation comes from the manifest and not from the record.
+        expected_targets: tuple[str, ...] | None = None
         if args.manifest:
-            manifest_required, obligation_kinds, claim_evidence = load_manifest(args.manifest)
+            (manifest_required, obligation_kinds, claim_evidence,
+             claim_depends) = load_manifest(args.manifest)
+            expected_targets = tuple(manifest_required)
+            # --expect-manifest is an operator override for judging records against
+            # a manifest this run is not holding; absent it the expectation is the
+            # held manifest's own bytes, which is what every other consumer derives.
             if args.expect_manifest is None:
-                args.expect_manifest = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
+                args.expect_manifest = manifest_binding(args.manifest)
         if args.require is not None:
             required = [claim.strip() for claim in args.require.split(",") if claim.strip()]
             if not required:
@@ -529,6 +838,19 @@ def main() -> int:
             print(f"ERROR: required claims absent from manifest: {unknown_required}")
             print("\nVERDICT: ERROR")
             return 2
+        # A required system claim is not discharged by its own cohort alone: judging
+        # it without the invariants and witnesses it depends on would report VERIFIED
+        # for a composition whose parts were never looked at.
+        dependency_expansion: dict[str, list[str]] = {}
+        if args.require is not None and args.manifest:
+            for claim_id in list(required):
+                if obligation_kinds.get(claim_id) != "system_claim":
+                    continue
+                added = [dependency for dependency in claim_depends.get(claim_id, ())
+                         if dependency not in required]
+                if added:
+                    dependency_expansion[claim_id] = added
+                    required.extend(added)
     except ManifestError as error:
         print(f"ERROR: malformed obligation manifest: {error}")
         print("\nVERDICT: ERROR")
@@ -541,6 +863,10 @@ def main() -> int:
     required = sorted(dict.fromkeys(required))
     repo_root = args.root.resolve() if args.root else infer_repo_root(args.records)
     intent_path: str | None = None
+    # The verdict must say which freshness discipline produced it: a pinned or
+    # unbound run is not the same claim as a recomputed one.
+    pinned = args.expect_snapshot is not None or args.expect_intent is not None
+    binding = "unbound" if args.allow_unbound else ("pinned" if pinned else "recomputed")
     if not args.allow_unbound:
         try:
             if args.expect_snapshot is None:
@@ -560,6 +886,7 @@ def main() -> int:
             if claim_id in by_claim:
                 duplicates.add(claim_id)
             by_claim[claim_id] = record
+    cited = cited_artifact_index(required, by_claim)
 
     failed: list[str] = []
     incomplete: list[str] = []
@@ -586,22 +913,29 @@ def main() -> int:
             repo_root,
             obligation_kinds.get(claim_id),
             claim_evidence.get(claim_id),
+            intent_path,
+            expected_targets,
         )
+        defects.extend(shared_artifact_defects(claim_id, record, cited))
         if defects:
             incomplete.append(f"{claim_id}: invalid record ({'; '.join(defects)})")
             per_claim.append({"claim_id": claim_id, "status": "invalid", "defects": defects})
             continue
         evidence_class = record["evidence_class"]
         result = record["result"]
+        assumed = _assumed_evidence(record)
         if result == "FAIL":
             failed.append(f"{claim_id}: {evidence_class} FAIL - {record['scope']}")
             per_claim.append({"claim_id": claim_id, "status": "FAIL", "evidence_class": evidence_class})
         elif result == "INCOMPLETE":
             incomplete.append(f"{claim_id}: record result INCOMPLETE")
             per_claim.append({"claim_id": claim_id, "status": "INCOMPLETE", "evidence_class": evidence_class})
-        elif evidence_class in ("externally-assumed", "unverified") and not record["waiver"]:
-            incomplete.append(f"{claim_id}: {evidence_class} evidence cannot PASS without a waiver")
-            per_claim.append({"claim_id": claim_id, "status": "unwaived-assumption", "evidence_class": evidence_class})
+        elif assumed and not record["waiver"]:
+            incomplete.append(f"{claim_id}: assumed or unverified evidence cannot PASS "
+                              f"without a waiver ({', '.join(assumed)})")
+            per_claim.append({"claim_id": claim_id, "status": "unwaived-assumption",
+                              "evidence_class": evidence_class,
+                              "assumed_evidence": assumed})
         else:
             if record["waiver"]:
                 waived.append(claim_id)
@@ -620,7 +954,7 @@ def main() -> int:
         verdict, code = "INCOMPLETE", 3
     else:
         profiles = sorted({by_claim[claim]["bindings"]["profile"] for claim in required})
-        verdict = f"VERIFIED[profile={'/'.join(profiles)}]"
+        verdict = f"VERIFIED[profile={'/'.join(profiles)}; binding={binding}]"
         if waived:
             verdict += f" (waived: {','.join(sorted(waived))})"
         code = 0
@@ -630,6 +964,8 @@ def main() -> int:
         "repo_root": str(repo_root),
         "expected_snapshot": args.expect_snapshot,
         "intent_path": intent_path,
+        "binding": binding,
+        "dependency_expansion": dependency_expansion,
         "required_claims": required,
         "obligation_kinds": {claim: obligation_kinds[claim] for claim in required
                              if claim in obligation_kinds},

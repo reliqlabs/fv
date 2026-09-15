@@ -25,10 +25,42 @@ and reports an evidence gap or a dependency gap rather than a bare PASS
 when it is not. Those cases are built in a temporary directory, so this
 suite owns them without editing the shared m1 fixture set.
 
+Finally it pins cross-gate parity directly. The dashboard shares Gate B's
+schema module, so a record Gate B rejects structurally must never render
+as covered here. Section (i) builds a real repository-shaped evidence set
+(records, obligation manifest, raw artifacts with matching digests) in a
+temporary root, runs both tools over it, and asserts the anti-drift
+property in the direction that matters: the dashboard exits 0 only where
+Gate B does. The mutations are the ones an adversary named — a v3 record
+with no cohort, an unreadable cohort entry, a strong record class over an
+unverified execution, a witness-class execution under an invariant, a
+bare `true` waiver, a waiver naming an id and nothing else, two records
+for one claim, one raw artifact cited by two claims, a PASS bound to a
+`+dirty` snapshot, a cohort record claiming a profile the producer never
+writes, `required_targets` that omits a declared obligation or names an
+undeclared one, a record bound to another obligation manifest, and an
+`intent_path` that is not a path at all. For every record-level rule both
+tools own, the case also requires the two defect lists to be identical, so
+agreement on the exit code cannot hide two different reasons. One case is
+a layer up: an obligation ID the producer could never write a record for
+must be ERROR(2) in both tools, never a required set with missing-record
+rows in one and an ERROR in the other.
+
+The parity runs both ways: a pre-cohort (v2) record with its own profile,
+its own `required_targets` and an artifact another claim also cites must
+still pass both tools, so the cohort-schema rules cannot leak into the
+legacy shape in one tool and not the other. Two documented boundaries are
+asserted symmetric rather than closed: a v2 record's own profile reaches
+the verdict scope in both tools, and under `--require` with no manifest
+neither the obligation-manifest binding nor `required_targets` binds in
+either tool — naming the manifest is what turns the same records into a
+rejection on both sides.
+
 No external toolchain required. Exit 0 pass, 1 fail.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -38,6 +70,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 DASHBOARD = REPO / "scripts" / "coverage_dashboard.py"
+GATE = REPO / "scripts" / "check_evidence_records.py"
 FIXTURES = REPO / "tests" / "fixtures" / "m1"
 FAILURES: list[str] = []
 
@@ -47,6 +80,9 @@ ALL_CLAIMS = "B1,B2,B3,B4,W1,S1"
 # so this suite proves the token-discipline rule itself, not just that
 # --check happens to pass on inputs that were never going to trip it.
 BARE_VERIFIED = re.compile(r"VERIFIED(?!\[)")
+# VERIFIED[<field>; <field>] optionally followed by the waiver suffix.
+SCOPED_VERDICT = re.compile(
+    r"^VERIFIED\[(?P<scope>[^\]]*)\](?: \(waived: (?P<waived>[^)]*)\))?$")
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -87,6 +123,11 @@ def row(dashboard: dict, claim_id: str) -> dict:
 # dimension per case (which cohort tool PASSed, which dependency held)
 # without multiplying shared fixture files.
 
+# The manifest these fixtures are judged against, written beside them: both
+# tools derive a record's expected obligation_manifest_hash from the manifest
+# bytes they are handed, so the records have to be bound to this file.
+SYSTEM_MANIFEST_NAME = "obligations-system.json"
+
 SYSTEM_MANIFEST = {
     "version": 1,
     "invariants": [{"id": "B1", "name": "inv_b1"}],
@@ -100,30 +141,40 @@ SYSTEM_MANIFEST = {
 }
 
 
-def execution(tool: str, result: str) -> dict:
-    """One v3 cohort entry, shaped as the evidence producer writes it."""
+def execution(tool: str, result: str,
+              evidence_class: str = "bounded-checked",
+              claim: str = "SC1") -> dict:
+    """One v3 cohort entry, shaped as the evidence producer writes it.
+
+    The artifact is named the producer's own way, `<claim>-<run_id>.log`: a
+    cohort record declares the producer profile and both tools hold that
+    profile to the naming rule, so a plausible-looking stand-in would not be
+    the shape either tool actually has to judge."""
+    run_id = f"m1-system-{tool}"
     return {
         "tool": tool,
-        "evidence_class": "bounded-checked",
+        "evidence_class": evidence_class,
         "command": [tool, "verify"],
         "cwd": ".",
         "toolchain_digests": {"executable": f"/usr/bin/{tool}",
                               "sha256": "4" * 64, "version": "1.0.0",
                               "version_exit_code": 0},
-        "raw_output_path": f".fv/evidence/{tool}.txt",
+        "raw_output_path": f".fv/evidence/raw/{claim}-{run_id}.log",
         "raw_output_hash": "5" * 64,
         "result": result,
-        "run_id": f"m1-system-{tool}",
+        "run_id": run_id,
     }
 
 
 def record(claim_id: str, *, result: str = "PASS",
            evidence_class: str = "bounded-checked",
-           executions: list[dict] | None = None) -> dict:
+           executions: list[dict] | None = None,
+           waiver: dict | None = None,
+           manifest_hash: str = "2" * 64) -> dict:
     bindings = {
         "source_snapshot": "aaaaaaa1+worktree-clean",
         "intent_hash": "1" * 64,
-        "obligation_manifest_hash": "2" * 64,
+        "obligation_manifest_hash": manifest_hash,
         "profile": "bounded",
         "required_targets": ["B1", "W1", "SC1"],
         "environment_policy": "z2-worktree",
@@ -136,11 +187,51 @@ def record(claim_id: str, *, result: str = "PASS",
         "run_id": f"m1-system-{claim_id}",
     }
     if executions is not None:
-        bindings["executions"] = executions
+        # A cohort record is a v3 record: it is producer-written, so it carries
+        # the producer profile and the canonical target, and derives its legacy
+        # bindings from executions[0]. Both tools reject a cohort record that
+        # does not, so a fixture skipping any of it would not be the shape they
+        # actually have to judge.
+        primary = executions[0]
+        bindings.update({
+            "intent_path": ".fv/intent.md",
+            "parser_schema_version": "fv-evidence-run/v3",
+            "profile": "producer-trusted-execution",
+            "executions": executions,
+            "command": json.dumps(primary["command"]),
+            "configuration": {"cwd": primary["cwd"]},
+            "toolchain_digests": primary["toolchain_digests"],
+            "raw_output_path": primary["raw_output_path"],
+            "raw_output_hash": primary["raw_output_hash"],
+        })
     return {"claim_id": claim_id, "required": True,
             "evidence_class": evidence_class, "result": result,
             "scope": f"scope for {claim_id}", "bindings": bindings,
-            "waiver": None}
+            "waiver": waiver}
+
+
+def verdict_parts(verdict: str) -> dict:
+    """A verdict banner split into the parts the two tools must agree on.
+
+    They disagree on `binding` by construction — Gate B recomputes the
+    snapshot, is pinned to one, or is told to skip it, while the dashboard
+    never recomputes anything — so the binding mode is compared separately,
+    never folded into the equality."""
+    match = SCOPED_VERDICT.match(verdict)
+    if match is None:
+        return {"kind": verdict, "profiles": [], "waived": [], "binding": None}
+    fields: dict[str, str] = {}
+    for part in match.group("scope").split(";"):
+        key, _, value = part.strip().partition("=")
+        if key:
+            fields[key] = value
+    waived = match.group("waived") or ""
+    return {
+        "kind": "VERIFIED",
+        "profiles": sorted(p for p in fields.get("profile", "").split("/") if p),
+        "waived": sorted(w for w in waived.split(",") if w),
+        "binding": fields.get("binding"),
+    }
 
 
 def write_json(path: Path, payload: object) -> Path:
@@ -155,10 +246,14 @@ def system_records(tmp: Path, name: str, *,
                    include_claim: bool = True) -> Path:
     """A records file for the SYSTEM_MANIFEST obligations, varying the
     dependency results and the system claim's execution cohort."""
-    records = [record("B1", result=b1),
-               record("W1", result=w1, evidence_class="test-witnessed")]
+    manifest_hash = hashlib.sha256(
+        (tmp / SYSTEM_MANIFEST_NAME).read_bytes()).hexdigest()
+    records = [record("B1", result=b1, manifest_hash=manifest_hash),
+               record("W1", result=w1, evidence_class="test-witnessed",
+                      manifest_hash=manifest_hash)]
     if include_claim:
-        records.append(record("SC1", result=claim_result, executions=cohort))
+        records.append(record("SC1", result=claim_result, executions=cohort,
+                              manifest_hash=manifest_hash))
     return write_json(tmp / f"{name}.json", records)
 
 
@@ -211,8 +306,12 @@ def main() -> int:
     code, d2, err2 = run_json(records, "--require", "B1,W1")
     check("all-PASS subset (B1,W1): exit 0", code == 0)
     check("all-PASS subset: verdict is scoped VERIFIED[...]",
-          d2.get("verdict", "").startswith("VERIFIED[")
-          and d2.get("verdict") == "VERIFIED[profile=bounded] (waived: W1)")
+          d2.get("verdict") == "VERIFIED[profile=bounded; binding=not-recomputed]"
+          " (waived: W1)", f"verdict={d2.get('verdict')}")
+    check("all-PASS subset: verdict discloses that no binding was recomputed",
+          verdict_parts(d2.get("verdict", ""))["binding"] == "not-recomputed")
+    check("all-PASS subset: payload echoes the same binding mode",
+          d2.get("binding") == "not-recomputed")
     check("all-PASS subset: verdict is never bare VERIFIED",
           not BARE_VERIFIED.search(d2.get("verdict", "")))
 
@@ -300,40 +399,66 @@ def main() -> int:
           d_man.get("required_claims") == ["B1", "B2", "B3", "B4", "W1", "S1"])
 
     # ── (g) no drift from the semantic gate ─────────────────────────────
-    # The dashboard mirrors check_evidence_records.py's validator and G2
-    # verdict logic. Run both on identical inputs and require the verdicts
-    # to agree, so a future change to the gate that isn't mirrored here
-    # fails loudly instead of drifting silently.
-    gate = REPO / "scripts" / "check_evidence_records.py"
+    # The dashboard imports check_evidence_records.py's schema and mirrors its
+    # G2 verdict logic. Run both on identical inputs and require the verdicts
+    # to agree on kind, profile and waivers, so a gate change that is not
+    # mirrored here fails loudly instead of drifting silently. `binding` is
+    # the one field that must differ: Gate B recomputes the snapshot, is
+    # pinned to one, or is told to skip it, while the dashboard never
+    # recomputes anything and says so.
+    # The shared fixture records predate the obligation-manifest binding and
+    # carry a placeholder hash. Both tools now derive that expectation from the
+    # manifest bytes they are handed and neither side of this comparison is told
+    # what to expect, so the manifest-derived case runs on a copy rebound to the
+    # manifest itself: otherwise the case would measure the staleness rule
+    # instead of the verdict logic it exists to compare.
+    with tempfile.TemporaryDirectory() as raw_rebound:
+        rebound = Path(raw_rebound) / "records.json"
+        rebound_records = json.loads(records.read_text())
+        for rec in rebound_records:
+            rec["bindings"]["obligation_manifest_hash"] = hashlib.sha256(
+                manifest.read_bytes()).hexdigest()
+        write_json(rebound, rebound_records)
 
-    def gate_verdict(*extra: str) -> str:
-        gate_extra = [*extra]
-        if "--manifest" in gate_extra:
-            gate_extra += ["--expect-manifest", "2" * 64]
-        proc = subprocess.run(
-            ["uv", "run", "--script", str(gate), "--records", str(records),
-             "--allow-unbound", *gate_extra, "--json"],
-            capture_output=True, text=True, timeout=60)
-        try:
-            return json.loads(proc.stdout)["verdict"]
-        except (json.JSONDecodeError, KeyError):
-            return f"<gate-error rc={proc.returncode}>"
+        def gate_run(source: Path, *extra: str) -> tuple[int, str]:
+            proc = subprocess.run(
+                ["uv", "run", "--script", str(GATE), "--records", str(source),
+                 "--allow-unbound", *extra, "--json"],
+                capture_output=True, text=True, timeout=60)
+            try:
+                return proc.returncode, json.loads(proc.stdout)["verdict"]
+            except (json.JSONDecodeError, KeyError):
+                return proc.returncode, f"<gate-error rc={proc.returncode}>"
 
-    for label, extra in (("mixed", ["--require", ALL_CLAIMS]),
-                         ("all-PASS", ["--require", "B1,W1"]),
-                         ("FAIL-only", ["--require", "B2"]),
-                         ("missing-only", ["--require", "B4"]),
-                         ("via-manifest", ["--manifest", str(manifest)])):
-        _, dj, _ = run_json(records, *extra)
-        gv = gate_verdict(*extra)
-        check(f"no drift vs semantic gate ({label})",
-              dj.get("verdict") == gv,
-              f"dashboard={dj.get('verdict')} gate={gv}")
+        for label, source, extra in (
+            ("mixed", records, ["--require", ALL_CLAIMS]),
+            ("all-PASS", records, ["--require", "B1,W1"]),
+            ("FAIL-only", records, ["--require", "B2"]),
+            ("missing-only", records, ["--require", "B4"]),
+            ("via-manifest", rebound, ["--manifest", str(manifest)]),
+        ):
+            dash_code, dj, _ = run_json(source, *extra)
+            gate_code, gv = gate_run(source, *extra)
+            dash_parts = verdict_parts(dj.get("verdict", ""))
+            gate_parts = verdict_parts(gv)
+            comparable = {key: value for key, value in dash_parts.items()
+                          if key != "binding"}
+            check(f"no drift vs semantic gate ({label})",
+                  dash_code == gate_code
+                  and comparable == {key: value for key, value in gate_parts.items()
+                                     if key != "binding"},
+                  f"dashboard={dj.get('verdict')} rc={dash_code} "
+                  f"gate={gv} rc={gate_code}")
+            if dash_parts["kind"] == "VERIFIED":
+                check(f"both tools disclose their binding mode ({label})",
+                      dash_parts["binding"] == "not-recomputed"
+                      and gate_parts["binding"] == "unbound",
+                      f"dashboard={dash_parts['binding']} gate={gate_parts['binding']}")
 
     # ── (h) system claims are reported, and only pass on a full cohort ──
     with tempfile.TemporaryDirectory() as raw_tmp:
         tmp = Path(raw_tmp)
-        sys_manifest = write_json(tmp / "obligations-system.json", SYSTEM_MANIFEST)
+        sys_manifest = write_json(tmp / SYSTEM_MANIFEST_NAME, SYSTEM_MANIFEST)
         full_cohort = [execution("quint", "PASS"), execution("kani", "PASS")]
 
         # fully covered: every required_evidence tool PASSed, both
@@ -457,20 +582,36 @@ def main() -> int:
         check("FAILing dependency named on the system claim row",
               row(d_df, "SC1")["dependency_gaps"] == ["B1"])
 
-        # --require subset: dependencies outside the required set are
-        # reported as not evaluated, never counted as covered or as gaps.
+        # --require naming a system claim pulls its depends_on into the
+        # required set, exactly as Gate B does: a composition judged without
+        # its parts would report them covered by omission.
         code, d_sub, _ = run_json(dep_incomplete, "--manifest", str(sys_manifest),
                                   "--require", "SC1")
         sub_row = row(d_sub, "SC1")
         check("--require subset keeps the manifest's cohort requirement",
               sub_row["required_evidence"] == ["quint", "kani"]
               and sub_row["evidence_gaps"] == [])
-        check("dependency outside the required set is reported unevaluated",
-              sub_row["dependencies_not_evaluated"] == ["B1", "W1"]
-              and sub_row["dependency_gaps"] == [])
-        check("--require subset of a covered system claim -> exit 0",
-              code == 0 and d_sub.get("verdict", "").startswith("VERIFIED["),
+        check("--require SC1 expands depends_on into the required set",
+              d_sub.get("dependency_expansion") == {"SC1": ["B1", "W1"]}
+              and d_sub.get("required_claims") == ["SC1", "B1", "W1"],
+              f"expansion={d_sub.get('dependency_expansion')} "
+              f"required={d_sub.get('required_claims')}")
+        check("expanded dependency is judged, so its INCOMPLETE record is a gap",
+              sub_row["dependency_gaps"] == ["W1"]
+              and sub_row["dependencies_not_evaluated"] == [],
+              f"gaps={sub_row['dependency_gaps']} "
+              f"unevaluated={sub_row['dependencies_not_evaluated']}")
+        check("--require subset with an uncovered dependency -> exit 3",
+              code == 3 and d_sub.get("verdict") == "INCOMPLETE",
               f"rc={code} verdict={d_sub.get('verdict')}")
+
+        # The same subset over a fully covered set still passes, so the rule
+        # above is the dependency's state, not the expansion itself.
+        code, d_sub_ok, _ = run_json(covered, "--manifest", str(sys_manifest),
+                                     "--require", "SC1")
+        check("--require subset of a fully covered system claim -> exit 0",
+              code == 0 and d_sub_ok.get("verdict", "").startswith("VERIFIED["),
+              f"rc={code} verdict={d_sub_ok.get('verdict')}")
 
         # a system claim with no record is a missing-record gap, not an
         # omitted row.
@@ -522,6 +663,494 @@ def main() -> int:
                             ("no cohort", no_cohort)):
             code, _, err_chk = run(path, "--manifest", str(sys_manifest), "--check")
             check(f"--check clean on system-claim fixture ({label})",
+                  code == 0 and "CHECK: clean" in err_chk)
+
+    # ── (i) cross-gate parity on repository-shaped v3 evidence ──────────
+    # (g) compares verdicts on the shared v2 fixture set. This section builds
+    # a real evidence tree — obligation manifest, v3 records, raw artifacts
+    # whose digests match — so Gate B can run every check it has, then mutates
+    # one thing at a time. The property under test is directional: whatever
+    # else the two tools report, the dashboard may exit 0 only where Gate B
+    # does. Anything weaker lets a coverage view bless evidence its own gate
+    # rejects.
+    with tempfile.TemporaryDirectory() as raw_root:
+        root = Path(raw_root)
+        (root / ".fv").mkdir()
+        parity_manifest = write_json(root / ".fv" / "obligations.json", {
+            "version": 1,
+            "invariants": [{"id": "A1", "name": "inv_a1"}],
+            "witnesses": [{"id": "W1", "name": "wit_w1"}],
+            "system_claims": [{"id": "SC1", "name": "claim_sc1",
+                               "depends_on": ["A1", "W1"],
+                               "required_evidence": ["quint", "kani"]}],
+        })
+        manifest_hash = hashlib.sha256(parity_manifest.read_bytes()).hexdigest()
+        # One artifact body that satisfies every evidence class's PASS marker,
+        # so a case varies the class without also varying whether the log
+        # matches it. Exactly one canonical trailer, last line.
+        artifact_body = ("No violation found\n[ok]\ntest result: ok.\n"
+                         "VERIFICATION:- SUCCESSFUL\nCONFORMANCE: PASS\n"
+                         "--- fv-evidence: exit=0 ---\n")
+        artifact_hash = hashlib.sha256(artifact_body.encode()).hexdigest()
+
+        def parity_execution(claim: str, tool: str, *, result: str = "PASS",
+                             evidence_class: str = "bounded-checked") -> dict:
+            # Producer artifact naming: Gate B requires
+            # .fv/evidence/raw/<claim_id>-<run_id>.log under the
+            # producer-trusted-execution profile, so the fixture is the shape
+            # a real run writes rather than a plausible-looking stand-in.
+            run_id = f"parity-{claim}-{tool}"
+            relative = f".fv/evidence/raw/{claim}-{run_id}.log"
+            artifact = root / relative
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text(artifact_body)
+            return {
+                "tool": tool,
+                "evidence_class": evidence_class,
+                "command": [tool, "verify", claim],
+                "cwd": ".",
+                "toolchain_digests": {"executable": f"/usr/bin/{tool}",
+                                      "sha256": "7" * 64, "version": "1.0.0",
+                                      "version_exit_code": 0},
+                "raw_output_path": relative,
+                "raw_output_hash": artifact_hash,
+                "result": result,
+                "run_id": run_id,
+            }
+
+        def parity_record(claim: str, executions: list[dict], *,
+                          evidence_class: str, waiver: object = None) -> dict:
+            primary = executions[0]
+            return {
+                "claim_id": claim,
+                "required": True,
+                "evidence_class": evidence_class,
+                "result": "PASS",
+                "scope": f"parity scope for {claim}",
+                "bindings": {
+                    "source_snapshot": "sha256:" + "a" * 64,
+                    "intent_path": ".fv/intent.md",
+                    "intent_hash": "1" * 64,
+                    "obligation_manifest_hash": manifest_hash,
+                    "profile": "producer-trusted-execution",
+                    "required_targets": ["A1", "W1", "SC1"],
+                    "environment_policy": "omp-extension-tool",
+                    "toolchain_digests": primary["toolchain_digests"],
+                    "command": json.dumps(primary["command"]),
+                    "configuration": {"cwd": primary["cwd"]},
+                    "seeds": None,
+                    "raw_output_hash": primary["raw_output_hash"],
+                    "raw_output_path": primary["raw_output_path"],
+                    "executions": executions,
+                    "parser_schema_version": "fv-evidence-run/v3",
+                    "run_id": f"parity-{claim}",
+                },
+                "waiver": waiver,
+            }
+
+        def parity_set() -> dict[str, dict]:
+            """The covering evidence set: one record per obligation, each with
+            a cohort Gate B accepts end to end."""
+            return {
+                "A1": parity_record(
+                    "A1", [parity_execution("A1", "kani")],
+                    evidence_class="bounded-checked"),
+                "W1": parity_record(
+                    "W1", [parity_execution("W1", "cargo-test",
+                                            evidence_class="test-witnessed")],
+                    evidence_class="test-witnessed"),
+                "SC1": parity_record(
+                    "SC1", [parity_execution("SC1", "quint"),
+                            parity_execution("SC1", "kani")],
+                    evidence_class="bounded-checked"),
+            }
+
+        def run_parity(name: str, by_claim: dict[str, dict]) -> tuple:
+            """Both tools over one records directory. Returns
+            (dashboard rc, dashboard payload, gate rc, gate verdict, gate report)."""
+            directory = root / "sets" / name
+            directory.mkdir(parents=True, exist_ok=True)
+            for index, rec in enumerate(by_claim.values()):
+                write_json(directory / f"{index}-{rec['claim_id']}.json", rec)
+            dash_code, payload, _ = run_json(directory, "--manifest",
+                                             str(parity_manifest))
+            proc = subprocess.run(
+                ["uv", "run", "--script", str(GATE), "--records", str(directory),
+                 "--root", str(root), "--manifest", str(parity_manifest),
+                 "--allow-unbound", "--json"],
+                capture_output=True, text=True, timeout=60)
+            try:
+                gate_report = json.loads(proc.stdout)
+                gate_verdict_text = gate_report["verdict"]
+            except (json.JSONDecodeError, KeyError):
+                gate_report = {}
+                gate_verdict_text = f"<gate-error rc={proc.returncode}>"
+            return dash_code, payload, proc.returncode, gate_verdict_text, gate_report
+
+        def gate_defects(report: dict, claim: str) -> list[str]:
+            """Gate B's defect list for one claim, or []."""
+            for entry in report.get("per_claim", []):
+                if entry.get("claim_id") == claim:
+                    return entry.get("defects") or []
+            return []
+
+        def unverified_execution(by_claim: dict[str, dict]) -> dict:
+            """A1's cohort re-declared at a weaker class than the record's."""
+            by_claim["A1"] = parity_record(
+                "A1", [parity_execution("A1", "kani",
+                                        evidence_class="unverified")],
+                evidence_class="code-enforced")
+            return by_claim
+
+        def witness_class_under_invariant(by_claim: dict[str, dict]) -> dict:
+            by_claim["A1"] = parity_record(
+                "A1", [parity_execution("A1", "kani",
+                                        evidence_class="test-witnessed")],
+                evidence_class="bounded-checked")
+            return by_claim
+
+        def no_cohort(by_claim: dict[str, dict]) -> dict:
+            del by_claim["SC1"]["bindings"]["executions"]
+            return by_claim
+
+        def unreadable_cohort_entry(by_claim: dict[str, dict]) -> dict:
+            stray = parity_execution("SC1", "verus")
+            stray["tool"] = 123
+            by_claim["SC1"]["bindings"]["executions"].append(stray)
+            return by_claim
+
+        def failing_execution(by_claim: dict[str, dict]) -> dict:
+            by_claim["SC1"]["bindings"]["executions"].append(
+                parity_execution("SC1", "verus", result="FAIL"))
+            return by_claim
+
+        def bare_true_waiver(by_claim: dict[str, dict]) -> dict:
+            by_claim["W1"] = parity_record(
+                "W1", [parity_execution("W1", "gnark",
+                                        evidence_class="externally-assumed")],
+                evidence_class="externally-assumed", waiver=True)
+            return by_claim
+
+        def shared_artifact(by_claim: dict[str, dict]) -> dict:
+            """A1 cites the artifact W1 already earned.
+
+            W1's own row is the pure witness of the rule: its record is untouched
+            and its only defect is that a second claim now cites its log."""
+            borrowed = by_claim["W1"]["bindings"]["executions"][0]
+            by_claim["A1"]["bindings"]["executions"][0].update(
+                raw_output_path=borrowed["raw_output_path"],
+                raw_output_hash=borrowed["raw_output_hash"])
+            by_claim["A1"]["bindings"].update(
+                raw_output_path=borrowed["raw_output_path"],
+                raw_output_hash=borrowed["raw_output_hash"])
+            return by_claim
+
+        def dirty_pass(by_claim: dict[str, dict]) -> dict:
+            """The producer's own marker for a tree that moved under the run."""
+            bindings = by_claim["A1"]["bindings"]
+            bindings["source_snapshot"] = bindings["source_snapshot"] + "+dirty"
+            return by_claim
+
+        def non_producer_profile(by_claim: dict[str, dict]) -> dict:
+            """A cohort record claiming a profile the producer never writes: it
+            would keep the cohort schema while opting out of the producer rules
+            keyed off the profile."""
+            by_claim["A1"]["bindings"]["profile"] = "bounded"
+            return by_claim
+
+        def required_targets_short(by_claim: dict[str, dict]) -> dict:
+            by_claim["A1"]["bindings"]["required_targets"] = ["A1", "SC1"]
+            return by_claim
+
+        def required_targets_extra(by_claim: dict[str, dict]) -> dict:
+            by_claim["A1"]["bindings"]["required_targets"] = ["A1", "W1", "SC1",
+                                                              "Z9"]
+            return by_claim
+
+        def foreign_manifest(by_claim: dict[str, dict]) -> dict:
+            """A1's evidence bound to some other obligation manifest.
+
+            The expectation is the hash of the manifest both tools were handed,
+            so it is derivable with no repository access — and must be derived
+            on both sides, or a coverage view reports evidence earned against a
+            different obligation set as coverage of this one."""
+            by_claim["A1"]["bindings"]["obligation_manifest_hash"] = "0" * 64
+            return by_claim
+
+        def unreadable_intent_path(by_claim: dict[str, dict]) -> dict:
+            """The canonical target as an object rather than a path.
+
+            Containment needs the repository root, but "is it a string at all"
+            is record text, so the shape half belongs to both tools."""
+            by_claim["A1"]["bindings"]["intent_path"] = {"path": ".fv/intent.md"}
+            return by_claim
+
+        def bare_id_waiver(by_claim: dict[str, dict]) -> dict:
+            """A waiver carrying an id and nothing else: it names no approver
+            and no scope, so it authorizes nobody to assume anything."""
+            by_claim["W1"] = parity_record(
+                "W1", [parity_execution("W1", "gnark",
+                                        evidence_class="externally-assumed")],
+                evidence_class="externally-assumed", waiver={"id": "WV-9"})
+            return by_claim
+
+        def named_waiver(by_claim: dict[str, dict]) -> dict:
+            by_claim["W1"] = parity_record(
+                "W1", [parity_execution("W1", "gnark",
+                                        evidence_class="externally-assumed")],
+                evidence_class="externally-assumed",
+                waiver={"id": "WV-9", "approver": "reviewer",
+                        "scope": "upstream gnark acceptance"})
+            return by_claim
+
+        baseline_code, baseline, gate_baseline_code, gate_baseline, _ = run_parity(
+            "baseline", parity_set())
+        check("parity baseline: covering v3 evidence -> dashboard exit 0",
+              baseline_code == 0, f"rc={baseline_code} "
+              f"verdict={baseline.get('verdict')}")
+        check("parity baseline: covering v3 evidence -> Gate B exit 0",
+              gate_baseline_code == 0, f"rc={gate_baseline_code} "
+              f"verdict={gate_baseline}")
+        base_parts = verdict_parts(baseline.get("verdict", ""))
+        gate_base_parts = verdict_parts(gate_baseline)
+        check("parity baseline: same verdict kind, profile and waivers",
+              {k: v for k, v in base_parts.items() if k != "binding"}
+              == {k: v for k, v in gate_base_parts.items() if k != "binding"},
+              f"dashboard={baseline.get('verdict')} gate={gate_baseline}")
+        check("parity baseline: binding modes are distinct and both disclosed",
+              base_parts["binding"] == "not-recomputed"
+              and gate_base_parts["binding"] == "unbound",
+              f"dashboard={base_parts['binding']} gate={gate_base_parts['binding']}")
+
+        # (label, mutation, claim whose row carries it, that row's dashboard
+        # status, defect fragment both tools must name). A fragment is given
+        # wherever the defect is a record-level rule both tools own, so the case
+        # proves the shared rule rather than a coincidence of exit codes.
+        for label, mutate, claim, expected_status, fragment in (
+            ("v3 record with no cohort", no_cohort, "SC1", "invalid", None),
+            ("unreadable cohort tool id", unreadable_cohort_entry, "SC1",
+             "invalid", None),
+            ("FAILing execution beneath a PASS record", failing_execution,
+             "SC1", "evidence-gap", None),
+            ("unverified execution under a code-enforced record",
+             unverified_execution, "A1", "unwaived-assumption", None),
+            ("witness-class execution under an invariant",
+             witness_class_under_invariant, "A1", "invalid", None),
+            ("bare true waiver on assumed evidence", bare_true_waiver, "W1",
+             "invalid", "waiver is not an object"),
+            # One artifact, two claims: W1's record is untouched, so its row is
+            # the rule itself rather than a side effect of A1's mutation.
+            ("cross-claim artifact reuse", shared_artifact, "W1", "invalid",
+             "evidence cannot be shared between claims"),
+            ("+dirty PASS record", dirty_pass, "A1", "invalid",
+             "PASS record bound to a dirty snapshot"),
+            ("cohort record with a non-producer profile", non_producer_profile,
+             "A1", "invalid", "not the producer profile"),
+            ("required_targets omitting a declared obligation",
+             required_targets_short, "A1", "invalid", "missing ['W1']"),
+            ("required_targets naming an undeclared obligation",
+             required_targets_extra, "A1", "invalid", "unexpected ['Z9']"),
+            ("record bound to another obligation manifest", foreign_manifest,
+             "A1", "invalid", "bound to obligation manifest"),
+            ("intent_path that is not a path", unreadable_intent_path, "A1",
+             "invalid", "binding field 'intent_path' is not a nonempty string"),
+            ("waiver naming an id and nothing else", bare_id_waiver, "W1",
+             "invalid", "waiver is not attributable"),
+        ):
+            dash_code, payload, gate_code, gate_text, gate_json = run_parity(
+                label.replace(" ", "-"), mutate(parity_set()))
+            check(f"parity ({label}): dashboard reports INCOMPLETE, not coverage",
+                  dash_code == 3 and payload.get("verdict") == "INCOMPLETE",
+                  f"rc={dash_code} verdict={payload.get('verdict')}")
+            check(f"parity ({label}): the row names the defect on {claim}",
+                  row(payload, claim)["status"] == expected_status,
+                  f"status={row(payload, claim)['status']}")
+            check(f"parity ({label}): Gate B rejects the same evidence",
+                  gate_code == 3, f"rc={gate_code} verdict={gate_text}")
+            check(f"parity ({label}): dashboard never passes where Gate B does not",
+                  not (dash_code == 0 and gate_code != 0),
+                  f"dashboard rc={dash_code} gate rc={gate_code}")
+            if fragment is None:
+                continue
+            dash_defects = row(payload, claim).get("defects") or []
+            gate_list = gate_defects(gate_json, claim)
+            check(f"parity ({label}): both tools report the same defect text",
+                  any(fragment in defect for defect in dash_defects)
+                  and sorted(dash_defects) == sorted(gate_list),
+                  f"dashboard={dash_defects} gate={gate_list}")
+
+        # The cohort-schema rules and artifact identity are v3's. A pre-cohort
+        # record predates all of them and only validates under an explicit
+        # freshness escape hatch, so both tools keep the legacy tolerance: its own
+        # profile, its own target list, and one log cited by several claims. The
+        # dashboard must not be stricter than the gate either.
+        legacy_artifact = ".fv/evidence/raw/legacy-shared.log"
+        (root / legacy_artifact).write_text(artifact_body)
+        legacy_dir = root / "sets" / "v2-legacy"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        for claim, klass in (("A1", "bounded-checked"), ("W1", "test-witnessed")):
+            legacy = parity_record(claim, [parity_execution(claim, "quint")],
+                                   evidence_class=klass)
+            bindings = legacy["bindings"]
+            del bindings["executions"]
+            bindings.update(parser_schema_version="fv-evidence-run/v2",
+                            profile="legacy-bounded",
+                            required_targets=["Z9"],
+                            command="quint verify",
+                            configuration={"max_steps": 10},
+                            raw_output_path=legacy_artifact,
+                            raw_output_hash=artifact_hash)
+            write_json(legacy_dir / f"{claim}.json", legacy)
+        v2_code, v2_payload, _ = run_json(legacy_dir, "--manifest",
+                                          str(parity_manifest),
+                                          "--require", "A1,W1")
+        v2_gate = subprocess.run(
+            ["uv", "run", "--script", str(GATE), "--records", str(legacy_dir),
+             "--root", str(root), "--manifest", str(parity_manifest),
+             "--require", "A1,W1", "--allow-unbound", "--json"],
+            capture_output=True, text=True, timeout=60)
+        check("parity (v2 carve-out): both tools accept a pre-cohort record with "
+              "its own profile, its own required_targets, and a shared artifact",
+              v2_code == 0 and v2_gate.returncode == 0,
+              f"dashboard rc={v2_code} verdict={v2_payload.get('verdict')} "
+              f"gate rc={v2_gate.returncode} {v2_gate.stdout[-200:]}")
+        check("parity (v2 carve-out): both name the record's own profile",
+              verdict_parts(v2_payload.get("verdict", ""))["profiles"]
+              == ["legacy-bounded"]
+              and verdict_parts(json.loads(v2_gate.stdout or "{}")
+                                .get("verdict", ""))["profiles"]
+              == ["legacy-bounded"],
+              f"dashboard={v2_payload.get('verdict')} gate={v2_gate.stdout[-200:]}")
+
+        # The documented limit of --require on its own, asserted symmetric: with
+        # no manifest there is no declared obligation set, so neither the
+        # obligation-manifest binding nor required_targets binds in either tool.
+        # Naming the manifest is what turns the same records into a rejection on
+        # both sides, which is what keeps this a boundary and not a divergence.
+        loose_dir = root / "sets" / "require-only"
+        loose_dir.mkdir(parents=True, exist_ok=True)
+        for index, rec in enumerate(foreign_manifest(parity_set()).values()):
+            write_json(loose_dir / f"{index}-{rec['claim_id']}.json", rec)
+
+        def loose_pair(*extra: str) -> tuple[int, int]:
+            dash_rc, _, _ = run_json(loose_dir, *extra)
+            gate = subprocess.run(
+                ["uv", "run", "--script", str(GATE), "--records", str(loose_dir),
+                 "--root", str(root), "--allow-unbound", "--json", *extra],
+                capture_output=True, text=True, timeout=60)
+            return dash_rc, gate.returncode
+
+        loose_code, loose_gate_code = loose_pair("--require", "A1,W1,SC1")
+        check("parity (--require without --manifest): manifest freshness binds in "
+              "neither tool",
+              loose_code == 0 and loose_gate_code == 0,
+              f"dashboard rc={loose_code} gate rc={loose_gate_code}")
+        pinned_code, pinned_gate_code = loose_pair("--manifest",
+                                                   str(parity_manifest))
+        check("parity (--manifest named): the same records are stale in both tools",
+              pinned_code == 3 and pinned_gate_code == 3,
+              f"dashboard rc={pinned_code} gate rc={pinned_gate_code}")
+
+        # The same assumed-class evidence with a real waiver passes both, so
+        # the rule above is the waiver's absence, not the class alone.
+        waived_code, waived, gate_waived_code, gate_waived, _ = run_parity(
+            "named-waiver", named_waiver(parity_set()))
+        check("parity (named waiver): assumed evidence PASSes both tools",
+              waived_code == 0 and gate_waived_code == 0,
+              f"dashboard rc={waived_code} gate rc={gate_waived_code} "
+              f"gate verdict={gate_waived}")
+        check("parity (named waiver): both name W1 as waived",
+              verdict_parts(waived.get("verdict", ""))["waived"] == ["W1"]
+              and verdict_parts(gate_waived)["waived"] == ["W1"],
+              f"dashboard={waived.get('verdict')} gate={gate_waived}")
+
+        # --require naming only the system claim: both tools expand depends_on
+        # into the required set, so a missing invariant record cannot hide
+        # behind the composition that rests on it.
+        partial_set = parity_set()
+        del partial_set["A1"]
+        subset_dir = root / "sets" / "require-subset"
+        subset_dir.mkdir(parents=True, exist_ok=True)
+        for index, rec in enumerate(partial_set.values()):
+            write_json(subset_dir / f"{index}-{rec['claim_id']}.json", rec)
+        sub_code, sub_payload, _ = run_json(subset_dir, "--manifest",
+                                            str(parity_manifest), "--require", "SC1")
+        sub_gate = subprocess.run(
+            ["uv", "run", "--script", str(GATE), "--records", str(subset_dir),
+             "--root", str(root), "--manifest", str(parity_manifest),
+             "--require", "SC1", "--allow-unbound", "--json"],
+            capture_output=True, text=True, timeout=60)
+        sub_gate_report = json.loads(sub_gate.stdout) if sub_gate.stdout else {}
+        check("parity (--require system claim): same dependency expansion",
+              sub_payload.get("dependency_expansion")
+              == sub_gate_report.get("dependency_expansion")
+              == {"SC1": ["A1", "W1"]},
+              f"dashboard={sub_payload.get('dependency_expansion')} "
+              f"gate={sub_gate_report.get('dependency_expansion')}")
+        check("parity (--require system claim): missing dependency record is a "
+              "gap in both tools",
+              sub_code == 3 and sub_gate.returncode == 3
+              and row(sub_payload, "A1")["status"] == "missing-record",
+              f"dashboard rc={sub_code} gate rc={sub_gate.returncode}")
+
+        # Two records for one claim: Gate B refuses to choose between them.
+        duplicated = parity_set()
+        duplicate_dir = root / "sets" / "duplicate"
+        duplicate_dir.mkdir(parents=True, exist_ok=True)
+        for index, rec in enumerate(duplicated.values()):
+            write_json(duplicate_dir / f"{index}-{rec['claim_id']}.json", rec)
+        second = parity_record("A1", [parity_execution("A1", "quint")],
+                               evidence_class="bounded-checked")
+        write_json(duplicate_dir / "9-A1-again.json", second)
+        dup_code, dup_payload, _ = run_json(duplicate_dir, "--manifest",
+                                            str(parity_manifest))
+        dup_gate = subprocess.run(
+            ["uv", "run", "--script", str(GATE), "--records", str(duplicate_dir),
+             "--root", str(root), "--manifest", str(parity_manifest),
+             "--allow-unbound", "--json"],
+            capture_output=True, text=True, timeout=60)
+        check("parity (duplicate records): dashboard reports duplicate-record",
+              dup_code == 3 and row(dup_payload, "A1")["status"] == "duplicate-record",
+              f"rc={dup_code} status={row(dup_payload, 'A1')['status']}")
+        check("parity (duplicate records): Gate B is INCOMPLETE too",
+              dup_gate.returncode == 3, f"rc={dup_gate.returncode}")
+
+        # Manifest grammar, not record content: an obligation ID the evidence
+        # producer could never write a record for makes the manifest unusable.
+        # Gate B calls that an ERROR, so a view that rendered it as a required
+        # set with missing-record rows would report a weaker failure than the
+        # gate for the same input — the same drift, one layer up.
+        baseline_dir = root / "sets" / "baseline"
+        for label, claim_id in (("outside the producer's claim_id grammar",
+                                 "verus:contract::Machine"),
+                                ("outside the obligation id grammar", "A 1")):
+            unusable = write_json(root / ".fv" / "obligations-unusable.json", {
+                "version": 1,
+                "invariants": [{"id": claim_id, "name": "inv_bad"}],
+                "witnesses": [{"id": "W1", "name": "wit_w1"}],
+            })
+            bad_code, bad_out, bad_err = run(baseline_dir, "--manifest",
+                                             str(unusable))
+            bad_gate = subprocess.run(
+                ["uv", "run", "--script", str(GATE), "--records",
+                 str(baseline_dir), "--root", str(root), "--manifest",
+                 str(unusable), "--allow-unbound"],
+                capture_output=True, text=True, timeout=60)
+            check(f"parity (manifest id {label}): both tools exit 2 ERROR",
+                  bad_code == 2 and bad_gate.returncode == 2 and bad_out == "",
+                  f"dashboard rc={bad_code} gate rc={bad_gate.returncode}")
+            check(f"parity (manifest id {label}): both name the same reason",
+                  "malformed obligation manifest: invariants[0]" in bad_err
+                  and "malformed obligation manifest: invariants[0]"
+                  in bad_gate.stdout,
+                  f"dashboard={bad_err.strip()[:120]} "
+                  f"gate={bad_gate.stdout.strip()[:120]}")
+
+        for label, path in (("baseline", root / "sets" / "baseline"),
+                            ("duplicate records", duplicate_dir)):
+            code, _, err_chk = run(path, "--manifest", str(parity_manifest),
+                                   "--check")
+            check(f"--check clean on parity fixture ({label})",
                   code == 0 and "CHECK: clean" in err_chk)
 
     print()

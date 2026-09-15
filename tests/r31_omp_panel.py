@@ -652,7 +652,8 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
 
     def full_record(**over):
         bindings = {k: "x" for k in cer.BINDING_FIELDS}
-        bindings.update(source_snapshot="HEAD1+sha256:abc", intent_hash="sha256:intentAAA", seeds=None)
+        bindings.update(source_snapshot="HEAD1+sha256:abc", intent_hash="sha256:intentAAA",
+                        seeds=None, required_targets=["A1"])
         if "bindings" in over:
             bindings = over.pop("bindings")
         rec = {"claim_id": "A1", "required": True, "evidence_class": "test-witnessed",
@@ -664,18 +665,20 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
     check("Gate B rejects intent-hash drift (task/AC redefined)",
           cer.validate_record(full_record(), "HEAD1", "sha256:other") != [])
     nonstr = {k: "x" for k in cer.BINDING_FIELDS}
-    nonstr.update(source_snapshot=123, intent_hash="sha256:intentAAA", seeds=None)
+    nonstr.update(source_snapshot=123, intent_hash="sha256:intentAAA", seeds=None,
+                  required_targets=["A1"])
     check("Gate B rejects non-string source_snapshot under --expect-snapshot",
           cer.validate_record(full_record(bindings=nonstr), "HEAD1", None) != [])
     clean = {k: "x" for k in cer.BINDING_FIELDS}
-    clean.update(source_snapshot="HEAD1", intent_hash="sha256:intentAAA", seeds=None)
+    clean.update(source_snapshot="HEAD1", intent_hash="sha256:intentAAA", seeds=None,
+                 required_targets=["A1"])
     dirty = {**clean, "source_snapshot": "HEAD1+dirty"}
     check("Gate B exact-snapshot accepts a clean HEAD record",
           cer.validate_record(full_record(bindings=clean), "HEAD1", snapshot_exact=True) == [])
     check("Gate B exact-snapshot rejects a HEAD+dirty record",
           cer.validate_record(full_record(bindings=dirty), "HEAD1", snapshot_exact=True) != [])
-    check("Gate B prefix-snapshot (default) still accepts HEAD+dirty",
-          cer.validate_record(full_record(bindings=dirty), "HEAD1") == [])
+    check("Gate B rejects a PASS record bound to HEAD+dirty under prefix matching too",
+          cer.validate_record(full_record(bindings=dirty), "HEAD1") != [])
     with tempfile.TemporaryDirectory(prefix="r31-dup-") as td:
         recs = Path(td) / "recs.json"
         recs.write_text(json.dumps([full_record(result="FAIL"), full_record(result="PASS")]))
@@ -729,7 +732,7 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
         def rec(result, snap=head, ih=ihash):
             b = {k: "x" for k in cer.BINDING_FIELDS}
             b.update(source_snapshot=snap, intent_hash=ih, seeds=None,
-                     obligation_manifest_hash=manifest_hash,
+                     obligation_manifest_hash=manifest_hash, required_targets=["B1"],
                      raw_output_path=str(raw.relative_to(ge)), raw_output_hash=raw_hash)
             return {"claim_id": "B1", "required": True, "evidence_class": "code-enforced",
                     "result": result, "scope": "limiter", "bindings": b, "waiver": None}

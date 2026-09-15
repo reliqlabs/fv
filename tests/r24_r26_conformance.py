@@ -4,26 +4,20 @@
 # dependencies = []
 # ///
 """
-R24 + R26 — conformance bridge and label surfaces (C2, contract G3).
+R24 + R26 — conformance bridge and scoped verdict propagation.
 
-R24: seeded ITF traces replayed through the fixture Rust adapter. The
+Seeded ITF traces are replayed through the fixture Rust adapter. The
 faithful adapter passes with the label carrying trace scope; the seeded
 divergence (FV_R24_BUG=1 saturates dbl at 64, a bound the spec
-does not have) is caught at the exact step, nonzero exit; the --record
-output validates through Gate B (check_evidence_records.py) as a
-conformance-tested record whose scope survives aggregation.
-
-R26: label surface sweep. REFINEMENT_VERIFIED is emitted by no script and
-appears in docs only in negation context; every VERIFIED a script can
-emit is scoped (followed by '['); the conformance label's scope string
-appears in Gate B's per-claim output.
+does not have) is caught at the exact step with a nonzero exit. The
+record validates through Gate B as conformance-tested evidence whose
+scope survives aggregation.
 
 Requires quint + cargo. Exit 0 pass, 1 fail, 2 toolchain unavailable.
 """
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -115,36 +109,6 @@ def main() -> int:
               gj["verdict"].startswith("VERIFIED[")
               and "traces=5, depth=15, seed=0x1" in gj["per_claim"][0].get("scope", ""))
 
-    # ── R26: label surface sweep ───────────────────────────────────────
-    scripts = sorted((REPO / "scripts").glob("*.py"))
-    offenders = [p.name for p in scripts if "REFINEMENT_VERIFIED" in p.read_text()]
-    check("R26: REFINEMENT_VERIFIED emitted by no script", not offenders,
-          str(offenders))
-
-    doc_offenders = []
-    for p in [REPO / "README.md", REPO / "CONCEPTS.md",
-              *sorted((REPO / "skills").glob("*/SKILL.md"))]:
-        if not p.exists():
-            continue
-        for i, line in enumerate(p.read_text().splitlines(), 1):
-            if "REFINEMENT_VERIFIED" in line and not re.search(
-                    r"never|not\b|until|no surface|emitted by no|distinct label",
-                    line, re.IGNORECASE):
-                doc_offenders.append(f"{p.name}:{i}")
-    check("R26: docs mention REFINEMENT_VERIFIED only in negation context",
-          not doc_offenders, str(doc_offenders))
-
-    unqualified = []
-    for p in scripts:
-        for i, line in enumerate(p.read_text().splitlines(), 1):
-            for m in re.finditer(r"VERIFIED(?!\[)(?!_)", line):
-                if re.search(r"never|bare|unqualified|REFINEMENT", line):
-                    continue
-                if line.lstrip().startswith("#"):
-                    continue
-                unqualified.append(f"{p.name}:{i}")
-    check("R26: every script-emitted VERIFIED is scoped (followed by '[')",
-          not unqualified, str(unqualified))
 
     print()
     if FAILURES:

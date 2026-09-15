@@ -20,16 +20,42 @@ Project-binding half: the dispatch target may be an external doc
 (docs/intent.md) and Gate B binds intent to it rather than to .fv/intent.md;
 the verified-input snapshot is stable across a commit of unchanged content and
 invalidates records when a verified input changes; targets that escape the
-project root (or are missing, a directory, or a symlink) are rejected; evidence,
-verify, panel, and declared exclusion outputs never enter the snapshot; and v2
-records still validate under explicit --expect-snapshot/--allow-unbound.
+project root (or are missing, a directory, a symlink, or ``~``-prefixed) are
+rejected; evidence, verify, panel, quarantined-history, and declared exclusion
+outputs never enter the snapshot; a verified input that is not a regular file is
+classified instead of hanging the hash; an exclusion list carrying a byte-order
+mark, a control character, or a line break the Python and TypeScript parsers
+would read differently is rejected outright while non-ASCII path entries stay
+legal; and v2 records still validate under explicit
+--expect-snapshot/--allow-unbound, which the verdict scope discloses as
+binding=pinned/unbound rather than recomputed.
 
 System-claim half: obligations.json may declare system_claims, which Gate B
 aggregates into the required-claim set with kind system_claim; a claim whose
 depends_on or required_evidence list is empty, duplicated, unknown, or
-malformed makes the whole manifest an ERROR, dependencies name invariants and
-witnesses only (so no dependency cycle between claims is representable), and
-manifests with no system_claims gate exactly as before.
+malformed makes the whole manifest an ERROR, an obligation id the evidence
+producer could never write a record for is an ERROR too, dependencies name
+invariants and witnesses only (so no dependency cycle between claims is
+representable), --require on a system claim also requires what it depends on,
+and manifests with no system_claims gate exactly as before.
+
+Cohort honesty: each execution's evidence class is judged against the obligation
+kind and against the waiver rule, and each PASS artifact belongs to exactly one
+execution of one claim.
+
+Cohort provenance: the cohort schema is the producer's, so a v3 record must
+declare the producer profile and, as required_targets, exactly the obligation set
+the manifest the run is judged against declares - neither read back off the
+record. A v2 record predates both rules and keeps its own profile and its own
+target list, which is what the v2 cases exercise.
+
+Record attribution: the waiver is the only thing that turns an assumed claim into
+a PASS, so it must name a nonempty id, approver and scope - a bare flag, an id
+alone, an arbitrary object, or a blank field is refused, while an attributable
+waiver still passes. A record is judged stale against the obligation manifest the
+run is handed, and the canonical target path it asserts has to be a string before
+anything resolves it. All three are record text, so they bind with or without a
+repository tree.
 
 Exit 0 pass, 1 fail.
 """
@@ -37,6 +63,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -132,6 +159,25 @@ def cohort_for(tools: list[str]) -> list[dict]:
     return specs
 
 
+def manifest_targets(project: Path) -> list[str]:
+    """Every obligation id the project's manifest declares, in Gate B's order.
+
+    The producer asserts the whole declared set as `required_targets`, and both
+    Gate B and the coverage dashboard now diff that assertion against the manifest
+    the run is judged against, so a v3 fixture has to carry the set rather than the
+    one claim it happens to be about.
+    """
+    manifest = json.loads((project / ".fv" / "obligations.json").read_text())
+    ids: list[str] = []
+    for collection in ("invariants", "witnesses", "system_claims"):
+        entries = manifest.get(collection)
+        if not isinstance(entries, list):
+            continue
+        ids.extend(item["id"] for item in entries
+                   if isinstance(item, dict) and isinstance(item.get("id"), str))
+    return ids
+
+
 def write_record(project: Path, snapshot: str, intent_hash: str,
                  schema: str = "fv-evidence-run/v3", claim_id: str = "A1",
                  evidence_class: str = "code-enforced", marker: str = "",
@@ -141,13 +187,20 @@ def write_record(project: Path, snapshot: str, intent_hash: str,
     A cohort spec is {tool, evidence_class?, marker?, command?, cwd?, result?}. Each
     execution gets its own raw artifact, and the record's legacy bindings are derived
     from the first execution exactly as the producer derives them.
+
+    A v3 record is producer-written by definition, so it is written the producer's
+    way throughout: the producer profile, `<claim>-<run_id>.log` artifacts, and the
+    manifest's complete obligation set as `required_targets`. A v2 record predates
+    all three and keeps the legacy shape, which is what the v2 cases exercise.
     """
     raw_dir = project / ".fv" / "evidence" / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     specs = cohort if cohort else [{"tool": "true", "marker": marker, "command": ["true"]}]
     executions: list[dict] = []
+    producer = schema == "fv-evidence-run/v3"
     for index, spec in enumerate(specs):
-        name = f"{claim_id}.log" if len(specs) == 1 else f"{claim_id}-{spec['tool']}.log"
+        run_id = f"r6-{claim_id}-{index}"
+        name = f"{claim_id}-{run_id}.log"
         raw = raw_dir / name
         result = spec.get("result", "PASS")
         line = spec.get("marker", marker)
@@ -168,7 +221,7 @@ def write_record(project: Path, snapshot: str, intent_hash: str,
             "raw_output_path": f".fv/evidence/raw/{name}",
             "raw_output_hash": sha256_file(raw),
             "result": result,
-            "run_id": f"r6-{claim_id}-{index}",
+            "run_id": run_id,
         })
     records = project / ".fv" / "evidence" / "records"
     records.mkdir(parents=True, exist_ok=True)
@@ -178,8 +231,8 @@ def write_record(project: Path, snapshot: str, intent_hash: str,
         "intent_hash": intent_hash,
         "intent_path": "docs/intent.md",
         "obligation_manifest_hash": sha256_file(project / ".fv" / "obligations.json"),
-        "profile": "r6-fixture",
-        "required_targets": [claim_id],
+        "profile": "producer-trusted-execution" if producer else "r6-fixture",
+        "required_targets": manifest_targets(project) if producer else [claim_id],
         "environment_policy": "r6-fixture-local",
         "toolchain_digests": primary["toolchain_digests"],
         "command": json.dumps(primary["command"]),
@@ -191,7 +244,7 @@ def write_record(project: Path, snapshot: str, intent_hash: str,
         "run_id": f"r6-{claim_id}",
     }
     # Only v3 carries the execution cohort; a v2 record is exactly what it always was.
-    if schema == "fv-evidence-run/v3":
+    if producer:
         bindings["executions"] = executions
     record = {
         "claim_id": claim_id,
@@ -238,8 +291,22 @@ def resolver_checks(root: Path, project: Path) -> None:
                         ("absolute path outside root", str(outside)),
                         ("nonexistent file", "docs/nope.md"),
                         ("directory", ".fv"),
-                        ("empty spec", "   ")):
+                        ("empty spec", "   "),
+                        ("home-relative spec", "~/intent.md"),
+                        ("bare tilde", "~"),
+                        ("other user's home", "~someone/intent.md")):
         check(f"resolver rejects target: {label}", rejects(spec, project))
+    # ~ is rejected, never expanded: expanding it here while the producer resolves
+    # it under the project root would bind the two ends to different files.
+    tilde_dir = project / "~"
+    tilde_dir.mkdir()
+    (tilde_dir / "intent.md").write_text("# home-shaped decoy\n")
+    try:
+        check("resolver rejects target: ~ is never expanded, even when <root>/~ exists",
+              rejects("~/intent.md", project))
+    finally:
+        (tilde_dir / "intent.md").unlink()
+        tilde_dir.rmdir()
     link = project / "docs" / "linked-intent.md"
     link.symlink_to(project / "docs" / "intent.md")
     try:
@@ -276,12 +343,22 @@ def snapshot_checks(project: Path) -> str:
           committed == untracked and git_out(project, "rev-parse", "HEAD") != head)
 
     for relative in (".fv/evidence/raw/noise.log", ".fv/verify/report.json",
-                     ".fv/panels/run.json", ".colosseum/intent.md"):
+                     ".fv/panels/run.json", ".fv/history/colosseum/legacy-record.json",
+                     ".colosseum/intent.md"):
         path = project / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("noise\n")
-    check("snapshot: default exclusions keep evidence/verify/panel outputs out",
+    check("snapshot: default exclusions keep evidence/verify/panel/history outputs out",
           fv_project.content_snapshot(project) == committed)
+    # Quarantining legacy history is structural, not a project-file favour: dropping
+    # the entry must visibly change the snapshot, so a project that never declares it
+    # still cannot have its evidence invalidated by one.
+    without_history = tuple(entry for entry in fv_project.DEFAULT_EXCLUSIONS
+                            if entry != ".fv/history/")
+    check("snapshot: .fv/history/ is a structural default exclusion",
+          ".fv/history/" in fv_project.DEFAULT_EXCLUSIONS
+          and fv_project.content_snapshot(project, fv_project.DEFAULT_EXCLUSIONS)
+          != fv_project.content_snapshot(project, without_history))
     (project / "build").mkdir()
     (project / "build" / "out.bin").write_bytes(b"\x00\x01")
     check("snapshot: declared build/ exclusion keeps build output out",
@@ -304,6 +381,64 @@ def snapshot_checks(project: Path) -> str:
         except fv_project.ProjectError:
             rejected = True
         check(f"exclusions reject entry {bad!r}", rejected)
+    # Python splits or strips these; JS's split("\n")/trim() do not. Accepting one
+    # would make the gate and the producer hash different input sets.
+    for label, text in (("lone CR", "logs/\rtmp/\n"),
+                        ("vertical tab", "logs/\x0btmp/\n"),
+                        ("form feed", "logs/\x0ctmp/\n"),
+                        ("file separator", "logs/\x1ctmp/\n"),
+                        ("next line", "logs/\x85tmp/\n"),
+                        ("line separator", "logs/\u2028tmp/\n")):
+        rejected = False
+        try:
+            fv_project.parse_exclusions(text)
+        except fv_project.ProjectError:
+            rejected = True
+        check(f"exclusions reject ambiguous line terminator: {label}", rejected)
+    check("exclusions: CRLF stays legal and parses like LF",
+          fv_project.parse_exclusions("logs/\r\ntmp/\r\n") == ["logs/", "tmp/"])
+    # A byte-order mark survives Python's utf-8 decode and is dropped by a JavaScript
+    # runtime's, so a list carrying one would exclude build/ in the producer and hash
+    # it in the gate, with nothing in either report naming the parse as the cause.
+    for label, text in (("leading BOM", "\ufeffbuild/\n"),
+                        ("BOM on a comment line", "\ufeff# generated\nbuild/\n"),
+                        ("interior BOM", "build/\n\ufefflogs/\n")):
+        message = ""
+        try:
+            fv_project.parse_exclusions(text)
+        except fv_project.ProjectError as error:
+            message = str(error)
+        check(f"exclusions reject a byte-order mark: {label}",
+              "byte-order mark U+FEFF" in message, message)
+    # Every control character that is not a terminator: \x1f is stripped on the Python
+    # side only, \t is invisible inside an entry, \x00 cannot occur in a path at all.
+    for label, text in (("tab inside an entry", "bu\tild/\n"), ("leading tab", "\tbuild/\n"),
+                        ("unit separator", "build/\x1f\n"), ("nul", "build/\x00\n"),
+                        ("delete", "build/\x7f\n"), ("C1 control", "build/\x9f\n")):
+        message = ""
+        try:
+            fv_project.parse_exclusions(text)
+        except fv_project.ProjectError as error:
+            message = str(error)
+        check(f"exclusions reject control character: {label}",
+              "control character" in message, message)
+    # Rejecting the BOM and the controls must not cost legitimate Unicode: a non-ASCII
+    # entry is a normal prefix and excludes the directory it names.
+    unicode_entry = fv_project.parse_exclusions("# unicode paths stay legal\n\u65e5\u672c\u8a9e/\n")
+    unicode_dir = project / "\u65e5\u672c\u8a9e"
+    unicode_dir.mkdir()
+    (unicode_dir / "out.bin").write_bytes(b"\x02\x03")
+    try:
+        check("exclusions: a non-ASCII path entry parses and excludes its directory",
+              unicode_entry == ["\u65e5\u672c\u8a9e/"]
+              and fv_project.is_excluded("\u65e5\u672c\u8a9e/out.bin", unicode_entry)
+              and fv_project.content_snapshot(
+                  project,
+                  [*fv_project.DEFAULT_EXCLUSIONS, "build/", *unicode_entry]) == committed,
+              unicode_entry)
+    finally:
+        (unicode_dir / "out.bin").unlink()
+        unicode_dir.rmdir()
     check("snapshot: component-wise exclusion does not swallow sibling prefixes",
           fv_project.is_excluded("build/out.bin", ["build"])
           and not fv_project.is_excluded("buildout.bin", ["build"]))
@@ -317,6 +452,22 @@ def snapshot_checks(project: Path) -> str:
         rejected = True
     symlinked.unlink()
     check("snapshot: symlinked verified input fails closed", rejected)
+
+    fifo = project / "src" / "extra.rs"
+    original = fifo.read_bytes()
+    fifo.unlink()
+    os.mkfifo(fifo)
+    rejected = ""
+    try:
+        fv_project.content_snapshot(project)
+    except fv_project.ProjectError as error:
+        rejected = str(error)
+    finally:
+        fifo.unlink()
+        fifo.write_bytes(original)
+    # Opening a FIFO blocks until a writer appears: classify it, never hash it.
+    check("snapshot: tracked path replaced by a FIFO is rejected, not opened",
+          "not a regular file" in rejected, rejected)
     return committed
 
 
@@ -338,6 +489,119 @@ def gate_checks(project: Path, snapshot: str) -> None:
           report.get("intent_path") == "docs/intent.md"
           and report.get("expected_snapshot") == snapshot,
           f"{report.get('intent_path')!r} {report.get('expected_snapshot')!r}")
+    # A VERIFIED that recomputed both bindings and one that was handed them, or told
+    # to skip them, are different claims: the scope has to say which one this is.
+    check("Gate B: recomputed freshness is disclosed as binding=recomputed",
+          "VERIFIED[profile=producer-trusted-execution; binding=recomputed]" in result.stderr
+          and report.get("binding") == "recomputed",
+          f"{result.stderr[-200:]} {report.get('binding')!r}")
+
+    result = run_gate("--expect-snapshot", snapshot)
+    check("Gate B: operator-pinned freshness is disclosed as binding=pinned",
+          result.returncode == 0
+          and "VERIFIED[profile=producer-trusted-execution; binding=pinned]" in result.stderr,
+          f"exit={result.returncode} {result.stderr[-200:]}")
+    result = run_gate("--allow-unbound", "--json")
+    report = json.loads(result.stdout) if result.stdout.strip().startswith("{") else {}
+    check("Gate B: skipped freshness is disclosed as binding=unbound, not as a plain VERIFIED",
+          result.returncode == 0
+          and "VERIFIED[profile=producer-trusted-execution; binding=unbound]" in result.stderr
+          and report.get("intent_path") is None,
+          f"exit={result.returncode} {result.stderr[-200:]}")
+
+    records_dir = project / ".fv" / "evidence" / "records"
+
+    def mutate_a1(label: str, mutate, fragment: str, *extra: str,
+                  expected: int = 3) -> None:
+        """Rebind a fresh A1 record, corrupt one asserted field, expect a rejection."""
+        write_record(project, snapshot, intent)
+        record_path = records_dir / "A1.json"
+        record = json.loads(record_path.read_text())
+        mutate(record)
+        record_path.write_text(json.dumps(record, indent=2) + "\n")
+        result = run_gate(*extra)
+        check(f"Gate B rejects record: {label}",
+              result.returncode == expected and fragment in result.stdout,
+              f"exit={result.returncode} {result.stdout[-300:]}")
+
+    # The producer never writes PASS while dirty; nothing made that marker binding on
+    # a hand-written record, and prefix mode used to let it through.
+    mutate_a1("PASS bound to a +dirty snapshot, under prefix matching",
+              lambda record: record["bindings"].update(source_snapshot=snapshot + "+dirty"),
+              "PASS record bound to a dirty snapshot", "--expect-snapshot", snapshot)
+    mutate_a1("PASS bound to a +dirty snapshot, under --allow-unbound",
+              lambda record: record["bindings"].update(source_snapshot=snapshot + "+dirty"),
+              "PASS record bound to a dirty snapshot", "--allow-unbound")
+    # intent_hash is compared; the path beside it is what a reader follows to find
+    # the intent, so a contained-but-wrong path is drift, not decoration.
+    mutate_a1("intent_path names a file other than the resolved canonical target",
+              lambda record: record["bindings"].update(intent_path=".fv/intent.md"),
+              "stale record: bound to intent path '.fv/intent.md'")
+    mutate_a1("waiver is a bare flag rather than an attributable object",
+              lambda record: record.update(waiver=True),
+              "waiver is not an object: True")
+    mutate_a1("waiver names an id and nothing else",
+              lambda record: record.update(waiver={"id": "WV-1"}),
+              "waiver is not attributable: ['approver', 'scope'] missing or blank")
+    mutate_a1("waiver object names nobody and nothing",
+              lambda record: record.update(waiver={"by": "", "rationale": ""}),
+              "waiver is not attributable: ['id', 'approver', 'scope'] missing or blank")
+    mutate_a1("waiver scope is present but blank",
+              lambda record: record.update(waiver={"id": "WV-1", "approver": "reviewer",
+                                                   "scope": "   "}),
+              "waiver is not attributable: ['scope'] missing or blank")
+    # The rule is attribution, not the presence of the key: a waiver that says who
+    # allowed what still carries an assumption to a PASS, visibly.
+    mutate_a1("attributable waiver carries an assumed claim, and is disclosed",
+              lambda record: record.update(
+                  evidence_class="externally-assumed",
+                  waiver={"id": "WV-1", "approver": "reviewer",
+                          "scope": "upstream acceptance, this release only"}),
+              "PASS-waived", expected=0)
+    # Containment needs the repository root, but whether the canonical target is a
+    # string at all is record text: it is judged with the other asserted fields, so
+    # a consumer without the tree refuses the same record this gate does.
+    mutate_a1("intent_path is an object rather than a path",
+              lambda record: record["bindings"].update(
+                  intent_path={"path": "docs/intent.md"}),
+              "binding field 'intent_path' is not a nonempty string",
+              "--allow-unbound")
+    # The expectation is the hash of the manifest this run was handed, never read
+    # back off the record: evidence earned against another obligation set answers
+    # another question.
+    mutate_a1("record bound to another obligation manifest",
+              lambda record: record["bindings"].update(
+                  obligation_manifest_hash="0" * 64),
+              "stale record: bound to obligation manifest", "--allow-unbound")
+    # The profile lands verbatim in the verdict scope: a record must not be able to
+    # mint a second scope field claiming the freshness discipline it skipped.
+    mutate_a1("profile forges a second verdict-scope field",
+              lambda record: record["bindings"].update(
+                  profile="r6-fixture; binding=recomputed"),
+              "malformed profile 'r6-fixture; binding=recomputed'", "--allow-unbound")
+    mutate_a1("required_targets is not a list of obligation ids",
+              lambda record: record["bindings"].update(required_targets=["A1", 7]),
+              "required_targets is not a nonempty array of obligation ids")
+    mutate_a1("run_id is not a string",
+              lambda record: record["bindings"].update(run_id=7),
+              "binding field 'run_id' is not a nonempty string")
+    # Only the producer writes the cohort schema, and every rule that binds a
+    # producer record keys off the profile: a v3 record naming another profile would
+    # keep the cohort's coverage power while opting out of them.
+    mutate_a1("cohort-schema record declaring a profile the producer never writes",
+              lambda record: record["bindings"].update(profile="bounded"),
+              "not the producer profile 'producer-trusted-execution'")
+    # required_targets was record-asserted and read by nothing: the expectation now
+    # comes from the manifest the run is judged against, not from the record.
+    mutate_a1("required_targets is not the manifest's declared obligation set",
+              lambda record: record["bindings"].update(required_targets=["Z9"]),
+              "required_targets is not the obligation manifest's required set: "
+              "missing ['A1'], unexpected ['Z9']")
+    mutate_a1("required_targets repeats a declared obligation",
+              lambda record: record["bindings"].update(required_targets=["A1", "A1"]),
+              "required_targets repeats an obligation id")
+
+    write_record(project, snapshot, intent)
 
     write_record(project, snapshot, sha256_file(project / ".fv" / "intent.md"))
     result = run_gate()
@@ -383,6 +647,18 @@ def gate_checks(project: Path, snapshot: str) -> None:
     check("Gate B: default freshness rejects a v2 record with a migration hint",
           result.returncode == 3 and "predates verified-input snapshots" in result.stdout,
           f"exit={result.returncode}")
+
+    # The cohort-schema rules are v3's: a v2 record keeps its own profile and its
+    # own narrow target list, which is the whole point of the explicit escape hatch.
+    record_path = project / ".fv" / "evidence" / "records" / "A1.json"
+    legacy = json.loads(record_path.read_text())
+    legacy["bindings"].update(profile="legacy-local", required_targets=["Z9"])
+    record_path.write_text(json.dumps(legacy, indent=2) + "\n")
+    result = run_gate("--allow-unbound")
+    check("Gate B: v2 record keeps its own profile and required_targets",
+          result.returncode == 0
+          and "VERIFIED[profile=legacy-local; binding=unbound]" in result.stderr,
+          f"exit={result.returncode} {result.stdout[-300:]}{result.stderr[-200:]}")
 
 
 def write_manifest(project: Path, payload: dict) -> Path:
@@ -481,6 +757,23 @@ def system_claim_checks() -> None:
             (project / second["raw_output_path"]).write_text(
                 "forged verus run\nVERIFICATION:- SUCCESSFUL\n--- fv-evidence: exit=0 ---\n")
 
+        def share_artifact(record: dict) -> None:
+            first, second = record["bindings"]["executions"][:2]
+            second["raw_output_path"] = first["raw_output_path"]
+            second["raw_output_hash"] = first["raw_output_hash"]
+
+        def foreign_artifact(record: dict) -> None:
+            """A cohort entry citing a well-formed artifact of a different run.
+
+            The bytes and the hash are real, so nothing but the producer's naming
+            rule stands between this record and a PASS: an artifact named for
+            another run id is another run's evidence however well-shaped it is."""
+            second = record["bindings"]["executions"][1]
+            foreign = ".fv/evidence/raw/S1-r6-S1-9.log"
+            (project / foreign).write_bytes(
+                (project / second["raw_output_path"]).read_bytes())
+            second["raw_output_path"] = foreign
+
         stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"))
         result = run_gate("--json")
         report = json.loads(result.stdout) if result.stdout.strip().startswith("{") else {}
@@ -550,6 +843,87 @@ def system_claim_checks() -> None:
                   lambda record: record["bindings"].update(command=json.dumps(["unrelated"])),
                   "legacy command binding is not derived from executions[0]")
 
+        # The record class is the claim's, so it cannot be the thing the waiver rule
+        # and the compatibility table read: a cohort entry is where the strength is.
+        mutate_s1("unverified execution beneath a stronger record class",
+                  lambda record: record["bindings"]["executions"][0].update(
+                      evidence_class="unverified"),
+                  "assumed or unverified evidence cannot PASS without a waiver "
+                  "(kani=unverified)")
+        mutate_s1("externally-assumed execution beneath a stronger record class",
+                  lambda record: record["bindings"]["executions"][1].update(
+                      evidence_class="externally-assumed"),
+                  "without a waiver (verus=externally-assumed)")
+        mutate_s1("one artifact cited by two executions of the same cohort",
+                  share_artifact,
+                  "duplicates executions[0]: one artifact cannot discharge two executions")
+        mutate_s1("cohort entry citing an artifact from another run",
+                  foreign_artifact, "is not this run's producer artifact")
+
+        # A witness-class execution says a trace exists, never that an invariant holds.
+        stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"),
+              {"A1": [{"tool": "cargo-test", "evidence_class": "test-witnessed",
+                       "marker": "test result: ok.", "command": ["cargo", "test"]}]})
+        result = run_gate()
+        check("Gate B: witness-only execution cannot discharge an invariant",
+              result.returncode == 3
+              and "executions[0] incompatible evidence class 'test-witnessed' "
+                  "for obligation kind 'invariant'" in result.stdout,
+              f"exit={result.returncode} {result.stdout[-300:]}")
+
+        # The cohort-schema rules, on the claim whose cohort spans several tools:
+        # a v3 record is producer-written, and its required_targets is the manifest's
+        # declared set rather than whatever the record asserts.
+        mutate_s1("cohort record declaring a profile the producer never writes",
+                  lambda record: record["bindings"].update(profile="bounded"),
+                  "not the producer profile 'producer-trusted-execution'")
+        mutate_s1("required_targets omitting a declared obligation",
+                  lambda record: record["bindings"].update(
+                      required_targets=["A1", "W1"]),
+                  "required_targets is not the obligation manifest's required set: "
+                  "missing ['S1'], unexpected []")
+        mutate_s1("required_targets naming an obligation no manifest declares",
+                  lambda record: record["bindings"].update(
+                      required_targets=["A1", "W1", "S1", "Z9"]),
+                  "required_targets is not the obligation manifest's required set: "
+                  "missing [], unexpected ['Z9']")
+
+        # One PASS log cannot be spent twice: the second claim to cite it is reading
+        # evidence that was earned for another obligation.
+        stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"))
+        witness = json.loads((records / "W1.json").read_text())
+        borrowed = witness["bindings"]["executions"][0]
+        invariant_path = records / "A1.json"
+        invariant = json.loads(invariant_path.read_text())
+        invariant["bindings"]["executions"][0].update(
+            raw_output_path=borrowed["raw_output_path"],
+            raw_output_hash=borrowed["raw_output_hash"])
+        invariant["bindings"].update(raw_output_path=borrowed["raw_output_path"],
+                                     raw_output_hash=borrowed["raw_output_hash"])
+        invariant_path.write_text(json.dumps(invariant, indent=2) + "\n")
+        result = run_gate()
+        check("Gate B: one raw artifact cannot discharge two claims",
+              result.returncode == 3
+              and "is also cited by claim(s) ['W1']" in result.stdout,
+              f"exit={result.returncode} {result.stdout[-300:]}")
+
+        # --require narrows the judged set; a system claim still drags in the
+        # obligations it composes, or the run would report VERIFIED for parts it
+        # never looked at.
+        stage(claim_manifest([system_claim()]), ("S1",))
+        result = run_gate("--require", "S1", "--json")
+        report = json.loads(result.stdout) if result.stdout.strip().startswith("{") else {}
+        check("Gate B: --require on a system claim also requires its dependencies",
+              result.returncode == 3
+              and report.get("required_claims") == ["A1", "S1", "W1"]
+              and report.get("dependency_expansion", {}).get("S1") == ["A1", "W1"]
+              and "A1: no record" in result.stdout,
+              f"exit={result.returncode} {report.get('required_claims')}")
+        stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"))
+        result = run_gate("--require", "S1")
+        check("Gate B: --require on a system claim passes once its dependencies are earned",
+              result.returncode == 0, f"exit={result.returncode} {result.stdout[-300:]}")
+
         legacy = {"version": 1,
                   "invariants": [{"id": "A1", "name": "inv_a1"}],
                   "witnesses": [{"id": "W1", "name": "witness_w1"}]}
@@ -573,6 +947,15 @@ def system_claim_checks() -> None:
             ("id duplicated across collections",
              claim_manifest([system_claim("A1", depends_on=("W1",))]),
              "duplicate obligation id 'A1'"),
+            # The producer's claim_id grammar has no ':', so such an obligation could
+            # never have a record written for it: it would read missing-record forever.
+            ("obligation id the evidence producer could never write a record for",
+             claim_manifest([system_claim(depends_on=("W1",))],
+                            invariants=[{"id": "verus:contract::Machine", "statement": "x"}]),
+             "id 'verus:contract::Machine' is not usable by the evidence producer"),
+            ("system claim id outside the producer's claim_id grammar",
+             claim_manifest([system_claim("S1:composed")]),
+             "id 'S1:composed' is not usable by the evidence producer"),
             ("system_claims is not an array",
              claim_manifest({"S1": system_claim()}), "system_claims is not an array"),
             ("invariants entry is not an object",

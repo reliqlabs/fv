@@ -80,7 +80,10 @@ VERIFICATION PLANS (--plan, fv-verification-plan/v1)
         sibling invocations.
       * evidence_tool, when present, names the tool the invocation witnesses.
         On the `fuzz` layer it also names the fuzz surface whose measured
-        duration feeds the C8 fuzz-time floor.
+        duration feeds the C8 fuzz-time floor. An id names exactly one
+        invocation: the same id twice anywhere in the plan is a rejection, not
+        a merge, because the runner keys each measured duration by it and two
+        verifications must not collapse into one witnessed tool.
       * `floors` is not plannable: it is computed from .fv/floors.json, and a
         declared command could not enforce the C8 baseline. It is the only
         reserved layer id.
@@ -94,13 +97,15 @@ VERIFICATION PLANS (--plan, fv-verification-plan/v1)
     (LAYER_ORDER), then custom layers run in lexical order, both independent
     of their order in the file (see plan_layer_order). Every invocation in a
     layer runs (a layer is one evidence cohort); the layer fails when any
-    invocation exits non-zero or times out. `required: true` adds a layer to
-    the gating set — a custom layer included, which is how a tool outside the
-    Rust pyramid becomes a G2 gate; `required: false` is non-gating but never
-    un-requires a layer the profile already requires: a plan can only tighten
-    the verdict. A types failure invalidates everything downstream, so every
-    required or declared layer that has not run — custom layers included — is
-    recorded not_run.
+    invocation exits non-zero, times out, or cannot be launched at all — a
+    plan naming a tool this machine does not have is a `failed` layer with a
+    per-invocation `launch_errors` row, never a traceback and never a missing
+    report. `required: true` adds a layer to the gating set — a custom layer
+    included, which is how a tool outside the Rust pyramid becomes a G2 gate;
+    `required: false` is non-gating but never un-requires a layer the profile
+    already requires: a plan can only tighten the verdict. A types failure
+    invalidates everything downstream, so every required or declared layer
+    that has not run — custom layers included — is recorded not_run.
     Layers the plan does not name keep every built-in default, and without
     --plan the runner is byte-for-byte the legacy runner.
 
@@ -342,7 +347,15 @@ def aggregate_verdict(profile: str, required: list[str],
 def run_cmd(cmd: list[str], cwd: Path, timeout: int = 1800,
             env: dict[str, str] | None = None) -> dict:
     """Run argv directly — never a shell string. `env` is merged over the
-    runner's own environment for this child only; os.environ is untouched."""
+    runner's own environment for this child only; os.environ is untouched.
+
+    Every failure mode is a structured result, never an exception. A timeout
+    returns `timeout: True`; a launch failure — the executable is missing or
+    not executable, the cwd vanished, the kernel refused the spawn — returns
+    `launch_error` with the OS error class and message. Both carry returncode
+    -1, so the caller records the layer `failed` and the run still reaches its
+    report and verdict. A plan may name any argv, so an absent tool is an
+    expected input, not a runner crash."""
     child_env = {**os.environ, **env} if env else None
     t0 = time.monotonic()
     try:
@@ -354,6 +367,10 @@ def run_cmd(cmd: list[str], cwd: Path, timeout: int = 1800,
                 "stderr_preview": proc.stderr[-500:]}
     except subprocess.TimeoutExpired:
         return {"command": cmd, "returncode": -1, "timeout": True,
+                "duration_s": round(time.monotonic() - t0, 1)}
+    except OSError as error:
+        return {"command": cmd, "returncode": -1,
+                "launch_error": f"{type(error).__name__}: {error}",
                 "duration_s": round(time.monotonic() - t0, 1)}
 
 
@@ -479,6 +496,11 @@ def parse_plan(document: object, root: Path, source: str = "<plan>") -> dict:
                 f"{PLAN_CUSTOM_ID.pattern} or a known layer "
                 f"{list(PLAN_LAYERS)}")
     layers: dict[str, dict] = {}
+    # evidence_tool is the name a required_evidence entry matches against and
+    # the key the runner files each measured duration under, so one id names
+    # exactly one invocation: a repeated id would silently collapse two
+    # verifications into one witnessed duration.
+    tool_origin: dict[str, str] = {}
     for name in plan_layer_order(declared):
         spec = declared[name]
         where = f"{source}: layers.{name}"
@@ -494,13 +516,20 @@ def parse_plan(document: object, root: Path, source: str = "<plan>") -> dict:
         executions = spec.get("executions")
         if not isinstance(executions, list) or not executions:
             raise PlanError(f"{where}: executions must be a non-empty array")
-        layers[name] = {
-            "required": required,
-            "executions": [
-                _plan_execution(root, execution, f"{where}.executions[{index}]")
-                for index, execution in enumerate(executions)
-            ],
-        }
+        parsed = [_plan_execution(root, execution, f"{where}.executions[{index}]")
+                  for index, execution in enumerate(executions)]
+        for index, execution in enumerate(parsed):
+            tool = execution["evidence_tool"]
+            if tool is None:
+                continue
+            origin = f"layers.{name}.executions[{index}]"
+            first = tool_origin.setdefault(tool, origin)
+            if first != origin:
+                raise PlanError(
+                    f"{source}: evidence_tool {tool!r} is declared twice "
+                    f"({first} and {origin}); one tool id names exactly one "
+                    f"invocation, so two runs need two ids")
+        layers[name] = {"required": required, "executions": parsed}
     return {"schema": PLAN_SCHEMA, "source": source, "layers": layers}
 
 
@@ -592,7 +621,11 @@ def main() -> int:
         """Run a plan-declared layer; True when the plan owns this layer.
 
         Every declared invocation runs (the layer is one evidence cohort) and
-        the layer fails when any of them exits non-zero or times out."""
+        the layer fails when any of them exits non-zero, times out or cannot be
+        launched at all. A launch failure — the plan names a tool this machine
+        does not have, or names a file it cannot execute — is recorded per
+        invocation under `launch_errors`, keyed by position and evidence_tool so
+        a cohort of several invocations stays individually attributable."""
         spec = plan_layers.get(layer)
         if spec is None:
             return False
@@ -601,16 +634,27 @@ def main() -> int:
             return True
         results: list[dict] = []
         durations: dict[str, float] = {}
+        launch_errors: list[dict] = []
         status = TERMINAL_OK
-        for execution in spec["executions"]:
+        for index, execution in enumerate(spec["executions"]):
             result = run_plan_execution(execution, crate)
             results.append(result)
             if result["returncode"] != 0:
                 status = "failed"
+            if "launch_error" in result:
+                launch_errors.append({
+                    "execution": index,
+                    "evidence_tool": execution["evidence_tool"],
+                    "argv0": execution["argv"][0],
+                    "error": result["launch_error"],
+                })
             if execution["evidence_tool"]:
                 durations[execution["evidence_tool"]] = result.get("duration_s", 0)
-        record(layer, status, {"plan": True, "required": spec["required"],
-                               "executions": results, "durations": durations})
+        detail = {"plan": True, "required": spec["required"],
+                  "executions": results, "durations": durations}
+        if launch_errors:
+            detail["launch_errors"] = launch_errors
+        record(layer, status, detail)
         return True
 
     def cargo_layer(layer: str, cmd: list[str]) -> None:
@@ -676,9 +720,13 @@ def main() -> int:
             elif shutil.which("cargo-kani") is None:
                 record("kani", "skipped", "cargo-kani not installed")
             else:
-                src = subprocess.run(["grep", "-r", "-l", "kani::proof", "src"],
-                                     cwd=crate, capture_output=True, text=True)
-                if src.returncode != 0:
+                # A grep that cannot run tells us nothing about harnesses, so
+                # it is an infrastructure failure, never "no harnesses".
+                src = run_cmd(["grep", "-r", "-l", "kani::proof", "src"], crate,
+                              timeout=120)
+                if "launch_error" in src or src.get("timeout"):
+                    record("kani", "failed", src)
+                elif src["returncode"] != 0:
                     record("kani", "not_applicable", "no #[kani::proof] harnesses")
                 else:
                     r = run_cmd(["cargo", "kani"], crate)
@@ -723,9 +771,21 @@ def main() -> int:
         "verdict": verdict,
     }
     out_dir = crate / ".fv" / "verify"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"headless-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%M%SZ')}.json"
-    out_path.write_text(json.dumps(report, indent=2) + "\n")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    out_path = out_dir / f"headless-{stamp}.json"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2) + "\n")
+    except OSError as error:
+        # A verdict whose evidence cannot be persisted is an infrastructure
+        # ERROR, not a pass: the report still goes to stdout so nothing is lost.
+        if args.json:
+            print(json.dumps(report, indent=2))
+        print(f"ERROR: cannot write the report to {out_path}: {error}",
+              file=sys.stderr)
+        print(f"(layer verdict was {verdict})", file=sys.stderr)
+        print("\nVERDICT: ERROR", file=sys.stderr)
+        return 2
 
     if args.json:
         print(json.dumps(report, indent=2))

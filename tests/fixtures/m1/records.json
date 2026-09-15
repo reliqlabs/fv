@@ -139,7 +139,9 @@
       "raw_output_path": "tests/fixtures/r19/intent.md"
     },
     "waiver": {
-      "by": "reviewer",
+      "id": "WV-1",
+      "approver": "reviewer",
+      "scope": "gnark verifier acceptance, this release only",
       "rationale": "upstream gnark verifier accepted"
     }
   },

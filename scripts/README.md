@@ -21,26 +21,71 @@ uv run --script scripts/fv_migrate.py /absolute/path/to/project --apply
 `fv_migrate.py` reports in `fv-migration-report/v1`. Dry run is the default;
 `--apply` writes only under `.fv/` and never touches `.colosseum/`.
 
-Exit 0 is `status: ok`, 1 is `status: blocked` or an uninventoriable legacy tree,
-2 a usage error or an unresolvable project root.
+Exit 0 is `status: ok`; 1 is `status: blocked`, a legacy tree that cannot be
+inventoried, or an apply that failed and rolled back; 2 a usage error or an
+unresolvable project root.
+
+Report fields: `schema`, `project_root` (always `"."`, so a captured report
+carries no absolute machine path; the text render names the real directory),
+`target_spec` (the elected dispatch target, `null` when none could be elected),
+`requested_mode` (`dry-run` or `apply`, what the caller asked for), `mode` (what
+the run did), `applied`, `status` (`ok` or `blocked`), `error` (an apply failure
+message, otherwise `null`), `counts`, `artifacts[]`, `writes[]`, `conflicts[]`,
+`unsupported[]`. A blocked `--apply` reports `requested_mode: apply`, `mode:
+dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry run.
 
 - Every legacy file is classified once: `mapped`, `preserved-history`, or
-  `unsupported`. A `<file>#layers.<name>` or `<file>#claims.<id>` row names an
-  item inside a mapped file that the translation did not carry.
-- `unsupported[]` (unknown or malformed legacy schema, malformed claim,
-  untranslatable verification layer, colliding or empty normalized obligation
-  id, unreadable or non-regular file) and `conflicts[]` (a `.fv/` destination
-  existing with different content, or a symlink, directory, or non-directory
-  parent) each make `status` `blocked`.
+  `unsupported`. A `<file>#layers.<name>`, `<file>#claims.<id>`, `<file>#ids.<id>`
+  or `<file>#document` row names an item inside an otherwise-mapped file that did
+  not come across with the meaning the file's mapping implies.
+- `unsupported[]` blocks the run: an unknown or malformed legacy schema, a
+  malformed claim, a verification layer no argv execution can carry, a claim whose
+  `required_evidence` names a tool no migrated execution declares, two legacy
+  targets whose obligation ids collide after normalization, a target that
+  normalizes to an empty id, two executions that would declare one
+  `evidence_tool` id, an ambiguous dispatch target (two or more distinct canonical
+  intents cited by whichever document decides), no dispatch target at all, a
+  directory under `.colosseum/` that cannot be listed, an unreadable or
+  non-regular file.
+- `conflicts[]` blocks the run as well: a `.fv/` destination that exists with
+  different content (both hashes are printed), crosses a symlink at any path
+  component including `.fv` itself, is a directory, sits under a non-directory
+  parent, or whose nearest existing parent directory is not writable.
   `--apply` refuses a blocked migration and writes nothing.
-- `writes[]` lists each intended `.fv/` path with `action` `create`, `identical`,
-  or `conflict` and the SHA-256 of the bytes. Re-running `--apply` is
-  byte-idempotent.
-- Mapped: `ledger.md` verbatim, `intent.md` to the dispatch target,
+- `writes[]` lists each intended `.fv/` path with the SHA-256 of its bytes and an
+  `action`: `create`, `identical` (byte-equal already, nothing to do), `adopt`
+  (`.fv/dispatch.json` only), `conflict` (preflight refused it), or, in an apply,
+  `written`, `rolled-back`, `failed`, `pending`. Re-running a successful `--apply`
+  is byte-idempotent: every destination reports `identical`.
+- `--apply` is all-or-nothing. Every byte is staged under `.fv/` first, then each
+  destination is moved into place with `os.replace`, which does not follow a
+  symlink at the final name. A failure during the moves rolls back every
+  destination already moved, and the report is printed anyway because it is the
+  only enumeration of what landed: `rolled-back` was undone, `failed` is the write
+  that raised, `pending` never started, and `written` in a failed apply means the
+  rollback itself could not undo that destination (`error` carries the reason).
+- `.fv/dispatch.json` is the one destination adopted rather than refused. An
+  existing route keeps every other field, other `omp_native` keys and other
+  top-level keys alike, and has only the `project_root` and `target_spec` this
+  migration owns rewritten; the write is reported as `adopt` with the before and
+  after in its `detail`. A route already carrying `"."` and the elected
+  `target_spec` is left byte-identical.
+- The dispatch target is elected from the legacy pointer stub first: a `*intent.md`
+  path cited by `.colosseum/intent.md` that resolves under the project root wins,
+  and the ledger's citations decide only when the stub cites none. Mention
+  frequency never votes. Two or more distinct candidates in whichever document
+  decides is an `unsupported` row, and so is no candidate at all, since a
+  `target_spec` naming nothing cannot resolve for any gate, producer, or skill.
+  With no cited external intent, `.colosseum/intent.md` itself becomes
+  `.fv/intent.md`. The elected spec is the report's own `target_spec` field, not
+  only a sentence in a detail string.
+- Mapped: `ledger.md` verbatim, the elected intent as the dispatch target,
   `obligations.json` + `g1-claims.json` to `.fv/obligations.json` `system_claims`,
   `evidence/runs/layer-runs.json` to `.fv/verification-plan.json`. Everything else
-  is preserved byte-for-byte under `.fv/history/colosseum/`, which the migrated
-  `.fv/verified-inputs.txt` excludes from the snapshot.
+  is preserved under `.fv/history/colosseum/`, byte-for-byte plus the executable
+  bit; no other mode bit, ownership, timestamp, or empty legacy directory is
+  represented. `.fv/history/` is a structural snapshot exclusion prefix, so
+  quarantined history cannot move the content snapshot evidence binds to.
 - Legacy per-claim evidence is history, never live evidence: a v1/v2 record is
   copied under `.fv/history/colosseum/` and never into `.fv/evidence/`, so Gate B
   cannot see it and every migrated obligation stays uncovered until an
@@ -48,10 +93,30 @@ Exit 0 is `status: ok`, 1 is `status: blocked` or an uninventoriable legacy tree
   is never deleted.
 - Legacy layers with a pyramid equivalent are renamed (`proptest` to `proptests`);
   every other layer, `quint` included, becomes an `fv-verification-plan/v1` custom
-  layer that runs after the built-in layers in lexical order. A layer named by a
-  legacy claim the manifest marked `required` gets `required: true` and joins the
-  G2 gating set. An untranslatable layer blocks the migration rather than yielding
-  a partial plan.
+  layer that runs after the built-in layers in lexical order. A layer any migrated
+  claim names is written `required: true` and joins the G2 gating set, whatever the
+  legacy `required` flag said, because Gate B demands evidence for every declared
+  obligation regardless of that flag; when no legacy claim converted at all, every
+  recorded layer is required. An untranslatable layer blocks the migration rather
+  than yielding a partial plan: shell operators or expansions in the recorded
+  command, a leading `NAME=VALUE` assignment, a segment whose `argv[0]` is a
+  builtin whose effect dies with the process (`cd`, `export`, `source`, `eval`,
+  ...), a missing or escaping `cwd`, a malformed environment, the reserved id
+  `floors`.
+- A legacy `a; b; c` command becomes three executions in one layer; the last
+  segment carries the bare layer id as its `evidence_tool` because its exit status
+  is what the legacy manifest recorded, and earlier segments get `<layer>:<index>`.
+  Two independently recorded runs of one layer have no last-segment relation to
+  inherit, so they are merged into one cohort keyed `<layer>:run<k>.<segment>`
+  (only the final execution keeps the bare id) and the merge is reported as a
+  `#layers.<name>` deviation row.
+- `scope`, `waiver`, `evidence_class`, `profile`, and `environment_policy` are
+  retained rather than summarized when they carry the type the migrated manifest's
+  slot holds. Any other legacy claim key, and any of those five carrying a type
+  its slot cannot hold, is carried verbatim under the claim's `legacy_fields`
+  (document-level keys under `migration.legacy_fields`) and named in a
+  `#claims.<id>` or `#document` deviation row, so a dropped `waiver` can neither
+  vanish nor be implied to have migrated as a waiver.
 - Obligation and claim ids are normalized deterministically: the legacy target
   splits at its first colon, each part collapses every run of characters outside
   `[A-Za-z0-9._-]` to a single `-` and drops leading/trailing `.`, `_`, `-`, and
@@ -92,8 +157,9 @@ invariant and a worked multi-execution system claim, is in
 
 - Source binding is `bindings.source_snapshot`, a verified-input content snapshot
   `sha256:<hex>` over every tracked-or-untracked, unignored, non-excluded file (`+dirty` suffix
-  when a non-excluded path is modified), not a commit id. Exclusion prefixes:
-  `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.colosseum/`, plus any listed in
+  when a non-excluded path is modified), not a commit id. Structural exclusion
+  prefixes: `.fv/evidence/`, `.fv/verify/`, `.fv/panels/`, `.fv/history/`,
+  `.fv/.migrate-staging/`, `.colosseum/`, plus any listed in
   `.fv/verified-inputs.txt`.
 - Intent binding is `bindings.intent_path` (repo-relative canonical target, resolved from
   `.fv/dispatch.json` `omp_native.target_spec`, default `.fv/intent.md`) plus
@@ -132,6 +198,10 @@ invariant and a worked multi-execution system claim, is in
   not name keep the built-in defaults; without `--plan` the runner is the legacy runner.
 - No shell strings, no ambient environment mutation: declared `env` merges over the subprocess
   environment, `cwd` must stay repo-relative, and escapes are rejected.
+- One `evidence_tool` id names exactly one invocation: the same id twice anywhere in the plan is
+  a rejection, not a merge, because the runner keys each measured duration by it. A plan naming a
+  tool this machine does not have is a `failed` layer carrying a per-invocation `launch_errors`
+  row, so an absent binary still produces a report instead of a traceback.
 - Shipped example: [`verification-plan.example.json`](./verification-plan.example.json), walked
   through in [`docs/dogfood-evidence.md`](../docs/dogfood-evidence.md).
 

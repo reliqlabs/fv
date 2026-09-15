@@ -10,21 +10,49 @@ property that makes it safe to run on a project whose trust artifacts are the
 only record of past verification is that it cannot lose or rewrite anything:
 
   * dry run is the default and writes nothing at all;
-  * `--apply` writes only under `.fv/`, and `.colosseum/` stays byte-identical
-    (asserted with a digest over the whole legacy tree, before and after);
+  * `--apply` writes only under the real `.fv/`, and `.colosseum/` stays
+    byte-identical (asserted with a digest over the whole legacy tree, before
+    and after), including when a symlink sits at `.fv`, at any component
+    below it, or at the fixed staging prefix every migrated byte passes
+    through before any destination sees it -- whether that link points out of
+    the project or into `.colosseum/` itself;
   * every legacy file is classified exactly once as mapped, preserved-history,
-    or unsupported, so a file can never be silently dropped;
+    or unsupported, so a file can never be silently dropped, and a legacy
+    field with no typed slot in the migrated manifest is carried under
+    explicit provenance and named in a deviation row;
   * an unsupported artifact or a conflicting destination blocks the run in
-    preflight, before the first byte is written;
+    preflight, before the first byte is written, and an apply that fails
+    after preflight rolls back and still reports each destination's fate,
+    putting a destination it had already replaced back by renaming the
+    original inode into place, so the file's mode and the rest of its
+    metadata return with its bytes; a move-aside that itself fails is
+    reported as the failed write it is rather than as a lost destination,
+    because the file never moved;
+  * a hard-killed apply strands nothing a verified-input snapshot hashes: the
+    staging tree sits under one fixed, structurally excluded prefix, with a
+    unique subdirectory per run that no later apply reuses or disturbs, and a
+    concurrent run that removes the shared prefix mid-startup is retried and
+    then named rather than turned into a partial write;
+  * the dispatch target comes from the pointer stub before the ledger, and
+    an ambiguous or absent target blocks rather than being elected by
+    mention frequency;
   * every layer the legacy run manifest recorded reaches the plan, custom
-    layer ids included, and a layer no plan execution can carry blocks the run
-    instead of being quietly left out of a partial plan;
+    layer ids included; a layer no plan execution can carry blocks the run
+    instead of being quietly left out of a partial plan; and a claim whose
+    `required_evidence` no migrated execution can produce blocks the same
+    way, including when the legacy tree recorded no run manifest at all, so
+    no migration publishes required obligations against a project with no
+    declared execution;
+  * a layer any migrated claim names gates the migrated pyramid, whatever the
+    legacy `required` flag said;
   * every synthesized obligation id is directly usable as an
     `fv_evidence_run` `claim_id`, so no obligation needs renaming by hand
     after the migration, and two legacy ids that would share one record path
     block the run instead of being silently merged or suffixed;
-  * re-applying is byte-idempotent, and a destination that already exists with
-    different content fails instead of being overwritten.
+  * re-applying is byte-idempotent; a destination that already exists with
+    different content fails instead of being overwritten, except
+    `.fv/dispatch.json`, which is adopted by rewriting only the two fields
+    the migration owns and keeping the mode the existing file carried.
 
 The semantic translations are asserted against their real consumers rather
 than against a copy of the expected JSON: the migrated obligation manifest must
@@ -41,6 +69,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,7 +106,8 @@ def evidence_claim_id_pattern() -> re.Pattern[str]:
     a copy of it in this test would keep passing after the producer moved.
     """
     source = EVIDENCE_RUN.read_text()
-    match = re.search(r"/(\^\[[^/]+\$)/\.test\(params\.claim_id\)", source)
+    match = re.search(r"const CLAIM_ID = /(\^\[[^/]+\$)/", source) or re.search(
+        r"/(\^\[[^/]+\$)/\.test\(params\.claim_id\)", source)
     if match is None:
         raise AssertionError(f"no claim_id guard found in {EVIDENCE_RUN}")
     return re.compile(match.group(1))
@@ -413,9 +443,12 @@ def check_mapping(tmp: Path) -> None:
           (root / ".fv/ledger.md").read_text() == (root / ".colosseum/ledger.md").read_text())
     check("a verbatim mapped file is not duplicated into history",
           not (root / ".fv/history/colosseum/ledger.md").exists())
+    check("the ledger mapping says its citations are not re-rooted",
+          "citation" in artifact_of(report, ".colosseum/ledger.md")["detail"],
+          artifact_of(report, ".colosseum/ledger.md")["detail"])
 
     route = json.loads((root / ".fv/dispatch.json").read_text())["omp_native"]
-    check("dispatch stores the repo-relative external intent the ledger cites",
+    check("dispatch stores the repo-relative external intent the stub names",
           route["target_spec"] == "docs/intent.md" and route["project_root"] == ".",
           str({k: route.get(k) for k in ("project_root", "target_spec")}))
     check("the resolved dispatch target is the external intent",
@@ -440,6 +473,66 @@ def check_mapping(tmp: Path) -> None:
     check("the fallback dispatch target is .fv/intent.md",
           json.loads((plain / ".fv/dispatch.json").read_text())["omp_native"]["target_spec"]
           == ".fv/intent.md")
+    check("the dry-run report names the elected dispatch target as its own field",
+          report_of(root)[1]["target_spec"] == "docs/intent.md"
+          and report_of(plain)[1]["target_spec"] == ".fv/intent.md",
+          f"{report_of(root)[1].get('target_spec')} {report_of(plain)[1].get('target_spec')}")
+
+    # The stub is a declaration; the ledger is prose about the project. A
+    # ledger paragraph naming a superseded document three times must not
+    # outvote the entrypoint's own pointer, or the migration binds every
+    # future evidence record to the wrong trust root.
+    superseded = tmp / "intent-superseded"
+    scaffold(superseded)
+    (superseded / "docs/old-intent.md").write_text("# superseded\n")
+    (superseded / ".colosseum/ledger.md").write_text(
+        "# Ledger\n\nSuperseded: docs/old-intent.md, docs/old-intent.md, docs/old-intent.md.\n"
+        "Current: docs/intent.md.\n")
+    code, report, err = report_of(superseded, "--apply")
+    check("the pointer stub outranks every ledger mention",
+          code == 0 and report["target_spec"] == "docs/intent.md"
+          and json.loads((superseded / ".fv/dispatch.json").read_text())
+          ["omp_native"]["target_spec"] == "docs/intent.md",
+          f"exit={code} {report.get('target_spec')} {err[-160:]}")
+
+    # Ambiguity is a refusal, not a vote, in whichever document decides.
+    for label, stub, ledger, source in (
+        ("stub", "# Intent\nSee `docs/intent.md` or `docs/old-intent.md`.\n",
+         "# Ledger\n\nNo citations.\n", ".colosseum/intent.md#intent"),
+        ("ledger", "# Intent\nThe canonical document is elsewhere.\n",
+         "# Ledger\n\nSee docs/intent.md and docs/old-intent.md.\n", ".colosseum/ledger.md#intent"),
+    ):
+        ambiguous = tmp / f"intent-ambiguous-{label}"
+        scaffold(ambiguous)
+        (ambiguous / "docs/old-intent.md").write_text("# other\n")
+        (ambiguous / ".colosseum/intent.md").write_text(stub)
+        (ambiguous / ".colosseum/ledger.md").write_text(ledger)
+        dry_code, dry_report, _ = report_of(ambiguous)
+        code, report, _ = report_of(ambiguous, "--apply")
+        row = artifact_of(report, source)
+        check(f"two cited intents in the {label} block the run instead of electing one",
+              dry_code == 1 and dry_report["status"] == "blocked" and code == 1
+              and not (ambiguous / ".fv").exists()
+              and report["target_spec"] is None
+              and row is not None and row["classification"] == UNSUPPORTED,
+              f"dry={dry_code} apply={code} {row}")
+
+    # No entrypoint and no citation is not a silent no-op: the migrated
+    # project would resolve no target at all.
+    rootless = tmp / "intent-absent"
+    scaffold(rootless)
+    (rootless / ".colosseum/intent.md").unlink()
+    (rootless / ".colosseum/ledger.md").write_text("# Ledger\n\nNo citations.\n")
+    (rootless / "docs/intent.md").unlink()
+    dry_code, dry_report, _ = report_of(rootless)
+    code, report, _ = report_of(rootless, "--apply")
+    check("a legacy tree with no dispatch target blocks instead of migrating",
+          dry_code == 1 and dry_report["status"] == "blocked" and code == 1
+          and not (rootless / ".fv").exists()
+          and report["target_spec"] is None
+          and any("#intent" in entry and "no dispatch target" in entry
+                  for entry in report["unsupported"]),
+          f"dry={dry_code} apply={code} {report.get('unsupported')}")
 
 
 def check_history(tmp: Path) -> None:
@@ -474,6 +567,45 @@ def check_history(tmp: Path) -> None:
           ["parser_schema_version"] == "colosseum-evidence/v1")
     check("nested history directories are recreated",
           (root / ".fv/history/colosseum/attacks/panel/claude.md").read_text() == "voice artifact\n")
+
+    # A legacy helper arriving non-executable is a history copy that cannot
+    # be replayed, so the executable bit travels with the bytes.
+    executable = tmp / "history-modes"
+    scaffold(executable)
+    script = executable / ".colosseum/scripts/run_verification_layers.sh"
+    script.chmod(0o755)
+    code, _, err = report_of(executable, "--apply")
+    copied = executable / ".fv/history/colosseum/scripts/run_verification_layers.sh"
+    plain_copy = executable / ".fv/history/colosseum/attacks/intent-2026-08-24.md"
+    check("an executable legacy helper stays executable in history",
+          code == 0 and copied.stat().st_mode & 0o111 == 0o111
+          and copied.read_bytes() == script.read_bytes(),
+          f"exit={code} {oct(copied.stat().st_mode & 0o777)} {err[-120:]}")
+    check("a non-executable legacy file gains no execute bit",
+          plain_copy.stat().st_mode & 0o111 == 0,
+          oct(plain_copy.stat().st_mode & 0o777))
+
+    # A directory the inventory cannot list is an unsupported row, not a
+    # traceback: its files cannot be classified, so none of them can be
+    # claimed to have been preserved.
+    locked = tmp / "history-unreadable-dir"
+    scaffold(locked)
+    blocked_dir = locked / ".colosseum/sealed"
+    blocked_dir.mkdir()
+    (blocked_dir / "note.md").write_text("sealed\n")
+    blocked_dir.chmod(0o000)
+    try:
+        code, report, err = report_of(locked, "--apply")
+        check("an unlistable legacy directory blocks with a row, not a traceback",
+              code == 1 and report.get("status") == "blocked"
+              and any(".colosseum/sealed" in entry and "cannot be listed" in entry
+                      for entry in report.get("unsupported", []))
+              and "Traceback" not in err,
+              f"exit={code} {err[-160:]}")
+        check("nothing is written for an inventory that could not complete",
+              not (locked / ".fv").exists())
+    finally:
+        blocked_dir.chmod(0o755)
 
 
 def check_verified_inputs(tmp: Path) -> None:
@@ -579,6 +711,57 @@ def check_obligations(tmp: Path) -> None:
           all(safe.fullmatch(identifier) for identifier in every_id),
           str([identifier for identifier in every_id if not safe.fullmatch(identifier)]))
 
+    # A legacy claim carrying fields this translation has no slot for is a
+    # lossy translation: the fields survive under explicit provenance and the
+    # report names them, instead of the manifest implying the claim came
+    # across whole.
+    retained = tmp / "obligations-retained"
+    scaffold(retained)
+    lossy = {**G1_CLAIMS["claims"][0],
+             "scope": "admission keeps root canonical",
+             "waiver": "WAIVED pending a Lean proof",
+             "evidence_class": 123,
+             "status": "waived",
+             "notes": "see attacks/2026-08-24",
+             "required_targets_optional": ["kani:h2"]}
+    write_json(retained / ".colosseum/g1-claims.json",
+               {**G1_CLAIMS, "environment_policy": {"hosts": 1},
+                "claims": [lossy, *G1_CLAIMS["claims"][1:]]})
+    code, lossy_report, err = report_of(retained, "--apply")
+    lossy_manifest = json.loads((retained / ".fv/obligations.json").read_text())
+    carried = {claim["id"]: claim for claim in lossy_manifest["system_claims"]}["C-01"]
+    row = artifact_of(lossy_report, ".colosseum/g1-claims.json#claims.C-01")
+    check("a legacy field with no typed slot is carried, not dropped",
+          code == 0
+          and carried.get("legacy_fields", {}).get("waiver") == "WAIVED pending a Lean proof"
+          and carried["legacy_fields"]["status"] == "waived"
+          and carried["legacy_fields"]["notes"] == "see attacks/2026-08-24"
+          and carried["legacy_fields"]["required_targets_optional"] == ["kani:h2"]
+          and carried["legacy_fields"]["evidence_class"] == 123
+          and carried["legacy_fields"]["scope"] == "admission keeps root canonical",
+          f"exit={code} {json.dumps(carried, sort_keys=True)[:300]} {err[-120:]}")
+    check("an untypeable legacy field never occupies the typed slot",
+          "waiver" not in carried and "scope" not in carried
+          and "evidence_class" not in carried,
+          str(sorted(carried)))
+    check("the drop is reported as a deviation row naming every field",
+          row is not None and row["classification"] == MAPPED
+          and all(name in row["detail"] for name in
+                  ("waiver", "status", "notes", "required_targets_optional")),
+          str(row))
+    document_row = artifact_of(lossy_report, ".colosseum/g1-claims.json#document")
+    check("an untypeable document field is carried under migration provenance",
+          lossy_manifest["migration"]["legacy_fields"] == {"environment_policy": {"hosts": 1}}
+          and "environment_policy" not in lossy_manifest["migration"]
+          and document_row is not None,
+          str(lossy_manifest["migration"]))
+    check("the migrated manifest with retained fields still loads under the gate",
+          bool(check_evidence_records.load_manifest(retained / ".fv/obligations.json")[0]))
+    check("a claim whose fields all have slots gets no legacy_fields and no row",
+          all("legacy_fields" not in claim for claim in manifest["system_claims"])
+          and not [item for item in report["artifacts"] if "#claims." in item["source"]],
+          str([item["source"] for item in report["artifacts"] if "#claims." in item["source"]]))
+
     prefixes = tmp / "obligations-prefixes"
     scaffold(prefixes)
     write_json(prefixes / ".colosseum/g1-claims.json",
@@ -606,7 +789,8 @@ def check_obligations(tmp: Path) -> None:
           == [".colosseum/g1-claims.json", ".colosseum/obligations.json"],
           str(manifest["migration"]["source"]))
 
-    required, kinds, evidence = check_evidence_records.load_manifest(root / ".fv/obligations.json")
+    required, kinds, evidence, depends = check_evidence_records.load_manifest(
+        root / ".fv/obligations.json")
     check("the migrated manifest loads under the evidence gate",
           set(claims) <= set(required) and invariants <= set(required)
           and witnesses <= set(required),
@@ -621,6 +805,10 @@ def check_obligations(tmp: Path) -> None:
                        "C-02": ["quint", "proptest"],
                        "C-03": ["lean", "verus"]},
           str(evidence))
+    check("the gate reads each claim's dependencies",
+          depends["C-01"] == [migrated_id(target)
+                              for target in G1_CLAIMS["claims"][0]["required_targets"]],
+          str(depends.get("C-01")))
 
     for source in (".colosseum/obligations.json", ".colosseum/g1-claims.json"):
         artifact = artifact_of(report, source)
@@ -788,9 +976,9 @@ def check_plan(tmp: Path) -> None:
           document["layers"]["kani"]["executions"][0]["evidence_tool"] == "kani"
           and document["layers"]["lean"]["executions"][0]["evidence_tool"] == "lean",
           str(document["layers"]["kani"]["executions"][0]))
-    check("a layer required by no required claim is not gating",
-          document["layers"]["lean"]["required"] is False
-          and document["layers"]["kani"]["required"] is True,
+    check("every layer some migrated claim names gates, required flag or not",
+          all(document["layers"][name]["required"] is True
+              for name in ("kani", "lean", "quint", "verus", "proptests")),
           str({name: spec["required"] for name, spec in document["layers"].items()}))
 
     quint = document["layers"]["quint"]
@@ -813,6 +1001,11 @@ def check_plan(tmp: Path) -> None:
           and artifact["destination"] == ".fv/verification-plan.json", str(artifact))
     check("the custom layer is named in the mapped detail",
           "quint -> quint" in artifact["detail"], artifact["detail"])
+    check("the mapped detail carries the run manifest's provenance",
+          all(fragment in artifact["detail"] for fragment in
+              (".colosseum/evidence/runs/layer-runs.json",
+               LAYER_RUNS["generated"], LAYER_RUNS["source_snapshot"], "quint=0")),
+          artifact["detail"])
     check("no translated layer gets a deviation row",
           [item["source"] for item in report["artifacts"] if "#layers." in item["source"]] == [],
           str([item["source"] for item in report["artifacts"] if "#layers." in item["source"]]))
@@ -901,8 +1094,12 @@ def check_plan(tmp: Path) -> None:
           str([write["path"] for write in report["writes"]]))
 
     # A manifest whose only layer has no built-in pyramid step still migrates.
+    # Its claim set names only that layer: a claim requiring evidence the plan
+    # cannot produce is its own refusal, asserted further down.
     custom_only = tmp / "plan-custom-only"
     scaffold(custom_only)
+    with_claims(custom_only, [{**G1_CLAIMS["claims"][0],
+                               "required_targets": ["quint:invS7"], "layers": ["quint"]}])
     write_json(custom_only / ".colosseum/evidence/runs/layer-runs.json",
                {**LAYER_RUNS, "runs": [run for run in LAYER_RUNS["runs"] if run["layer"] == "quint"]})
     code, report, err = report_of(custom_only, "--apply")
@@ -914,6 +1111,111 @@ def check_plan(tmp: Path) -> None:
     check("the custom-only plan loads under pyramid_run",
           list(pyramid_run.load_plan(custom_only / ".fv/verification-plan.json", custom_only)
                ["layers"]) == ["quint"])
+
+    # A recorded layer no claim names runs but does not gate, and the mapped
+    # detail says so: the operator has to be able to see which recorded
+    # verification the migrated pyramid will not fail on.
+    unnamed = tmp / "plan-unnamed-layer"
+    scaffold(unnamed)
+    runs = json.loads(json.dumps(LAYER_RUNS))
+    runs["runs"].append({"layer": "mutation", "cwd": ".", "environment": {},
+                         "command": "cargo mutants --check", "exit_status": 0})
+    write_json(unnamed / ".colosseum/evidence/runs/layer-runs.json", runs)
+    code, report, err = report_of(unnamed, "--apply")
+    document = json.loads((unnamed / ".fv/verification-plan.json").read_text())
+    check("a recorded layer no migrated claim names is not gating",
+          code == 0 and document["layers"]["mutation"]["required"] is False
+          and document["layers"]["quint"]["required"] is True,
+          f"exit={code} " + str({name: spec["required"]
+                                 for name, spec in document["layers"].items()}))
+    check("the mapped detail names every layer written required: false",
+          "mutation written required: false"
+          in artifact_of(report, ".colosseum/evidence/runs/layer-runs.json")["detail"],
+          artifact_of(report, ".colosseum/evidence/runs/layer-runs.json")["detail"])
+
+    # Two independently recorded runs of one layer are a merge, not a
+    # sequence: the `<layer>:<index>` last-segment scheme would assert a
+    # relation the legacy manifest never stated.
+    twice = tmp / "plan-two-runs"
+    scaffold(twice)
+    runs = json.loads(json.dumps(LAYER_RUNS))
+    runs["runs"].append({"layer": "quint", "cwd": ".", "environment": {},
+                         "command": "quint verify quint/other.qnt", "exit_status": 0})
+    write_json(twice / ".colosseum/evidence/runs/layer-runs.json", runs)
+    code, report, err = report_of(twice, "--apply")
+    document = json.loads((twice / ".fv/verification-plan.json").read_text())
+    tools = [execution["evidence_tool"] for execution in document["layers"]["quint"]["executions"]]
+    row = artifact_of(report, ".colosseum/evidence/runs/layer-runs.json#layers.quint")
+    check("two recorded runs of one layer key their executions by run",
+          code == 0 and tools == ["quint:run1.1", "quint:run1.2", "quint:run1.3", "quint"],
+          f"exit={code} {tools} {err[-160:]}")
+    check("no cohort declares the same evidence tool twice across runs",
+          len(set(tools)) == len(tools), str(tools))
+    check("the merge of two recorded runs is reported as a deviation row",
+          row is not None and row["classification"] == MAPPED
+          and row["destination"] == ".fv/verification-plan.json"
+          and "merged" in row["detail"],
+          str(row))
+    check("the two-run plan still loads under pyramid_run",
+          len(pyramid_run.load_plan(twice / ".fv/verification-plan.json", twice)
+              ["layers"]["quint"]["executions"]) == 4)
+
+    # A claim whose required evidence no migrated execution produces blocks:
+    # the no-omission rule runs from the claim to the plan as well.
+    uncovered = tmp / "plan-uncovered-evidence"
+    scaffold(uncovered)
+    write_json(uncovered / ".colosseum/evidence/runs/layer-runs.json",
+               {**LAYER_RUNS,
+                "runs": [run for run in LAYER_RUNS["runs"] if run["layer"] != "quint"]})
+    dry_code, dry_report, _ = report_of(uncovered)
+    code, report, err = report_of(uncovered, "--apply")
+    row = artifact_of(report, ".colosseum/g1-claims.json#claims.C-01.required_evidence")
+    check("a claim requiring evidence no migrated run can produce blocks the migration",
+          dry_code == 1 and dry_report["status"] == "blocked" and code == 1
+          and not (uncovered / ".fv").exists()
+          and row is not None and row["classification"] == UNSUPPORTED
+          and "quint" in row["detail"],
+          f"dry={dry_code} apply={code} {row}")
+
+    # The same rule with nothing recorded at all: a legacy tree that carries
+    # claims but never produced an `evidence/runs/layer-runs.json` migrates to
+    # a manifest whose required evidence no plan can produce, because there is
+    # no plan. That blocks, deliberately: a status-ok migration here would
+    # publish required obligations against a project with no declared
+    # execution, which is exactly the coverage claim the migration must not
+    # invent. The refusal is pinned here so it cannot be relaxed back into an
+    # ok migration without this assertion failing, and the message must name
+    # the remedy -- record the run manifest, or drop the claims' layers.
+    unrecorded = tmp / "plan-no-run-manifest"
+    scaffold(unrecorded)
+    (unrecorded / ".colosseum/evidence/runs/layer-runs.json").unlink()
+    dry_code, dry_report, _ = report_of(unrecorded)
+    code, report, err = report_of(unrecorded, "--apply")
+    row = artifact_of(report, ".colosseum/g1-claims.json#claims.C-01.required_evidence")
+    check("a claim manifest with no recorded run at all blocks, and writes nothing",
+          dry_code == 1 and dry_report["status"] == "blocked" and code == 1
+          and not (unrecorded / ".fv").exists()
+          and row is not None and row["classification"] == UNSUPPORTED,
+          f"dry={dry_code} apply={code} {row}")
+    check("the refusal distinguishes an absent run manifest from an incomplete one",
+          row is not None and "records no evidence/runs/layer-runs.json" in row["detail"]
+          and "the run manifest" in row["detail"],
+          str(row.get("detail") if row else None))
+
+    # The same shape one spelling apart: the claim says `proptests`, the run
+    # manifest recorded `proptest`, so the migrated evidence tool matches no
+    # required_evidence entry.
+    spelling = tmp / "plan-spelling"
+    scaffold(spelling)
+    with_claims(spelling, [{**G1_CLAIMS["claims"][0],
+                            "required_targets": ["proptests:sequences"],
+                            "layers": ["proptests"]}])
+    code, report, err = report_of(spelling, "--apply")
+    check("a claim naming a layer the run manifest spells differently blocks",
+          code == 1 and not (spelling / ".fv").exists()
+          and any("required_evidence" in entry and "proptests" in entry
+                  for entry in report["unsupported"]),
+          f"exit={code} {report['unsupported'][:1]}")
 
     # A legacy layer whose id the plan schema reserves cannot be declared.
     reserved = tmp / "plan-reserved-id"
@@ -984,6 +1286,35 @@ def check_unsupported(tmp: Path) -> None:
                     run["command"] = command
             write_json(root / ".colosseum/evidence/runs/layer-runs.json", runs)
         mutate(label, replace)
+
+    # Tokenizing into words is not being argv. An assignment prefix and a
+    # cwd-mutating builtin both carry no character in SHELL_CHARACTERS and
+    # both split cleanly, so nothing but an explicit refusal stops them: the
+    # first would exec a binary named `PROPTEST_CASES=4096`, and the second
+    # would run `/usr/bin/cd`, exit 0, and leave the real command at the
+    # wrong working directory.
+    for label, command, fragment in (
+        ("env-assignment-prefix", "PROPTEST_CASES=4096 cargo kani -p dossier-contract",
+         "environment assignment"),
+        ("cd-segment", "cd proofs/lean; cargo kani", "builtin 'cd'"),
+        ("export-segment", "export RUSTFLAGS=-C; cargo kani", "builtin 'export'"),
+        ("source-segment", "source ./env.sh; cargo kani", "builtin 'source'"),
+    ):
+        def assign(root: Path, command=command) -> None:
+            runs = json.loads(json.dumps(LAYER_RUNS))
+            for run in runs["runs"]:
+                if run["layer"] == "kani":
+                    run["command"] = command
+            write_json(root / ".colosseum/evidence/runs/layer-runs.json", runs)
+        _, report, root = mutate(label, assign)
+        check(f"{label}: the refusal names the construct no argv represents",
+              any("#layers.kani" in entry and fragment in entry
+                  for entry in report["unsupported"]),
+              str(report["unsupported"]))
+        check(f"{label}: no plan is written for the rest of the layers",
+              not any(write["path"] == ".fv/verification-plan.json"
+                      for write in report["writes"]),
+              str([write["path"] for write in report["writes"]]))
 
     mutate("symlink", lambda root: (root / ".colosseum/link.md").symlink_to(root / "docs/intent.md"))
     mutate("dangling-symlink", lambda root: (root / ".colosseum/gone.md").symlink_to(root / "nowhere.md"))
@@ -1121,6 +1452,23 @@ def check_apply_and_idempotency(tmp: Path) -> None:
     check("the written set is exactly the planned set",
           {path.relative_to(root).as_posix() for path in (root / ".fv").rglob("*") if path.is_file()}
           == {write["path"] for write in report["writes"]})
+    check("a successful apply reports every destination as written",
+          {write["action"] for write in report["writes"]} == {"written"},
+          str({write["action"] for write in report["writes"]}))
+    check("the apply report distinguishes what was asked from what happened",
+          report["requested_mode"] == "apply" and report["applied"] is True
+          and report["mode"] == "apply" and report["error"] is None,
+          str({key: report.get(key) for key in ("requested_mode", "applied", "mode", "error")}))
+    check("the report carries no absolute machine path",
+          report["project_root"] == "."
+          and not any(str(value).startswith("/") for value in
+                      [write["path"] for write in report["writes"]]),
+          str(report["project_root"]))
+    check("the text report still names the real project directory",
+          str(root) in migrate(root)[1], migrate(root)[1][:120])
+    check("no staging directory survives the apply",
+          not [path for path in (root / ".fv").rglob("*") if "staging" in path.name],
+          str([path.name for path in (root / ".fv").rglob("*") if "staging" in path.name]))
 
     applied = tree_digest(root / ".fv")
     second_code, second_report, _ = report_of(root, "--apply")
@@ -1161,6 +1509,12 @@ def check_conflicts(tmp: Path) -> None:
     check("a blocked apply writes no other destination",
           not (root / ".fv/obligations.json").exists()
           and not (root / ".fv/history").exists())
+    check("a blocked --apply says an apply was requested and refused",
+          dry_report["requested_mode"] == "dry-run"
+          and report_of(root, "--apply")[1]["requested_mode"] == "apply"
+          and report_of(root, "--apply")[1]["applied"] is False,
+          str({key: report_of(root, "--apply")[1].get(key)
+               for key in ("requested_mode", "applied", "mode")}))
 
     (root / ".fv/ledger.md").write_text((root / ".colosseum/ledger.md").read_text())
     code, report, _ = report_of(root, "--apply")
@@ -1185,18 +1539,55 @@ def check_conflicts(tmp: Path) -> None:
               and any(".fv/ledger.md" in entry for entry in report["conflicts"]),
               f"exit={code} {report.get('conflicts')}")
 
-    # Dispatch is updated in place, so a foreign target is a conflict.
+    # Dispatch is the one destination that is adopted rather than refused: a
+    # project initialized before the migration already carries a route, and
+    # blocking on it would make every such project unmigratable without
+    # moving the file aside. Only the two fields the migration owns change.
     existing = tmp / "conflict-dispatch"
     scaffold(existing)
     (existing / ".fv").mkdir()
     write_json(existing / ".fv/dispatch.json",
-               {"omp_native": {"project_root": ".", "target_spec": "docs/other-intent.md"}})
-    before = (existing / ".fv/dispatch.json").read_bytes()
-    code, report, _ = report_of(existing, "--apply")
-    check("a dispatch declaring another target blocks the run",
-          code == 1 and any(".fv/dispatch.json" in entry for entry in report["conflicts"])
-          and (existing / ".fv/dispatch.json").read_bytes() == before,
-          f"exit={code} {report.get('conflicts')}")
+               {"omp_native": {"project_root": "/absolute/elsewhere",
+                               "target_spec": "docs/other-intent.md",
+                               "profile": "canonical-4@sha256:abc"},
+                "panel": {"roster": ["a", "b"]}})
+    (existing / ".fv/dispatch.json").chmod(0o600)
+    narrowed = (existing / ".fv/dispatch.json").stat()
+    dry_code, dry_report, _ = report_of(existing)
+    check("an existing dispatch with another target is adopted, not refused",
+          dry_code == 0 and dry_report["status"] == "ok"
+          and any(write["path"] == ".fv/dispatch.json" and write["action"] == "adopt"
+                  for write in dry_report["writes"]),
+          f"exit={dry_code} {[w for w in dry_report['writes'] if 'dispatch' in w['path']]}")
+    check("the adoption names the route it rewrote",
+          any(write["path"] == ".fv/dispatch.json"
+              and "docs/other-intent.md" in write.get("detail", "")
+              and "docs/intent.md" in write.get("detail", "")
+              for write in dry_report["writes"]),
+          str([w.get("detail") for w in dry_report["writes"] if "dispatch" in w["path"]]))
+    code, report, err = report_of(existing, "--apply")
+    adopted = json.loads((existing / ".fv/dispatch.json").read_text())
+    check("adoption rewrites exactly the two fields the migration owns",
+          code == 0 and adopted["omp_native"]["target_spec"] == "docs/intent.md"
+          and adopted["omp_native"]["project_root"] == "."
+          and adopted["omp_native"]["profile"] == "canonical-4@sha256:abc"
+          and adopted["panel"] == {"roster": ["a", "b"]},
+          f"exit={code} {json.dumps(adopted, sort_keys=True)} {err[-160:]}")
+    # The adoption replaces the inode, so the existing file's mode has to be
+    # carried across deliberately: a route an operator narrowed must not come
+    # back at the umask default because two of its fields were rewritten.
+    adopted_stat = (existing / ".fv/dispatch.json").stat()
+    check("the adopted destination keeps the mode the operator gave it",
+          adopted_stat.st_mode & 0o7777 == narrowed.st_mode & 0o7777
+          and adopted_stat.st_ino != narrowed.st_ino,
+          f"mode {oct(narrowed.st_mode & 0o7777)} -> {oct(adopted_stat.st_mode & 0o7777)}, "
+          f"inode {narrowed.st_ino} -> {adopted_stat.st_ino}")
+    check("the adopted project resolves the migrated target",
+          fv_project.resolve_target(existing) == (existing / "docs/intent.md").resolve())
+    check("re-running after an adoption is byte-idempotent",
+          report_of(existing, "--apply")[0] == 0
+          and {write["action"] for write in report_of(existing)[1]["writes"]} == {"identical"},
+          str({write["action"] for write in report_of(existing)[1]["writes"]}))
 
     canonical = tmp / "conflict-dispatch-ok"
     scaffold(canonical)
@@ -1220,6 +1611,548 @@ def check_conflicts(tmp: Path) -> None:
     check("an unreadable dispatch blocks the run instead of being overwritten",
           code == 1 and (unreadable / ".fv/dispatch.json").read_text() == "{not json",
           f"exit={code} {report.get('conflicts')}")
+
+
+def check_containment(tmp: Path) -> None:
+    """No write leaves the real `.fv` tree, whatever the path is made of.
+
+    `mkdir(parents=True)` and an ordinary open both follow symlinks, so a
+    link at any component -- `.fv` itself included -- is the one way the
+    "only `.fv` is written" and ".colosseum stays byte-identical" promises
+    break at the same time. The destination-is-a-symlink case is covered in
+    check_conflicts; these are the intermediate components.
+    """
+    outside = tmp / "containment-outside"
+    outside.mkdir()
+    root = tmp / "containment-fv-symlink"
+    scaffold(root)
+    (root / ".fv").symlink_to(outside)
+    code, report, _ = report_of(root, "--apply")
+    check("a symlinked .fv blocks every write",
+          code == 1 and report["status"] == "blocked"
+          and all(write["action"] == "conflict" for write in report["writes"])
+          and any(".fv is a symlink" in entry for entry in report["conflicts"]),
+          f"exit={code} {report.get('conflicts', [])[:1]}")
+    check("nothing lands outside the project through the symlink",
+          [path for path in outside.rglob("*")] == [],
+          str([path.name for path in outside.rglob("*")]))
+
+    nested = tmp / "containment-history-symlink"
+    scaffold(nested)
+    (nested / ".fv").mkdir()
+    (nested / ".colosseum/imported").mkdir()
+    (nested / ".fv/history").symlink_to(nested / ".colosseum/imported")
+    legacy_before = tree_digest(nested / ".colosseum")
+    code, report, _ = report_of(nested, "--apply")
+    check("a symlinked intermediate component blocks the run",
+          code == 1 and report["status"] == "blocked"
+          and any(".fv/history is a symlink" in entry for entry in report["conflicts"]),
+          f"exit={code} {report.get('conflicts', [])[:1]}")
+    check("the legacy tree stays byte-identical behind the link",
+          tree_digest(nested / ".colosseum") == legacy_before
+          and list((nested / ".colosseum/imported").iterdir()) == [],
+          str(sorted(p.name for p in (nested / ".colosseum/imported").iterdir())))
+
+
+def check_staging_containment(tmp: Path) -> None:
+    """The staging prefix is a write path, so containment must hold for it.
+
+    `.fv/.migrate-staging` is a fixed name, and every migrated byte is
+    written through it before any destination sees it. Anything with write
+    access to `.fv` -- an operator moving staging onto a tmpfs, a restore, an
+    rsync -- can therefore leave a symlink at it long before a migration
+    runs, and no destination path crosses that link, so the per-destination
+    guards never look at it. A link there breaks the same two promises a link
+    at `.fv` breaks: the bytes leave the tree this migration may write, and
+    they can land inside the legacy tree it promises to leave alone.
+    """
+    outside = tmp / "staging-outside"
+    outside.mkdir()
+    escaping = tmp / "staging-symlink-outside"
+    scaffold(escaping)
+    (escaping / ".fv").mkdir()
+    (escaping / ".fv/.migrate-staging").symlink_to(outside)
+    code, report, _ = report_of(escaping, "--apply")
+    check("a staging prefix symlinked out of the project blocks the run",
+          code == 1 and report["status"] == "blocked"
+          and any(".fv/.migrate-staging" in entry and "is a symlink" in entry
+                  for entry in report["conflicts"]),
+          f"exit={code} {report.get('conflicts', [])[:2]}")
+    check("no migrated byte is staged outside the project through the link",
+          list(outside.rglob("*")) == [] and not (escaping / ".fv/obligations.json").exists(),
+          str([path.name for path in outside.rglob("*")]))
+
+    into_legacy = tmp / "staging-symlink-legacy"
+    scaffold(into_legacy)
+    (into_legacy / ".fv").mkdir()
+    (into_legacy / ".colosseum/imported").mkdir()
+    (into_legacy / ".fv/.migrate-staging").symlink_to(into_legacy / ".colosseum/imported")
+    legacy_before = tree_digest(into_legacy / ".colosseum")
+    code, report, _ = report_of(into_legacy, "--apply")
+    check("a staging prefix symlinked into the legacy tree blocks the run",
+          code == 1 and report["status"] == "blocked"
+          and any(".fv/.migrate-staging" in entry and "is a symlink" in entry
+                  for entry in report["conflicts"]),
+          f"exit={code} {report.get('conflicts', [])[:2]}")
+    check("the legacy tree stays byte-identical behind the staging symlink",
+          tree_digest(into_legacy / ".colosseum") == legacy_before
+          and list((into_legacy / ".colosseum/imported").rglob("*")) == [],
+          str(sorted(path.name for path in (into_legacy / ".colosseum/imported").rglob("*"))))
+
+    not_a_directory = tmp / "staging-not-a-directory"
+    scaffold(not_a_directory)
+    (not_a_directory / ".fv").mkdir()
+    (not_a_directory / ".fv/.migrate-staging").write_text("not a directory\n")
+    code, report, _ = report_of(not_a_directory, "--apply")
+    check("a staging prefix that is not a directory blocks in preflight",
+          code == 1 and report["status"] == "blocked"
+          and any(".fv/.migrate-staging" in entry and "not a directory" in entry
+                  for entry in report["conflicts"])
+          and not (not_a_directory / ".fv/obligations.json").exists(),
+          f"exit={code} {report.get('conflicts', [])[:2]}")
+
+    unwritable = tmp / "staging-unwritable"
+    scaffold(unwritable)
+    (unwritable / ".fv/.migrate-staging").mkdir(parents=True)
+    (unwritable / ".fv/.migrate-staging").chmod(0o500)
+    try:
+        code, report, _ = report_of(unwritable, "--apply")
+        check("an unwritable staging prefix blocks in preflight, before any write",
+              code == 1 and report["status"] == "blocked"
+              and any(".fv/.migrate-staging" in entry and "not writable" in entry
+                      for entry in report["conflicts"])
+              and not (unwritable / ".fv/obligations.json").exists(),
+              f"exit={code} {report.get('conflicts', [])[:2]}")
+    finally:
+        # A run that removed the prefix instead of blocking is the failure the
+        # check above reports; restoring permissions must not bury it in a
+        # traceback from the cleanup.
+        if (unwritable / ".fv/.migrate-staging").is_dir():
+            (unwritable / ".fv/.migrate-staging").chmod(0o755)
+
+    # The prefix can also be replaced between the preflight and the writes,
+    # which is the one shape preflight cannot see. The apply has to refuse
+    # before it stages a byte rather than discover it afterwards.
+    raced = tmp / "staging-symlink-raced"
+    scaffold(raced)
+    planted = tmp / "staging-raced-outside"
+    planted.mkdir()
+    probe = tmp / "staging_toctou_probe.py"
+    probe.write_text(
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(REPO / 'scripts')!r})\n"
+        "from pathlib import Path\n"
+        "import fv_migrate\n"
+        "project, target = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "migration = fv_migrate.Migration(project)\n"
+        "migration.build()\n"
+        "(project / '.fv').mkdir(exist_ok=True)\n"
+        "(project / '.fv' / '.migrate-staging').symlink_to(target)\n"
+        "failure = None\n"
+        "try:\n"
+        "    migration.apply()\n"
+        "except (fv_migrate.MigrationError, OSError) as error:\n"
+        "    failure = str(error)\n"
+        "print(json.dumps(migration.report(requested='apply', applied=False, error=failure)))\n")
+    result = subprocess.run([sys.executable, str(probe), str(raced), str(planted)],
+                            capture_output=True, text=True, timeout=300)
+    report = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    check("a staging prefix replaced after preflight is refused at apply time",
+          "staging path is a symlink" in (report.get("error") or ""),
+          (report.get("error") or result.stderr[-200:])[:200])
+    check("not one byte is staged through the planted link",
+          list(planted.rglob("*")) == []
+          and {write["action"] for write in report.get("writes", [])} == {"pending"},
+          str([path.name for path in planted.rglob("*")])
+          + str(sorted({write["action"] for write in report.get("writes", [])})))
+
+
+def write_rollback_probe(path: Path) -> Path:
+    """Write a probe that drives a preflight-clean apply into its rollback.
+
+    `.fv/history` loses write permission between the build and the apply,
+    which is the one failure preflight cannot see, so the rollback is reached
+    without patching the migrator. The probe prints the report of the failed
+    apply: that report is the only enumeration of what happened to each
+    destination.
+    """
+    path.write_text(
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(REPO / 'scripts')!r})\n"
+        "from pathlib import Path\n"
+        "import fv_migrate\n"
+        "project = Path(sys.argv[1])\n"
+        "migration = fv_migrate.Migration(project)\n"
+        "migration.build()\n"
+        "(project / '.fv' / 'history').chmod(0o500)\n"
+        "failure = None\n"
+        "try:\n"
+        "    migration.apply()\n"
+        "except (fv_migrate.MigrationError, OSError) as error:\n"
+        "    failure = str(error)\n"
+        "report = migration.report(requested='apply', applied=False, error=failure)\n"
+        "(project / '.fv' / 'history').chmod(0o755)\n"
+        "print(json.dumps(report))\n")
+    return path
+
+
+def check_apply_atomicity(tmp: Path) -> None:
+    """A preflight-clean apply that fails mid-way leaves no partial state and
+    still reports what happened to every destination."""
+    unwritable = tmp / "atomic-unwritable"
+    scaffold(unwritable)
+    (unwritable / ".fv/history").mkdir(parents=True)
+    (unwritable / ".fv/history").chmod(0o500)
+    try:
+        code, report, _ = report_of(unwritable, "--apply")
+        check("an unwritable destination directory blocks in preflight, before any write",
+              code == 1 and report["status"] == "blocked"
+              and any("not writable" in entry for entry in report["conflicts"])
+              and not (unwritable / ".fv/dispatch.json").exists(),
+              f"exit={code} {report.get('conflicts', [])[:1]}")
+    finally:
+        (unwritable / ".fv/history").chmod(0o755)
+
+    # A failure preflight cannot see: the directory loses write permission
+    # between the preflight and the writes. The apply must roll back and the
+    # report must still be produced, naming each destination's real fate.
+    racing = tmp / "atomic-rollback"
+    scaffold(racing)
+    (racing / ".fv/history").mkdir(parents=True)
+    probe = write_rollback_probe(tmp / "atomic_probe.py")
+    result = subprocess.run([sys.executable, str(probe), str(racing)],
+                            capture_output=True, text=True, timeout=300)
+    report = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    actions = {write["action"] for write in report.get("writes", [])}
+    left = sorted(path.relative_to(racing).as_posix()
+                  for path in (racing / ".fv").rglob("*") if path.is_file())
+    check("a mid-apply failure still produces a report",
+          bool(report) and report.get("error"), result.stdout[:120] + result.stderr[-200:])
+    check("the report enumerates what happened to each destination",
+          actions <= {"failed", "lost", "pending", "rolled-back", "written"}
+          and "rolled-back" in actions and "failed" in actions
+          and "lost" not in actions,
+          str(sorted(actions)))
+    check("the rollback leaves no partially migrated .fv tree", left == [], str(left))
+    check("a rolled-back apply is not reported as applied",
+          report.get("applied") is False and report.get("mode") == "dry-run"
+          and report.get("requested_mode") == "apply",
+          str({key: report.get(key) for key in ("applied", "mode", "requested_mode")}))
+    rerun_code, rerun_report, _ = report_of(racing, "--apply")
+    check("the project is still migratable after a rolled-back apply",
+          rerun_code == 0 and rerun_report["status"] == "ok"
+          and (racing / ".fv/obligations.json").is_file(),
+          f"exit={rerun_code} {rerun_report.get('conflicts')}")
+
+
+def check_rollback_restores_metadata(tmp: Path) -> None:
+    """A rollback puts a replaced destination back as the file it was.
+
+    `.fv/dispatch.json` is the one destination an apply replaces instead of
+    refusing, so it is the only file a rollback has to restore rather than
+    remove. Restoring its bytes is not enough: a file re-created from saved
+    bytes carries the umask's mode and a new identity, which is how an apply
+    that failed halfway silently widens the permissions of a route an
+    operator narrowed. The original is therefore moved aside and renamed
+    back, and the whole inode is what this asserts returned.
+    """
+    root = tmp / "rollback-metadata"
+    scaffold(root)
+    (root / ".fv/history").mkdir(parents=True)
+    dispatch = root / ".fv/dispatch.json"
+    dispatch.write_text(json.dumps(
+        {"omp_native": {"project_root": ".", "target_spec": "docs/other.md"}}, indent=2) + "\n")
+    dispatch.chmod(0o640)
+    os.utime(dispatch, (1700000000, 1700000000))
+    before_bytes = dispatch.read_bytes()
+    before = dispatch.stat()
+
+    probe = write_rollback_probe(tmp / "metadata_probe.py")
+    result = subprocess.run([sys.executable, str(probe), str(root)],
+                            capture_output=True, text=True, timeout=300)
+    report = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    row = next((write for write in report.get("writes", [])
+                if write["path"] == ".fv/dispatch.json"), {})
+    after = dispatch.stat()
+    check("the destination the apply replaced is reported as rolled back",
+          row.get("action") == "rolled-back",
+          str(row) + result.stdout[:80] + result.stderr[-200:])
+    check("a rollback restores the replaced destination's bytes",
+          dispatch.read_bytes() == before_bytes)
+    check("a rollback restores the replaced destination's mode",
+          after.st_mode & 0o7777 == before.st_mode & 0o7777,
+          f"{oct(before.st_mode & 0o7777)} -> {oct(after.st_mode & 0o7777)}")
+    check("a rollback renames the original inode back rather than rewriting it",
+          after.st_ino == before.st_ino and after.st_mtime == before.st_mtime,
+          f"inode {before.st_ino} -> {after.st_ino}, "
+          f"mtime {before.st_mtime} -> {after.st_mtime}")
+    check("a finished rollback leaves no staging tree behind",
+          not (root / ".fv/.migrate-staging").exists(),
+          sorted(path.as_posix() for path in (root / ".fv/.migrate-staging").rglob("*"))[:3]
+          if (root / ".fv/.migrate-staging").exists() else "")
+
+    # A rollback that cannot finish must not destroy what it was holding.
+    # The staged original is the only copy of a replaced destination, so the
+    # staging tree is dropped only once every restore succeeded; here the
+    # move back is made to fail, and the original has to remain recoverable
+    # and the report has to say the destination is gone rather than claim it
+    # was put back.
+    unfinished = tmp / "rollback-unfinished"
+    scaffold(unfinished)
+    (unfinished / ".fv").mkdir()
+    route = unfinished / ".fv/dispatch.json"
+    route.write_text(json.dumps(
+        {"omp_native": {"project_root": ".", "target_spec": "docs/other.md"}}, indent=2) + "\n")
+    route.chmod(0o640)
+    route_bytes = route.read_bytes()
+    failing = tmp / "unfinished_probe.py"
+    failing.write_text(
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(REPO / 'scripts')!r})\n"
+        "from pathlib import Path\n"
+        "import fv_migrate\n"
+        "real = os.replace\n"
+        "def failing(source, destination):\n"
+        "    if str(destination).endswith('.fv/dispatch.json'):\n"
+        "        raise OSError(5, 'simulated I/O error')\n"
+        "    return real(source, destination)\n"
+        "migration = fv_migrate.Migration(Path(sys.argv[1]))\n"
+        "migration.build()\n"
+        "os.replace = failing\n"
+        "failure = None\n"
+        "try:\n"
+        "    migration.apply()\n"
+        "except (fv_migrate.MigrationError, OSError) as error:\n"
+        "    failure = str(error)\n"
+        "os.replace = real\n"
+        "print(json.dumps(migration.report(requested='apply', applied=False, error=failure)))\n")
+    result = subprocess.run([sys.executable, str(failing), str(unfinished)],
+                            capture_output=True, text=True, timeout=300)
+    report = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    row = next((write for write in report.get("writes", [])
+                if write["path"] == ".fv/dispatch.json"), {})
+    check("a destination the rollback could not restore is reported lost, not rolled back",
+          row.get("action") == "lost" and ".fv/dispatch.json" in (report.get("error") or ""),
+          str(row) + (report.get("error") or result.stderr[-200:])[:200])
+    staged = sorted(path for path in (unfinished / ".fv/.migrate-staging").rglob("saved/*")
+                    if path.is_file())
+    check("an unfinished rollback keeps the replaced original recoverable",
+          [path.read_bytes() for path in staged] == [route_bytes]
+          and all(path.stat().st_mode & 0o7777 == 0o640 for path in staged),
+          str([(path.name, oct(path.stat().st_mode & 0o7777)) for path in staged]))
+
+
+def check_aside_failure(tmp: Path) -> None:
+    """A move-aside that fails leaves its destination exactly where it was.
+
+    The rollback restores a replaced destination by renaming the original
+    inode back, so the apply may record that it is holding an original only
+    once the aside actually happened. Fail the aside itself and the file
+    never moved: reporting it `lost` would send an operator to a saved copy
+    that does not exist, and would keep a staging tree holding nothing
+    forever on the strength of that claim, since nothing ever sweeps a
+    retained staging tree.
+    """
+    root = tmp / "aside-failure"
+    scaffold(root)
+    (root / ".fv").mkdir()
+    dispatch = root / ".fv/dispatch.json"
+    dispatch.write_text(json.dumps(
+        {"omp_native": {"project_root": ".", "target_spec": "docs/other.md"}}, indent=2) + "\n")
+    dispatch.chmod(0o640)
+    before_bytes = dispatch.read_bytes()
+    before = dispatch.stat()
+    probe = tmp / "aside_probe.py"
+    probe.write_text(
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(REPO / 'scripts')!r})\n"
+        "from pathlib import Path\n"
+        "import fv_migrate\n"
+        "real = os.replace\n"
+        "def failing(source, destination):\n"
+        "    # Fail only the aside: its target is the staging copy under\n"
+        "    # saved/, never a real destination under .fv.\n"
+        "    if 'saved' in Path(destination).parts:\n"
+        "        raise OSError(28, 'simulated no space left on device')\n"
+        "    return real(source, destination)\n"
+        "migration = fv_migrate.Migration(Path(sys.argv[1]))\n"
+        "migration.build()\n"
+        "os.replace = failing\n"
+        "failure = None\n"
+        "try:\n"
+        "    migration.apply()\n"
+        "except (fv_migrate.MigrationError, OSError) as error:\n"
+        "    failure = str(error)\n"
+        "os.replace = real\n"
+        "print(json.dumps(migration.report(requested='apply', applied=False, error=failure)))\n")
+    result = subprocess.run([sys.executable, str(probe), str(root)],
+                            capture_output=True, text=True, timeout=300)
+    report = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    actions = {write["action"] for write in report.get("writes", [])}
+    row = next((write for write in report.get("writes", [])
+                if write["path"] == ".fv/dispatch.json"), {})
+    after = dispatch.stat()
+    check("a destination whose move-aside failed is reported failed, not lost",
+          row.get("action") == "failed" and "lost" not in actions
+          and "no longer present" not in (report.get("error") or ""),
+          str(row) + (report.get("error") or result.stderr[-200:])[:200])
+    check("the destination whose move-aside failed is still the file it was",
+          dispatch.read_bytes() == before_bytes and after.st_ino == before.st_ino
+          and after.st_mode & 0o7777 == before.st_mode & 0o7777,
+          f"inode {before.st_ino} -> {after.st_ino}, "
+          f"mode {oct(before.st_mode & 0o7777)} -> {oct(after.st_mode & 0o7777)}")
+    check("an apply that held no original retains no staging tree",
+          not (root / ".fv/.migrate-staging").exists(),
+          str(sorted(path.as_posix()
+                     for path in (root / ".fv/.migrate-staging").rglob("*"))[:3])
+          if (root / ".fv/.migrate-staging").exists() else "")
+    rerun_code, rerun_report, _ = report_of(root, "--apply")
+    check("the project is still migratable after a failed move-aside",
+          rerun_code == 0 and rerun_report["status"] == "ok"
+          and (root / ".fv/obligations.json").is_file(),
+          f"exit={rerun_code} {rerun_report.get('conflicts')}")
+
+
+def check_staging_race(tmp: Path) -> None:
+    """Concurrent migrations of one project share only the staging prefix.
+
+    Every run drops that prefix once it is empty, so a sibling can remove it
+    between this run's `mkdir` and its `mkdtemp`. That is a race, not a
+    failure: the prefix is recreated and the attempt repeated. A prefix that
+    keeps vanishing is named as the concurrent migration it is instead of
+    surfacing as `ENOENT` on a temp path, and writes nothing either way.
+    """
+    probe = tmp / "staging_race_probe.py"
+    probe.write_text(
+        "import json, sys, tempfile\n"
+        f"sys.path.insert(0, {str(REPO / 'scripts')!r})\n"
+        "from pathlib import Path\n"
+        "import fv_migrate\n"
+        "project, budget = Path(sys.argv[1]), int(sys.argv[2])\n"
+        "real, calls = tempfile.mkdtemp, []\n"
+        "def racing(*args, **kwargs):\n"
+        "    calls.append(1)\n"
+        "    if len(calls) <= budget:\n"
+        "        # exactly what a sibling run's own cleanup does to the prefix\n"
+        "        Path(kwargs['dir']).rmdir()\n"
+        "        raise FileNotFoundError(2, 'No such file or directory')\n"
+        "    return real(*args, **kwargs)\n"
+        "tempfile.mkdtemp = racing\n"
+        "migration = fv_migrate.Migration(project)\n"
+        "migration.build()\n"
+        "failure = None\n"
+        "try:\n"
+        "    migration.apply()\n"
+        "except (fv_migrate.MigrationError, OSError) as error:\n"
+        "    failure = str(error)\n"
+        "tempfile.mkdtemp = real\n"
+        "print(json.dumps({'report': migration.report(requested='apply',\n"
+        "                                             applied=failure is None, error=failure),\n"
+        "                  'calls': len(calls),\n"
+        "                  'attempts': fv_migrate.STAGING_ATTEMPTS}))\n")
+
+    transient = tmp / "staging-race-transient"
+    scaffold(transient)
+    result = subprocess.run([sys.executable, str(probe), str(transient), "1"],
+                            capture_output=True, text=True, timeout=300)
+    payload = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    report = payload.get("report", {})
+    check("a prefix a sibling removed mid-startup is recreated and the apply proceeds",
+          report.get("error") is None and payload.get("calls") == 2
+          and {write["action"] for write in report.get("writes", [])} == {"written"}
+          and (transient / ".fv/obligations.json").is_file(),
+          f"calls={payload.get('calls')} {str(report.get('error'))[:160]} "
+          f"{sorted({write['action'] for write in report.get('writes', [])})}"
+          f"{result.stderr[-160:]}")
+    check("the retried run leaves no staging tree behind",
+          not (transient / ".fv/.migrate-staging").exists())
+
+    persistent = tmp / "staging-race-persistent"
+    scaffold(persistent)
+    result = subprocess.run([sys.executable, str(probe), str(persistent), "99"],
+                            capture_output=True, text=True, timeout=300)
+    payload = json.loads(result.stdout) if result.stdout.startswith("{") else {}
+    report = payload.get("report", {})
+    check("a prefix that keeps vanishing is reported as the concurrent migration it is",
+          "another migration of this project removed the shared staging prefix"
+          in (report.get("error") or "")
+          and payload.get("calls") == payload.get("attempts"),
+          (report.get("error") or result.stderr[-200:])[:200]
+          + f" calls={payload.get('calls')} attempts={payload.get('attempts')}")
+    check("the named race writes nothing and leaves no .fv tree behind",
+          report.get("applied") is False
+          and {write["action"] for write in report.get("writes", [])} == {"pending"}
+          and not (persistent / ".fv").exists(),
+          str(sorted({write["action"] for write in report.get("writes", [])}))
+          + (str(sorted(path.name for path in (persistent / ".fv").rglob("*")))
+             if (persistent / ".fv").exists() else ""))
+
+
+def check_killed_apply_residue(tmp: Path) -> None:
+    """A hard-killed apply strands only snapshot-excluded residue.
+
+    `SIGKILL` runs no rollback and no cleanup, so whatever the staging tree
+    held at that moment stays on disk. What keeps it from invalidating the
+    evidence a later run binds is where it lives: one fixed prefix the
+    verified-input snapshot excludes structurally -- before the migrated
+    exclusion list exists, since the kill may precede it -- with a unique
+    subdirectory per run, so no later apply inherits or disturbs it.
+    """
+    root = tmp / "killed-apply"
+    scaffold(root)
+    probe = tmp / "killed_apply_probe.py"
+    probe.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(REPO / 'scripts')!r})\n"
+        "from pathlib import Path\n"
+        "import fv_migrate\n"
+        "migration = fv_migrate.Migration(Path(sys.argv[1]))\n"
+        "migration.build()\n"
+        "real, seen = os.replace, []\n"
+        "def killing(source, destination):\n"
+        "    seen.append(destination)\n"
+        "    if len(seen) == 3:\n"
+        "        os.kill(os.getpid(), signal.SIGKILL)\n"
+        "    return real(source, destination)\n"
+        "os.replace = killing\n"
+        "migration.apply()\n")
+    result = subprocess.run([sys.executable, str(probe), str(root)],
+                            capture_output=True, text=True, timeout=300)
+    check("the probe really was killed mid-apply, not merely failed",
+          result.returncode == -signal.SIGKILL,
+          f"exit={result.returncode} {result.stderr[-200:]}")
+    left = sorted(path.relative_to(root).as_posix()
+                  for path in (root / ".fv").rglob("*") if path.is_file())
+    destinations = {write["path"] for write in report_of(root)[1].get("writes", [])}
+    residue = [path for path in left if path not in destinations]
+    unexcluded = [path for path in residue
+                  if not fv_project.is_excluded(path, fv_project.DEFAULT_EXCLUSIONS)]
+    check("a hard kill leaves residue behind at all, so the claim is not vacuous",
+          bool(residue), str(left[:3]))
+    check("every stranded byte is excluded from the snapshot structurally",
+          not unexcluded, str(unexcluded[:3]))
+    check("the stranded residue sits under one fixed prefix",
+          len({"/".join(path.split("/")[:2]) for path in residue}) == 1,
+          str(sorted({"/".join(path.split("/")[:2]) for path in residue})))
+    check("the migrated project's own exclusion list covers it too",
+          all(fv_project.is_excluded(path, fv_project.load_exclusions(root))
+              for path in residue))
+
+    stranded_before = {path: (root / path).read_bytes() for path in residue}
+    runs_before = {path.split("/")[2] for path in residue}
+    rerun_code, rerun_report, _ = report_of(root, "--apply")
+    check("the project is still migratable after a hard-killed apply",
+          rerun_code == 0 and rerun_report["status"] == "ok"
+          and (root / ".fv/obligations.json").is_file(),
+          f"exit={rerun_code} {rerun_report.get('conflicts')}")
+    after = sorted(path.relative_to(root).as_posix()
+                   for path in (root / ".fv/.migrate-staging").rglob("*") if path.is_file())
+    check("a later apply does not disturb the killed run's staging tree",
+          {path: (root / path).read_bytes() for path in after} == stranded_before,
+          str(sorted(set(after) ^ set(stranded_before))[:3]))
+    check("a later apply stages under its own subdirectory and removes it",
+          {path.split("/")[2] for path in after} == runs_before,
+          str(sorted({path.split("/")[2] for path in after})))
 
 
 def check_cli(tmp: Path) -> None:
@@ -1268,6 +2201,20 @@ def main() -> int:
         check_apply_and_idempotency(tmp)
         print("conflicts")
         check_conflicts(tmp)
+        print("containment")
+        check_containment(tmp)
+        print("staging containment")
+        check_staging_containment(tmp)
+        print("apply atomicity")
+        check_apply_atomicity(tmp)
+        print("rollback restores metadata")
+        check_rollback_restores_metadata(tmp)
+        print("move-aside failure")
+        check_aside_failure(tmp)
+        print("staging race")
+        check_staging_race(tmp)
+        print("killed-apply residue")
+        check_killed_apply_residue(tmp)
         print("cli")
         check_cli(tmp)
     print()

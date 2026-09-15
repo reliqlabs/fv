@@ -20,7 +20,7 @@ committed on `main`, one commit per item:
 | M3 live calibration | `calibration/2026-07-13-r1`: blinded seeded-defect run, six scoreable voices | done |
 | OMP-native integration | ModelRegistry-backed adversary fan-out, generated routes, fail-closed session-root gate, live-tree preflight, process-local fallback suppression, failure-isolated evidence, initializer/doctor support (R29/R30/R33) | implemented on `feature/omp-integration`; the canonical 4-voice run is recorded at `calibration/2026-07-28-r3/`. Native calibration remains pending at the route level: one voice is attested and cited; two are unattested and one degraded. |
 | OMP-native deliberation panel | Three-wave `fv-panel` skill (drafts → blinded cross-review → synthesis): family/coverage quorum, randomized-label blinding + deferred identity, brief + git target-drift gating (binary-safe, full-digest, `.fv`-excluded), harness-aware doctor, `project-plan` + `milestone-review` modes (R31, ~50 assertions incl. a real Gate B end-to-end; R32 resolver dispatch-identity contract executed under Bun) | committed on `feature/omp-integration`; **`project-plan` live-verified** project-rooted (`calibration/2026-07-23-omp-panel-e2e/`, 3-family COMPLETE) but uncalibrated; **`milestone-review` EXPERIMENTAL** — evidence-bound fail-closed guard + Gate B `--expect-intent`/`--snapshot-exact`/dup-rejection are correct and deterministically tested, but not yet run against a real project's itf_replay G1 records + live panel; roster-resolver extension live-verified in a real OMP session (`calibration/2026-07-24-resolver-live/`: `ctx.models.family` distinctness positive + negative, canonical `provider/id` dispatch identity, both active seats serving real inference at `:max`); active roster is Sol+GLM (min_families=2) with Fable/Kimi-k3 pending; full three-wave run on that roster and calibration pending |
-| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | implemented 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`); focused suites PASS, full `ci.py` not yet run, and no real legacy project has been migrated |
+| Migration readiness | Canonical `target_spec` resolution, verified-input content snapshots, Gate A citation grammar, `system_claims` + evidence cohorts, configurable/custom verification layers, non-destructive `.colosseum` shadow migration with quarantined legacy evidence | implemented 2026-09-15 (`f2d0556`, `9eb3709`, `b1003a3`); code-adversarial pass complete (two reports under `.fv/code-adversarial/`, 32 findings, every one corrected in the current uncommitted correction set); focused suites PASS, full `ci.py` not yet run, and no real legacy project has been migrated |
 
 Gate: `./scripts/ci.py` validates frontmatter, agent policy, roster drift,
 documentation links, dispatch configuration, fixture tracking, and the full
@@ -68,7 +68,7 @@ The plan of record's "dependable" gate has ten criteria. Current state:
 | 3 | Evidence bound to snapshot/intent/manifest/tools/seeds/hashes | satisfied (R27) |
 | 4 | Lean and Quint evidence classes honest | satisfied (R7, R8) |
 | 5 | Least-privilege external-model execution + injection fixtures | satisfied (R10-R12; deny-first confirmed live) |
-| 6 | Cross-axis claims labeled conformance-tested until refinement exists | satisfied (R24, R26) |
+| 6 | Cross-axis claims labeled conformance-tested until refinement exists | satisfied (R24; R26's scoped-verdict half is asserted only where a verdict is observable — see "Test-quality cleanup" below — and no repo-wide label sweep guards a future emitter) |
 | 7 | Critique loop exercised once on a REAL contested finding, recorded per G4 | satisfied (`dogfood/jobq-2026-07-13/ADJUDICATION.md`: panel attack on jobq; F2 finite-arithmetic gap retained OPEN under G4, corroborated by the W5 Aeneas proof) |
 | 8 | Skills/agents/wrappers pass pinned validators | satisfied (R13) |
 | 9 | Known-good reference project passes; known-bad variants fail at intended gates | satisfied (R22, `tests/fixtures/r22/` jobq project + `tests/r22_reference_project.py`) |
@@ -264,23 +264,59 @@ Delivered:
 - **Verified-input content snapshot.** `.fv/verified-inputs.txt` is an
   exclusion-prefix list over `git ls-files --cached --others
   --exclude-standard`; the snapshot is `sha256:<hex>` over sorted
-  path + NUL + content-hash lines. `tools/evidence-run.ts` recomputes it (plus
-  the intent and manifest hashes) around every execution; Gate B recomputes and
-  demands an exact match unless `--expect-snapshot` / `--allow-unbound` are
-  passed. Evidence no longer binds to a commit id plus a dirty flag.
+  path + NUL + content-hash lines. `.fv/evidence/`, `.fv/verify/`,
+  `.fv/panels/`, `.fv/history/`, `.fv/.migrate-staging/`, and `.colosseum/`
+  are structural defaults in `fv_project.DEFAULT_EXCLUSIONS`, mirrored in
+  `tools/evidence-run.ts`, that no project file can drop; a non-regular
+  verified input is classified instead of
+  opened, and a list whose line terminators the Python and TypeScript parsers
+  would read differently is rejected on both ends. `tools/evidence-run.ts`
+  recomputes the snapshot (plus the intent and manifest hashes) before the
+  toolchain probes and around every execution; Gate B recomputes and demands
+  an exact match unless `--expect-snapshot` / `--expect-intent` /
+  `--allow-unbound` are passed, and discloses which discipline ran in the
+  verdict scope as `binding=recomputed|pinned|unbound`. A `+dirty` snapshot
+  cannot PASS in any comparison mode. Evidence no longer binds to a commit id
+  plus a dirty flag.
 - **Gate A citation grammar.** `scripts/check_ledger_references.py` parses four
   citation forms explicitly instead of one ambiguous alternation: a `code:`
   value that looks like a citation but does not parse now fails loudly, a
   broken `@sha256:` binding is drift rather than prose, and `**Depends on:**` /
   `### Depends on:` blocks are recognized, so per-link Kani coverage fires on
-  real ledgers it previously skipped entirely.
+  real ledgers it previously skipped entirely. A `kani:` body is parsed
+  against a grammar rather than searched for as a substring — any
+  identifier-shaped harness name, a `path:line` locator, or
+  `skipped because <reason>` with a reviewable reason. A bare identifier is a
+  valid harness name, so the closed `NON_HARNESS_TOKENS` list — matched
+  case-folded with surrounding `_` stripped, catching `NOT_APPLICABLE` and
+  `_none_` alike — is the whole defence against a placeholder, and an
+  identifier-shaped one is rejected by name (`'<tok>' is a placeholder, not a
+  harness name`) while a non-identifier body such as `n/a` or `-` gets the
+  generic rejection. A bare `kani: skipped` is not coverage either, and two
+  separate guards keep the marker honest: a negative lookbehind for
+  `barkani:` and `(?!:)` for `kani::proof`, the second being what leaves the
+  Rust attribute path citable by name. A `Depends on:` block ends at a blank
+  line, a heading, a further
+  `Depends on:` header, or any non-entry line, so an unrelated later bullet
+  list is no longer counted as a trust-chain link. Across a blank line only a
+  list indented deeper than the header continues the block; a bullet at the
+  header's own indentation after a blank line is deliberately not readmitted,
+  because that shape is exactly the unrelated prose bullet the old latch
+  miscounted. The residual is fail-open and recorded as a contract choice
+  rather than guessed at: a ledger that means to continue a link list indents
+  its entries under the header, which is what `fv-compose` Step 3 prescribes.
 - **System claims and evidence cohorts.** `obligations.json` accepts
   `system_claims` (`depends_on` over declared obligations, `required_evidence`
   over tool IDs). `fv-evidence-run/v3` adds `intent_path` and a nonempty
   `executions` array; a cohort's verdict is atomic — every execution PASSes and
-  every binding holds still, or the record is FAIL. A system claim PASSes only
-  when every required tool appears among PASS executions;
-  `coverage_dashboard.py` distinguishes `coverage-gap` from `dependency-gap`.
+  every binding holds still, or the record is FAIL. The obligation/class
+  compatibility table and the unwaived-assumption rule quantify over the whole
+  cohort, and one raw artifact discharges exactly one execution of one claim.
+  A system claim PASSes only when every required tool appears among PASS
+  executions, and judging one through `--require` pulls its `depends_on`
+  obligations into the required set; `coverage_dashboard.py` distinguishes
+  `evidence-gap` from `dependency-gap` and applies Gate B's own v3 cohort
+  schema, so the two tools cannot disagree about which records are valid.
   v2 records remain accepted.
 - **Configurable and custom verification layers.** `pyramid_run.py --plan`
   reads `fv-verification-plan/v1`: per-layer `required` plus argv/cwd/timeout/env
@@ -288,7 +324,9 @@ Delivered:
   Non-reserved layer ids are accepted as custom layers, run after the known
   `LAYER_ORDER` in lexical order, join `required_layers` when `required: true`,
   and go `not_run` under a types failure like any other layer. A malformed plan
-  is exit 2 before any layer runs.
+  is exit 2 before any layer runs, and an execution naming an absent
+  executable is a recorded `failed` layer with a `launch_error` rather than a
+  traceback that suppresses the whole report.
 - **Portability.** Target declarations, execution `cwd`s, and `intent_path`
   are repo-relative and containment-checked; evidence binds to content, not to
   a commit. A record earned in one clone is checkable in another with the same
@@ -305,13 +343,51 @@ Delivered:
   ids are normalized deterministically (`quint:invS7` to `quint.invS7`) so every
   migrated id is directly usable as an `fv_evidence_run` `claim_id`, each
   rewritten obligation carries `legacy_id` for traceability, and colliding or
-  empty normalized ids block the run instead of being suffixed apart. `--apply`
-  is byte-idempotent; `--json` emits a deterministic `fv-migration-report/v1`.
+  empty normalized ids block the run instead of being suffixed apart. The
+  dispatch target is elected from the legacy pointer stub first and the
+  ledger's citations only second — never by frequency of mention in legacy
+  prose — with two or more surviving candidates, or none, blocking; the
+  elected `target_spec` is a top-level report field. `--apply` stages every
+  write under `.fv/.migrate-staging/<pid>-<random>/` and then moves each into
+  place, moving an existing destination aside into the same staging tree so a
+  rollback renames its own inode back with mode, ownership and timestamps
+  intact, rolling back what
+  already moved if one fails, refuses a destination path that crosses a
+  symlink at any component (`.fv` itself included) or an unwritable
+  destination directory, and prints the report even on failure with each
+  write's action (`written`, `rolled-back`, `failed`, `lost`, `pending`), where
+  `lost` is a destination whose original could not be renamed back.
+  `.fv/dispatch.json` is adopted rather than refused: an existing route keeps
+  every field except the `project_root` and `target_spec` the migration owns.
+  A claim key with no typed slot survives under `legacy_fields` and is named
+  in a deviation row, an evidence tool no migrated execution can produce is
+  `unsupported`, and a layer any migrated claim names is written
+  `required: true`. That completeness check is intentionally blocking in the
+  degenerate case too: a legacy tree with claims but no recorded
+  `evidence/runs/layer-runs.json` declares no executions at all, so its
+  claims name evidence the plan cannot produce and the migration refuses
+  until the runs are recorded or the claims stop naming unrunnable layers.
+  A migrated manifest whose claims can never be discharged would read as
+  "evidence missing" forever instead of "never runnable here". `--apply` is
+  byte-idempotent; `--json` emits a
+  deterministic `fv-migration-report/v1` naming the requested mode and
+  whether it applied.
 - **Old-evidence quarantine.** Legacy `.colosseum/evidence/` records are never
   copied into `.fv/evidence/`: a v1/v2 record cannot satisfy v3 bindings, so it
   is preserved byte-for-byte under `.fv/history/colosseum/` and classified
-  `preserved-history`. `.fv/history/` is excluded from the verified-input
-  snapshot so quarantined history cannot perturb fresh evidence. The legacy
+  `preserved-history`. `.fv/history/` and the migrator's staging prefix
+  `.fv/.migrate-staging/` are both structural default exclusions in
+  `fv_project.DEFAULT_EXCLUSIONS` and its `tools/evidence-run.ts` mirror, so
+  neither quarantined history nor a staging tree can perturb fresh evidence,
+  even after `fv_init --force` rewrites the project's exclusion file. A
+  migration killed outright strands one
+  `.fv/.migrate-staging/<pid>-<random>/` directory, and a rollback that could
+  not put a destination back keeps its own deliberately, since the aside-moved
+  original inode is then the only copy of the replaced bytes and the error
+  names the retained directory. Either residue is snapshot-excluded, cannot
+  collide with a later run, and is safe to delete once accounted for. Nothing
+  sweeps it, deliberately: no later run can distinguish a dead staging tree
+  from a live migration's, or from a rollback's surviving originals. The legacy
   *include*-shaped `verified-inputs.txt` is preserved as history rather than
   inverted, and FV's conservative exclusion defaults are written instead.
 
@@ -323,10 +399,73 @@ change record): `py_compile` over changed Python modules plus
 `r28_baseline_floors`, `r20_verdict_truth_table`, `r35_colosseum_migration`,
 `r36_dossier_rehearsal`, with `git diff --check` clean.
 
-Not claimed, and the next steps for this item: a full `./scripts/ci.py` run
-over these commits; a code-adversarial pass over `fv_migrate.py`, the
-`pyramid_run.py` plan path, and the `evidence-run.ts` cohort path; and a real
-legacy-project dry run. **No real legacy project has been cut over.** `r36` is
+Test-quality cleanup in the same set: `r24_r26_conformance` drops its three
+R26 label-sweep checks, which grepped `scripts/*.py` and the doc sources for
+`REFINEMENT_VERIFIED` and for an unscoped `VERIFIED`. A banned-substring scan
+over source text is not the contract — a docstring or a comment trips it and a
+renamed emitter evades it — so it is not restored in any form. What is asserted
+instead is every place a verdict is actually observable: `r24_r26_conformance`
+still checks that a conformance scope survives Gate B aggregation (the JSON
+verdict starts `VERIFIED[` and the per-claim scope carries the replay
+parameters); `r1_r21_r27_ledger_gates` checks that Gate B emits
+`VERIFIED[profile=...; binding=unbound]` and never a bare `VERDICT: VERIFIED`;
+`r6_manifest_failclosed` checks that `recomputed`, `pinned`, and `unbound` are
+each disclosed in the scope; `m1_coverage` pins the dashboard's exact scope, exercises
+the bare-versus-scoped token discipline, and runs the dashboard's `--check`
+self-scan over a repository-shaped fixture; and `coverage_dashboard.py --check`
+scans its own table, banner, and JSON payload for an unscoped verdict. The gap this leaves is stated rather than papered
+over: no check now watches a *new* emitter anywhere in the repository, so a
+future script printing a bare `VERIFIED` or an unscoped `REFINEMENT_VERIFIED`
+would be caught by review, not by a test. R24's conformance-bridge assertions
+are unchanged.
+
+The code-adversarial pass is complete: `.fv/code-adversarial/2026-09-15-evidence-architecture.json`
+(17 findings: 1 HIGH, 4 MEDIUM, 1 MEDIUM-LOW, 1 LOW-MEDIUM, 8 LOW, 2 INFO) and
+`.fv/code-adversarial/2026-09-15-shadow-migration.json` (15 findings: 2 high,
+2 medium-high, 6 medium, 3 low-medium, 2 low). All 32 findings have corrections
+in the current **uncommitted** set across `check_evidence_records.py`,
+`coverage_dashboard.py`, `fv_project.py`, `fv_migrate.py`, `pyramid_run.py`,
+`check_ledger_references.py`, `tools/evidence-run.ts`, and their suites; the
+two documentation findings (a status string spelled `coverage-gap` in four
+documents the dashboard has always emitted as `evidence-gap`, and stale line
+citations in the change record) are fixed where they live, and the citations
+are now symbol names so a later refactor cannot silently invalidate them.
+
+Those corrections were then re-reviewed by two further read-only operators,
+neither the author of the corrections. The migration surface came back
+**15/15 original findings resolved**, with five observations recorded rather
+than hidden: the `Depends on:` loose-list residue above, the
+claims-without-a-run-manifest block above, a single-identifier Kani harness
+name the grammar now accepts, rollback restoring a pre-existing destination's
+bytes but not its mode, and the staging-directory residue above. The last two
+of those are closed in the final wave — rollback now moves the original aside
+into the staging tree, so putting it back is a rename of its own inode and
+carries mode, ownership and timestamps with it, and `.fv/.migrate-staging/`
+became a structural snapshot exclusion. The evidence surface came back with
+ten findings resolved on both the producer and the consumer, and five resolved
+on one side only; those residues were assigned to the same wave: Gate B rules
+the coverage dashboard did not mirror (the `+dirty` PASS rejection and
+cross-claim artifact identity), a manifest-id fidelity divergence where the
+two tools disagreed on the exit code for a manifest Gate B rejects, and a
+UTF-8 BOM in `.fv/verified-inputs.txt` parsing differently in Python and
+TypeScript.
+
+That wave is now in the worktree: the dashboard calls Gate B's own
+`dirty_snapshot_defects`, `shared_artifact_defects`, and `v3_producer_defects`,
+its manifest loader rejects an obligation id outside either id grammar with the
+same exit 2 Gate B uses, both exclusion parsers reject a `U+FEFF` byte-order
+mark, and `m1_coverage`'s parity matrix grew to eleven mutations — cross-claim
+artifact reuse, `+dirty` PASS, a non-producer cohort profile, and both
+`required_targets` mismatches among them — each asserted against both tools
+with identical defect text, with the Gate B side in `r6_manifest_failclosed`.
+What that is *not*: a re-review verdict. Both reviews probed the worktree as it
+stood before the wave, so the wave's own behaviour is regression-asserted and
+unreviewed, and nothing here has been through `./scripts/ci.py`.
+
+Not claimed, and the next steps for this item: re-probing the final correction
+wave, which no read-only pass has seen; then a full `./scripts/ci.py` run over
+these commits plus the whole correction set; and a real legacy-project dry run.
+**No real legacy project has been cut over.** `r36` is
 a dossier-*shaped* fixture rehearsal, not a migration of the dossier project;
 no `.colosseum` tree outside `tests/fixtures/` has been read by the migrator.
 

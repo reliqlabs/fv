@@ -44,12 +44,31 @@ INVENTORY
         `.fv/history/colosseum/<path relative to .colosseum>`. That includes
         the legacy per-claim evidence under `.colosseum/evidence/`: a v1/v2
         record is history, and copying one into `.fv/evidence/` would present
-        it as a live `fv-evidence-run/v3` record it cannot satisfy.
+        it as a live `fv-evidence-run/v3` record it cannot satisfy. A history
+        copy carries the bytes and the executable bit; no other mode bit, no
+        ownership, no timestamp, and no empty legacy directory is represented,
+        because the inventory is an inventory of files.
     unsupported
-        a non-regular or unreadable file, an unknown or malformed legacy
-        schema, a malformed claim, a legacy verification layer no plan
-        execution can carry, or a destination that already exists with
+        a non-regular or unreadable file, a directory that cannot be listed,
+        an unknown or malformed legacy schema, a malformed claim, a legacy
+        verification layer no plan execution can carry, a claim whose
+        `required_evidence` no migrated execution can produce, an ambiguous or
+        absent dispatch target, or a destination that already exists with
         different content.
+
+DISPATCH TARGET
+    The canonical intent is elected from the legacy pointer stub first and
+    from the ledger only second: a stub is a declaration, ledger prose is not.
+    `.colosseum/intent.md` is read and a `*intent.md` path it cites that
+    resolves under the project root becomes the dispatch target; only when the
+    stub cites none does the ledger's citations decide. Two or more distinct
+    surviving candidates in whichever document decides are unsupported and
+    block the run -- frequency of mention in untrusted legacy prose must never
+    pick between trust roots -- and so is no candidate at all, since a
+    migrated project whose `target_spec` names nothing cannot resolve a target
+    for any gate, producer, or skill. The elected spec is a top-level
+    `target_spec` field of the report, not only a sentence inside a detail
+    string, so a dry-run consumer can check the decision.
 
 OBLIGATIONS
     Legacy `obligations.json` carries only `{claim_id, required}`; the
@@ -59,7 +78,14 @@ OBLIGATIONS
     `layers`. Each distinct target is synthesized as its own obligation:
     `proptest:`/`test`-prefixed targets are witnesses, every other prefix is an
     invariant. `scope`, `waiver`, `evidence_class`, `profile`, and
-    `environment_policy` are retained rather than summarized.
+    `environment_policy` are retained rather than summarized. A claim key this
+    translation has no typed slot for -- an unknown key, or one of those keys
+    carrying a type its slot cannot hold -- is carried verbatim under the
+    claim's `legacy_fields` and named in a `#claims.<id>` deviation row, so a
+    dropped `waiver` can neither vanish nor be implied to have come across as
+    a waiver. Document-level keys other than `schema`, `version`, `claims`,
+    `profile`, and `environment_policy` are named in a `#document` row; the
+    document itself survives in history.
 
     Every synthesized id is the id `fv_evidence_run` will discharge it under.
     That tool writes `.fv/evidence/records/<claim_id>.json`, so a legacy
@@ -79,17 +105,46 @@ VERIFICATION PLAN
     semicolon-separated sequence of argv words is representable as an
     `fv-verification-plan/v1` execution list, so each segment is split with
     `shlex` and any shell operator or expansion character makes the layer
-    unsupported — wrapping it back in `sh -c` would launder the shell the plan
-    schema exists to exclude. Legacy names that have a pyramid equivalent are
-    renamed to it (`proptest` -> `proptests`); every other legacy layer keys
-    the plan under its own id, which `fv-verification-plan/v1` accepts as a
-    custom layer, so `quint` migrates as the layer `quint` instead of being
-    dropped. A recorded layer that cannot be translated at all — a command no
-    argv represents, a cwd that is missing or escapes the root, a malformed
-    environment, or an id the schema reserves (`floors`) — is unsupported and
-    blocks the whole migration: a plan that silently omits a layer the legacy
-    manifest recorded would present unrun verification as complete, so no
-    partial plan is written.
+    unsupported -- wrapping it back in `sh -c` would launder the shell the plan
+    schema exists to exclude. Tokenizing into words is not the same as being
+    argv: a leading `NAME=VALUE` assignment and a segment whose `argv[0]` is a
+    builtin whose effect dies with the process (`cd`, `export`, `source`,
+    `eval`, ...) are shell state changes, not commands, and are refused for
+    the same reason. A `cd` in particular would otherwise execute
+    `/usr/bin/cd`, exit 0, and silently move the recorded command to a
+    different working directory.
+
+    Legacy names that have a pyramid equivalent are renamed to it (`proptest`
+    -> `proptests`); every other legacy layer keys the plan under its own id,
+    which `fv-verification-plan/v1` accepts as a custom layer, so `quint`
+    migrates as the layer `quint` instead of being dropped. A recorded layer
+    that cannot be translated at all -- a command no argv represents, a cwd
+    that is missing or escapes the root, a malformed environment, or an id the
+    schema reserves (`floors`) -- is unsupported and blocks the whole
+    migration: a plan that silently omits a layer the legacy manifest recorded
+    would present unrun verification as complete, so no partial plan is
+    written. The completeness rule runs in both directions: an evidence tool
+    some migrated claim's `required_evidence` names and no migrated execution
+    produces is equally unsupported, since the migrated project would declare
+    a claim its own plan can never discharge. A legacy tree that recorded no
+    `evidence/runs/layer-runs.json` at all is that same case at its limit and
+    is refused the same way, deliberately: the plan declares nothing, so every
+    claim naming a layer is undischargeable, and a status-ok migration would
+    publish required obligations against a project with no declared execution.
+    The remedy is in the refusal: record the run manifest, or drop the layers
+    from the claims that name them. It is not a shape to relax into an ok
+    migration -- the coverage it would assert is the one thing the migration
+    must never invent.
+
+    A layer is written `required: true` when any migrated claim names it, not
+    only when a claim the legacy `obligations.json` marked required does:
+    Gate B demands evidence for every declared obligation regardless of that
+    flag, and a custom layer outside the plan's `required` set can fail while
+    the pyramid still reports VERIFIED. Two independent recorded runs of one
+    layer are merged into one cohort, which the `<layer>:<index>`
+    last-segment scheme cannot describe, so their executions are keyed
+    `<layer>:run<k>.<i>` and the merge is reported as a `#layers.<name>`
+    deviation row.
 
 VERIFIED INPUTS
     Legacy `verified-inputs.txt` is an include list: its entries name the paths
@@ -97,15 +152,59 @@ VERIFIED INPUTS
     opposite, and inverting an include list would mean enumerating the
     complement of the repository. The legacy list is therefore preserved as
     history and FV's conservative defaults are written instead.
+
+APPLY
+    `--apply` is all-or-nothing. Preflight refuses a destination whose path
+    crosses a symlink at any component -- `.fv` itself included, since both
+    `mkdir` and an ordinary open follow one -- a destination that exists with
+    different content, and a destination directory that is not writable. The
+    writes themselves are staged under `.fv/.migrate-staging/<run>/` in full
+    and then moved into place with `os.replace`, which does not follow a
+    symlink at the final name. A destination that already exists is moved
+    aside into the same staging tree before the new bytes land, so a failure
+    during the moves renames the original inode back and restores its mode,
+    ownership and timestamps together with its bytes, none of which writing
+    saved bytes into a fresh file reproduces. An aside that itself fails left
+    its destination untouched, so that write is `failed` and not `lost`, and
+    nothing is held back. Each write's reported action is what happened to it
+    (`written`, `rolled-back`, `failed`, `lost`, `pending`), and the report is
+    printed even when the apply fails, because it is the only enumeration of
+    what landed.
+
+    The staging prefix is every byte's first destination, so it is held to the
+    same containment rule as a real one: preflight refuses a symlinked or
+    unwritable `.fv/.migrate-staging`, and the apply re-checks the prefix and
+    the run directory it creates under it before the first staged byte, since
+    the prefix is a fixed name anything with write access to `.fv` can replace
+    with a link. The prefix is also structurally excluded from the
+    verified-input snapshot, and every run stages under its own unique
+    subdirectory of it. A hard kill between the first and the last move
+    therefore strands only snapshot-excluded residue: it cannot move a
+    snapshot, no later or concurrent run reuses it, and nothing collects it.
+    Concurrent migrations of one project share only the prefix, and each drops
+    it once it is empty, so a sibling removing it while this run creates its
+    own directory is retried and then reported as the race it is.
+
+    `.fv/dispatch.json` is the single destination adopted rather than
+    refused: an existing route keeps every field except the `project_root`
+    and `target_spec` this migration owns, reported as the `adopt` action
+    with the before and after in the write's detail, and keeps its mode --
+    the replacement is a fresh inode, so a route an operator narrowed must
+    not come back at the umask default. Refusing it instead would make every
+    project already initialized by `fv_init` unmigratable without moving the
+    file aside.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -118,6 +217,18 @@ REPORT_SCHEMA = "fv-migration-report/v1"
 LEGACY_DIRNAME = ".colosseum"
 HISTORY_RELATIVE = ".fv/history/colosseum"
 HISTORY_EXCLUSION = ".fv/history/"
+# Fixed staging prefix, one unique subdirectory per run. Fixed so a single
+# exclusion prefix covers it, and per-run so concurrent migrations never
+# stage into each other and no run inherits a killed run's residue.
+STAGING_RELATIVE = ".fv/.migrate-staging"
+STAGING_EXCLUSION = ".fv/.migrate-staging/"
+# A fixed prefix is also a name something can replace with a symlink long
+# before any migration runs, so it is preflighted and guarded exactly like a
+# destination. It is shared, too: every concurrent migration of one project
+# removes it once it is empty, so a sibling removing it between this run's
+# `mkdir` and its `mkdtemp` is an ordinary race, retried this many times
+# before the race is reported as itself rather than as ENOENT on a temp path.
+STAGING_ATTEMPTS = 5
 
 MAPPED = "mapped"
 PRESERVED = "preserved-history"
@@ -167,6 +278,37 @@ WITNESS_PREFIXES = frozenset({"proptest", "proptests"})
 # pipes, substitution, globbing, grouping, background, or word expansion. The
 # separator `;` is not listed because the segments are split on it first.
 SHELL_CHARACTERS = frozenset("|&<>$`(){}[]*?~!\n\r\\\0")
+# A leading `NAME=VALUE` word is a shell assignment prefix, not argv[0]:
+# executing the segment as argv would look for a binary of that literal name.
+# The recorded environment has its own `environment` object beside the
+# command, and the plan schema its own `env` field, so lifting the assignment
+# would be inventing a second, unrecorded source of environment.
+ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+# argv[0]s whose whole effect is a change to shell state that dies with the
+# process, plus the builtins that interpret further shell text. `cd` is the
+# motivating case: /usr/bin/cd exists on a POSIX system, so `cd crates/core;
+# cargo verus verify` would split into two argv executions, the first exiting
+# 0 without doing anything and the second running at the wrong cwd -- a
+# recorded command silently translated into a different one.
+SHELL_ONLY_COMMANDS = frozenset({
+    ".", ":", "alias", "bg", "builtin", "cd", "chdir", "command", "declare",
+    "disown", "eval", "exec", "exit", "export", "fg", "hash", "jobs", "let",
+    "local", "logout", "popd", "pushd", "read", "readonly", "return", "set",
+    "shift", "shopt", "source", "suspend", "times", "trap", "type", "typeset",
+    "ulimit", "umask", "unalias", "unset", "wait",
+})
+
+# Legacy claim keys this translation places in a typed slot of a migrated
+# system_claim. Every other key, and every one of these carrying a type its
+# slot cannot hold, is carried verbatim under `legacy_fields` and named in a
+# deviation row: a lossy translation must say what it could not interpret.
+CLAIM_CONSUMED_KEYS = frozenset({
+    "claim_id", "required_targets", "layers", "scope", "waiver", "evidence_class",
+})
+# Document-level keys of a legacy claim manifest this translation reads.
+CLAIMS_DOCUMENT_KEYS = frozenset({
+    "schema", "version", "claims", "profile", "environment_policy",
+})
 
 VERIFIED_INPUTS_HEADER = (
     "# Verified-input exclusion prefixes for the FV evidence content snapshot.\n"
@@ -227,9 +369,30 @@ class PlannedWrite:
     path: str
     data: bytes
     action: str = "create"
+    # A history copy carries its source's executable bit; None leaves the
+    # umask default, which is what every synthesized artifact wants.
+    mode: int | None = None
+    # `.fv/dispatch.json` is the one destination this migration may rewrite
+    # rather than refuse: it adopts an existing route instead of replacing it.
+    adopt: bool = False
+    detail: str = ""
 
     def as_json(self) -> dict:
-        return {"path": self.path, "action": self.action, "sha256": sha256_bytes(self.data)}
+        row = {"path": self.path, "action": self.action, "sha256": sha256_bytes(self.data)}
+        if self.detail:
+            row["detail"] = self.detail
+        return row
+
+
+@dataclass
+class _Moved:
+    """One destination the apply has already touched, and what putting it
+    back takes: the original inode moved aside (`None` when the destination
+    did not exist) and whether the new bytes actually landed."""
+    write: PlannedWrite
+    destination: Path
+    original: Path | None = None
+    landed: bool = False
 
 
 def _dedup(values: list[str]) -> list[str]:
@@ -270,10 +433,11 @@ def evidence_claim_id(legacy: str) -> str | None:
     the migrated manifest is directly dischargeable by `fv_evidence_run` with
     no post-migration rename.
 
-    It is deliberately not injective -- `quint:inv/S7` and `quint:inv-S7` both
-    land on `quint.inv-S7` -- because the alternative is an invented
-    disambiguating suffix that no legacy artifact, ledger citation, or
-    operator expectation names. The caller blocks on the collision instead.
+    It is deliberately not injective -- `verus:contract::state` and
+    `verus:contract-state` both land on `verus.contract-state` -- because the
+    alternative is an invented disambiguating suffix that no legacy artifact,
+    ledger citation, or operator expectation names. The caller blocks on the
+    collision instead.
 
     None means the legacy id carries no alphanumeric in some part (`quint:` or
     `:invS7` or `::`): there is no id to synthesize and nothing is guessed.
@@ -300,12 +464,35 @@ def _own(owners: dict[str, list[str]], migrated: str, legacy: str) -> None:
 
 
 
+def _uninterpreted_claim_fields(claim: dict) -> dict:
+    """Legacy claim fields the migration cannot place in a typed slot.
+
+    Two kinds, both silent losses otherwise: a key this translation knows
+    nothing about (`status`, `notes`, `required_targets_optional`), and a key
+    it does know carrying a type its slot cannot hold (a `waiver` string
+    where the manifest shape is an object). The caller carries the result
+    verbatim under the migrated claim's `legacy_fields` and names it in a
+    deviation row: the manifest is the only artifact a later auditor reads,
+    so a legacy record of what a claim excluded must not disappear from it.
+    """
+    carried = {key: value for key, value in claim.items() if key not in CLAIM_CONSUMED_KEYS}
+    for key, expected in (("scope", dict), ("waiver", dict), ("evidence_class", str)):
+        if key in claim and not isinstance(claim[key], expected):
+            carried[key] = claim[key]
+    return dict(sorted(carried.items()))
+
+
 def split_command(command: str) -> tuple[list[list[str]] | None, str]:
     """Translate a legacy shell string into argv lists, or explain the refusal.
 
     Only a semicolon-separated sequence of plain argv words is representable:
     every other shell construct is rejected rather than re-wrapped in `sh -c`,
     which would reintroduce the shell the plan schema exists to exclude.
+    Tokenizing into words is not sufficient. A segment that assigns an
+    environment variable or runs a builtin whose effect dies with the process
+    is shell state, not a command, and the executions the plan schema
+    describes cannot carry either: both are refused here rather than
+    translated into an argv that means something else.
     """
     if not isinstance(command, str) or not command.strip():
         return None, f"command must be a non-empty string, got {command!r}"
@@ -325,6 +512,19 @@ def split_command(command: str) -> tuple[list[list[str]] | None, str]:
             return None, f"segment {segment.strip()!r} does not tokenize: {error}"
         if not argv or any(not word for word in argv):
             return None, f"segment {segment.strip()!r} tokenizes to no command"
+        if ENV_ASSIGNMENT.match(argv[0]):
+            return None, (
+                f"segment {segment.strip()!r} begins with the environment assignment "
+                f"{argv[0]!r}: an assignment prefix is shell state and not argv[0], and the "
+                "run's own `environment` object is the only environment this translation "
+                "carries"
+            )
+        if argv[0] in SHELL_ONLY_COMMANDS:
+            return None, (
+                f"segment {segment.strip()!r} runs the shell builtin {argv[0]!r}, whose effect "
+                "does not survive the process that runs it: no argv represents it, and "
+                "executing it as one would silently drop what the recorded command did"
+            )
         executions.append(argv)
     if not executions:
         return None, f"command {command!r} carries no argv"
@@ -340,10 +540,24 @@ class Migration:
         self.artifacts: list[Artifact] = []
         self.unsupported: list[str] = []
         self.conflicts: list[str] = []
+        # The dispatch target this migration elected, reported as its own
+        # field so a dry-run consumer never has to parse a detail string to
+        # learn which document the migrated project will bind evidence to.
+        self.target_spec: str | None = None
         self._writes: dict[str, PlannedWrite] = {}
         self._history_skip: set[str] = set()
         self._legacy_files: list[str] = []
+        # Every layer any migrated claim names, or None when no claim
+        # manifest converted: the sentinel means "no claim says otherwise",
+        # under which every recorded layer gates.
         self._required_layers: set[str] | None = None
+        # Legacy claim id -> its required_evidence, for the plan-completeness
+        # check that runs once both manifests have been translated.
+        self._claim_layers: dict[str, list[str]] = {}
+        # Evidence tool ids the migrated plan declares, or None when no plan
+        # was translated at all.
+        self._plan_tools: set[str] | None = None
+        self._plan_blocked = False
 
     # ---- bookkeeping -----------------------------------------------------
 
@@ -357,6 +571,11 @@ class Migration:
     def _preserved(self, source: str, detail: str) -> None:
         self.artifacts.append(Artifact(source, PRESERVED, self._history_path(source), detail))
 
+    def _deviation(self, source: str, destination: str, detail: str) -> None:
+        """One `<file>#<item>` row: part of a mapped file that did reach the
+        destination, but not with the meaning the file's mapping implies."""
+        self.artifacts.append(Artifact(source, MAPPED, destination, detail))
+
     def _unsupported(self, source: str, detail: str) -> None:
         self.artifacts.append(Artifact(source, UNSUPPORTED, None, detail))
         self.unsupported.append(f"{source}: {detail}")
@@ -369,7 +588,8 @@ class Migration:
             relative = relative[len(LEGACY_DIRNAME) + 1 :]
         return f"{HISTORY_RELATIVE}/{relative}"
 
-    def _plan_write(self, path: str, data: bytes) -> None:
+    def _plan_write(self, path: str, data: bytes, *, mode: int | None = None,
+                    adopt: bool = False, detail: str = "") -> None:
         """Record intended bytes for one `.fv` destination."""
         if not path.startswith(".fv/"):
             raise MigrationError(f"refusing to write outside .fv: {path}")
@@ -378,7 +598,7 @@ class Migration:
             if existing.data != data:
                 raise MigrationError(f"two sources disagree about {path}")
             return
-        self._writes[path] = PlannedWrite(path, data)
+        self._writes[path] = PlannedWrite(path, data, mode=mode, adopt=adopt, detail=detail)
 
     # ---- inventory -------------------------------------------------------
 
@@ -387,7 +607,16 @@ class Migration:
             raise MigrationError(f"{self.legacy}: no legacy .colosseum directory to migrate")
 
         def walk(directory: Path) -> None:
-            for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            try:
+                entries = sorted(directory.iterdir(), key=lambda item: item.name)
+            except OSError as error:
+                self._unsupported(
+                    directory.relative_to(self.project).as_posix(),
+                    f"directory cannot be listed: {error}; the files under it cannot be "
+                    "inventoried, so none of them can be classified",
+                )
+                return
+            for entry in entries:
                 relative = entry.relative_to(self.project).as_posix()
                 if entry.is_symlink():
                     self._unsupported(
@@ -426,21 +655,10 @@ class Migration:
 
     # ---- intent and ledger ----------------------------------------------
 
-    def _ledger_intent(self) -> str | None:
-        """The external intent the ledger cites, when it exists on disk.
-
-        A legacy `.colosseum/intent.md` is frequently a pointer stub whose
-        normative text lives elsewhere; migrating the stub as the dispatch
-        target would bind evidence to a file that states nothing.
-        """
-        ledger = f"{LEGACY_DIRNAME}/{LEGACY_LEDGER}"
-        if ledger not in self._legacy_files:
-            return None
-        try:
-            text = (self.project / ledger).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        counts: dict[str, int] = {}
+    def _cited_intents(self, text: str) -> list[str]:
+        """Every distinct `*intent.md` path cited in `text` that resolves to a
+        file under the project root, in first-cited order."""
+        specs: list[str] = []
         for match in re.findall(r"[\w./-]*intent\.md", text):
             candidate = match.lstrip("./") if match.startswith("./") else match
             if not candidate or candidate.startswith(LEGACY_DIRNAME + "/"):
@@ -452,11 +670,51 @@ class Migration:
             except fv_project.ProjectError:
                 continue
             spec = fv_project.relative_target_spec(self.project, resolved)
-            counts[spec] = counts.get(spec, 0) + 1
-        if not counts:
-            return None
-        # Most-cited wins; lexicographic order breaks a tie deterministically.
-        return min(counts, key=lambda spec: (-counts[spec], spec))
+            if spec not in specs:
+                specs.append(spec)
+        return specs
+
+    def _external_intent(self) -> tuple[str | None, bool]:
+        """The external canonical intent, and whether the election was refused.
+
+        A legacy `.colosseum/intent.md` is frequently a pointer stub whose
+        normative text lives elsewhere; migrating the stub as the dispatch
+        target would bind evidence to a file that states nothing. The stub is
+        therefore read first and decides on its own: it is a declaration, and
+        the ledger is prose about the project, so a ledger sentence must never
+        outrank the entrypoint's own pointer. The ledger decides only when the
+        stub cites nothing at all.
+
+        Whichever document decides, two or more distinct surviving candidates
+        are a refusal rather than a vote. Counting mentions would let the
+        arrangement of legacy prose -- a "Superseded:" paragraph naming an old
+        document three times -- pick the trust root every future evidence
+        record binds to.
+        """
+        stub = f"{LEGACY_DIRNAME}/{LEGACY_INTENT}"
+        ledger = f"{LEGACY_DIRNAME}/{LEGACY_LEDGER}"
+        for source, present in ((stub, stub in self._legacy_files),
+                                (ledger, ledger in self._legacy_files)):
+            if not present:
+                continue
+            try:
+                text = (self.project / source).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            candidates = self._cited_intents(text)
+            if not candidates:
+                continue
+            if len(candidates) > 1:
+                self._unsupported(
+                    f"{source}#intent",
+                    f"cites {len(candidates)} existing canonical intents ({', '.join(candidates)}): "
+                    "the dispatch target is the root every migrated evidence record binds to, and "
+                    "nothing in the legacy tree ranks one citation over another, so the ambiguity "
+                    "is resolved in the legacy artifact rather than guessed here",
+                )
+                return None, True
+            return candidates[0], False
+        return None, False
 
     def _migrate_ledger(self) -> None:
         relative = f"{LEGACY_DIRNAME}/{LEGACY_LEDGER}"
@@ -466,35 +724,51 @@ class Migration:
         if data is None:
             return
         self._plan_write(".fv/ledger.md", data)
-        self._mapped(relative, ".fv/ledger.md", "legacy ledger, verbatim", verbatim=True)
+        self._mapped(
+            relative,
+            ".fv/ledger.md",
+            "legacy ledger, verbatim: the bytes are preserved exactly, so any citation written "
+            f"relative to {LEGACY_DIRNAME}/ still points where it did and now resolves from "
+            ".fv/ledger.md instead. Gate A reports such a citation as unresolvable rather than "
+            "reading it as prose, so re-rooting them is the first post-migration edit",
+            verbatim=True,
+        )
 
     def _migrate_intent(self) -> str | None:
         """Choose the dispatch target and report how the legacy intent got there."""
         relative = f"{LEGACY_DIRNAME}/{LEGACY_INTENT}"
         present = relative in self._legacy_files
-        external = self._ledger_intent()
+        external, refused = self._external_intent()
         if external is not None:
             if present:
                 self._mapped(
                     relative,
                     ".fv/dispatch.json",
-                    f"ledger cites {external}, which exists: dispatch targets it instead of this "
-                    "entrypoint; the entrypoint's bytes are preserved as history",
+                    f"the canonical intent is {external}, which exists: dispatch targets it "
+                    "instead of this entrypoint; the entrypoint's bytes are preserved as history",
                 )
             return external
-        if not present:
-            return None
-        data = self._read_bytes(relative)
-        if data is None:
-            return None
-        self._plan_write(".fv/intent.md", data)
-        self._mapped(
-            relative,
-            ".fv/intent.md",
-            "no ledger-cited external intent: this document becomes the dispatch target",
-            verbatim=True,
-        )
-        return fv_project.DEFAULT_TARGET_SPEC
+        if present and not refused:
+            data = self._read_bytes(relative)
+            if data is None:
+                return None
+            self._plan_write(".fv/intent.md", data)
+            self._mapped(
+                relative,
+                ".fv/intent.md",
+                "no cited external intent: this document becomes the dispatch target",
+                verbatim=True,
+            )
+            return fv_project.DEFAULT_TARGET_SPEC
+        if not refused:
+            self._unsupported(
+                f"{LEGACY_DIRNAME}#intent",
+                f"no dispatch target can be established: there is no {LEGACY_DIRNAME}/"
+                f"{LEGACY_INTENT} and no document cites an existing canonical intent, so the "
+                "migrated project would declare no target_spec and every gate, evidence run and "
+                "skill would fail to resolve one",
+            )
+        return None
 
     def _migrate_dispatch(self, target_spec: str | None) -> None:
         if target_spec is None:
@@ -511,15 +785,33 @@ class Migration:
                 self.conflicts.append(".fv/dispatch.json: exists without an omp_native route")
                 return
             route = current["omp_native"]
-            if route.get("project_root") == "." and route.get("target_spec") == target_spec:
+            before_root = route.get("project_root")
+            before_target = route.get("target_spec")
+            if before_root == "." and before_target == target_spec:
                 # Already canonical. Re-serializing would rewrite a file this
                 # migration did not author purely to change its formatting, so
                 # the intended bytes are the bytes already there.
                 self._plan_write(".fv/dispatch.json", existing)
                 return
+            # The one destination that is adopted rather than refused. A
+            # project already carrying a dispatch.json has a route this
+            # migration must not discard, so only the two fields the migration
+            # owns are rewritten and everything else -- other omp_native keys,
+            # other top-level keys -- is kept exactly as written. Refusing
+            # here instead would make every fv_init-initialized project
+            # unmigratable without manually moving the file aside.
             route["project_root"] = "."
             route["target_spec"] = target_spec
-            self._plan_write(".fv/dispatch.json", canonical_json(current))
+            self._plan_write(
+                ".fv/dispatch.json",
+                canonical_json(current),
+                adopt=True,
+                detail=(
+                    f"existing route adopted: target_spec {before_target!r} -> {target_spec!r}, "
+                    f"project_root {before_root!r} -> '.'; every other field of the existing "
+                    "dispatch is kept"
+                ),
+            )
             return
         config = json.loads((REPO / "scripts" / "dispatch.config.example.json").read_text())
         config["omp_native"]["project_root"] = "."
@@ -529,7 +821,11 @@ class Migration:
     # ---- verified inputs -------------------------------------------------
 
     def _migrate_verified_inputs(self) -> None:
-        prefixes = [*fv_project.DEFAULT_EXCLUSIONS, HISTORY_EXCLUSION]
+        # Both explicit entries are structural defaults, so `_dedup` normally
+        # drops them; they are named anyway because this migrator is what
+        # quarantines legacy history under one and what strands residue under
+        # the other, and a project list may only ever add prefixes.
+        prefixes = [*fv_project.DEFAULT_EXCLUSIONS, HISTORY_EXCLUSION, STAGING_EXCLUSION]
         body = "".join(f"{prefix}\n" for prefix in _dedup(prefixes))
         self._plan_write(".fv/verified-inputs.txt", (VERIFIED_INPUTS_HEADER + body).encode("utf-8"))
         relative = f"{LEGACY_DIRNAME}/{LEGACY_VERIFIED_INPUTS}"
@@ -552,6 +848,12 @@ class Migration:
         if not isinstance(document, dict):
             self._unsupported(relative, "document is not an object")
             return None
+        # A legacy document that declares neither `schema` nor `version` is
+        # accepted as the manifest its canonical path says it is. The file is
+        # only ever read at `.colosseum/<name>`, which the legacy layout fixes
+        # -- an unrelated JSON document does not live there -- and the oldest
+        # legacy trees predate both keys. A declared value that disagrees is
+        # still unsupported.
         declared = document.get("schema")
         if declared is not None and declared != schema:
             self._unsupported(relative, f"unknown schema {declared!r}, expected {schema!r}")
@@ -624,7 +926,12 @@ class Migration:
         target_ids: dict[str, str] = {}
         owners: dict[str, list[str]] = {}
         system_claims: list[dict] = []
-        required_layers: set[str] = set()
+        # Every layer any migrated claim names. Gate B requires evidence for
+        # each declared obligation whatever the legacy `required` flag said,
+        # so a layer a claim names has to gate the pyramid too; deriving the
+        # plan's `required` from the flag alone would leave a migrated custom
+        # layer able to fail while the runner still reports VERIFIED.
+        claimed_layers: set[str] = set()
 
         for claim_id in ordered_ids:
             claim = detail_index.get(claim_id)
@@ -710,11 +1017,21 @@ class Migration:
                 entry["scope"] = scope
             if isinstance(claim.get("waiver"), dict):
                 entry["waiver"] = claim["waiver"]
+            uninterpreted = _uninterpreted_claim_fields(claim)
+            if uninterpreted:
+                entry["legacy_fields"] = uninterpreted
+                self._deviation(
+                    f"{claims_rel}#claims.{claim_id}",
+                    ".fv/obligations.json",
+                    f"legacy field(s) {', '.join(uninterpreted)} have no typed slot in a "
+                    f"system_claim: carried verbatim under system_claims[{migrated_claim!r}]"
+                    ".legacy_fields rather than summarized or dropped, since a legacy waiver or "
+                    "status is exactly what a later auditor reads this manifest for",
+                )
             system_claims.append(entry)
-            if entry["required"]:
-                required_layers.update(layers)
+            self._claim_layers[claim_id] = layers
+            claimed_layers.update(layers)
 
-        self._required_layers = required_layers
         collision = sorted(set(invariants) & set(witnesses))
         if collision:
             self._unsupported(
@@ -731,6 +1048,10 @@ class Migration:
                     "colliding names must be resolved in the legacy manifest first",
                 )
         if not system_claims:
+            # `_required_layers` deliberately stays None here: nothing
+            # converted, so no claim says which layers matter, and the plan
+            # must fall back to "every recorded layer gates" rather than read
+            # an empty set as "no layer gates".
             for relative, present in ((obligations_rel, has_obligations), (claims_rel, has_claims)):
                 if present:
                     self._preserved(
@@ -739,13 +1060,33 @@ class Migration:
                         "is written",
                     )
             return
+        self._required_layers = claimed_layers
 
         sources = [relative for relative, present in ((claims_rel, has_claims), (obligations_rel, has_obligations)) if present]
         migration: dict = {"source": sorted(sources), "note": OBLIGATIONS_NOTE}
-        if isinstance(profile, str):
-            migration["profile"] = profile
-        if isinstance(environment_policy, str):
-            migration["environment_policy"] = environment_policy
+        legacy_document: dict = {}
+        for name, value in (("profile", profile), ("environment_policy", environment_policy)):
+            if isinstance(value, str):
+                migration[name] = value
+            elif value is not None:
+                # The key is known but its value is not a statement this
+                # manifest can carry in the same slot; it is kept verbatim
+                # instead of being dropped or stringified.
+                legacy_document[name] = value
+        if has_claims:
+            unknown = sorted(set(document) - CLAIMS_DOCUMENT_KEYS)
+            if unknown or legacy_document:
+                if legacy_document:
+                    migration["legacy_fields"] = dict(sorted(legacy_document.items()))
+                named = sorted({*unknown, *legacy_document})
+                self._deviation(
+                    f"{claims_rel}#document",
+                    ".fv/obligations.json",
+                    f"document-level field(s) {', '.join(named)} are not part of the migrated "
+                    "manifest's shape: "
+                    + ("the typed ones are carried under migration.legacy_fields; " if legacy_document else "")
+                    + f"the document itself survives byte-for-byte at {self._history_path(claims_rel)}",
+                )
         manifest = {
             "version": 1,
             "invariants": [
@@ -839,15 +1180,21 @@ class Migration:
         relative = f"{LEGACY_DIRNAME}/{LEGACY_LAYER_RUNS}"
         if relative not in self._legacy_files:
             return
+        # A run manifest that cannot be read at all already blocks with its
+        # own row; `_plan_blocked` keeps the claim-to-plan completeness check
+        # from restating that one defect once per claim.
         document = self._read_json(relative)
         if document is None:
+            self._plan_blocked = True
             return
         if not isinstance(document, dict):
+            self._plan_blocked = True
             self._unsupported(relative, "document is not an object")
             return
         schema = document.get("schema")
         version = document.get("version")
         if schema != LAYER_RUNS_SCHEMA or version != LAYER_RUNS_VERSION:
+            self._plan_blocked = True
             self._unsupported(
                 relative,
                 f"unknown run manifest {schema!r} version {version!r}, expected "
@@ -856,10 +1203,14 @@ class Migration:
             return
         runs = document.get("runs")
         if not isinstance(runs, list) or not runs:
+            self._plan_blocked = True
             self._unsupported(relative, "runs is not a nonempty array")
             return
 
-        layers: dict[str, dict[str, list[dict]]] = {}
+        # planned layer id -> legacy layer id -> one execution list per
+        # recorded run. Runs stay separate: two independent runs of one layer
+        # are a merge this translation has to report, not a sequence.
+        layers: dict[str, dict[str, list[list[dict]]]] = {}
         blocked: list[str] = []
         for position, run in enumerate(runs):
             if not isinstance(run, dict):
@@ -879,12 +1230,13 @@ class Migration:
                 )
                 blocked.append(legacy_layer)
                 continue
-            layers.setdefault(planned, {}).setdefault(legacy_layer, []).extend(executions)
+            layers.setdefault(planned, {}).setdefault(legacy_layer, []).append(executions)
 
         if blocked:
             # Never a partial plan: one recorded layer missing from the plan
             # would let a later pyramid run report every declared layer green
             # while the verification the legacy manifest recorded never ran.
+            self._plan_blocked = True
             self._unsupported(
                 relative,
                 f"layer(s) {', '.join(_dedup(blocked))} cannot be translated into "
@@ -895,44 +1247,104 @@ class Migration:
             return
 
         document_layers: dict[str, dict] = {}
+        merged: list[tuple[str, int]] = []
         for planned in pyramid_run.plan_layer_order(layers):
             groups = layers[planned]
             executions = []
-            for legacy_layer, recorded in groups.items():
-                total = len(recorded)
-                for index, execution in enumerate(recorded, start=1):
-                    # `a; b; c` reports c's exit status, so the layer's recorded
-                    # result came from its last segment: that segment carries the
-                    # bare layer id every migrated required_evidence entry names,
-                    # and each earlier step gets a distinct id so one cohort never
-                    # declares the same tool twice.
-                    tool = legacy_layer if index == total else f"{legacy_layer}:{index}"
-                    entry = {
-                        "argv": execution["argv"],
-                        "cwd": execution["cwd"],
-                        "timeout_seconds": execution["timeout_seconds"],
-                        "evidence_tool": tool,
-                    }
-                    if execution["env"]:
-                        entry["env"] = execution["env"]
-                    executions.append(entry)
+            for legacy_layer, recorded_runs in groups.items():
+                runs_of_layer = len(recorded_runs)
+                if runs_of_layer > 1:
+                    merged.append((legacy_layer, runs_of_layer))
+                for run_index, recorded in enumerate(recorded_runs, start=1):
+                    total = len(recorded)
+                    for index, execution in enumerate(recorded, start=1):
+                        # `a; b; c` reports c's exit status, so one recorded
+                        # run's result came from its last segment: that segment
+                        # carries the bare layer id every migrated
+                        # required_evidence entry names, and each earlier step
+                        # gets a distinct id so one cohort never declares the
+                        # same tool twice. Across two independently recorded
+                        # runs there is no last-segment relation to inherit, so
+                        # those ids name their run instead of pretending to be
+                        # steps of one command.
+                        if run_index == runs_of_layer and index == total:
+                            tool = legacy_layer
+                        elif runs_of_layer == 1:
+                            tool = f"{legacy_layer}:{index}"
+                        else:
+                            tool = f"{legacy_layer}:run{run_index}.{index}"
+                        entry = {
+                            "argv": execution["argv"],
+                            "cwd": execution["cwd"],
+                            "timeout_seconds": execution["timeout_seconds"],
+                            "evidence_tool": tool,
+                        }
+                        if execution["env"]:
+                            entry["env"] = execution["env"]
+                        executions.append(entry)
             required = True if self._required_layers is None else bool(
                 set(groups) & self._required_layers
             )
             document_layers[planned] = {"required": required, "executions": executions}
 
+        tools = [execution["evidence_tool"]
+                 for layer in document_layers.values() for execution in layer["executions"]]
+        repeated = sorted({tool for tool in tools if tools.count(tool) > 1})
+        if repeated:
+            # The runner keys per-tool results by this id, so two executions
+            # sharing one would silently collapse into a single reported
+            # result. Only a legacy layer named like a synthesized step id can
+            # reach this, and inventing a suffix would name a tool no legacy
+            # artifact does.
+            self._plan_blocked = True
+            self._unsupported(
+                relative,
+                f"evidence tool id(s) {', '.join(repeated)} would be declared by more than one "
+                "execution: one id cannot stand for two recorded verifications, and the colliding "
+                "legacy layer names must be resolved in the run manifest first",
+            )
+            return
+
         plan = {"schema": pyramid_run.PLAN_SCHEMA, "layers": document_layers}
         self._plan_write(".fv/verification-plan.json", canonical_json(plan))
+        self._plan_tools = set(tools)
+        for legacy_layer, runs_of_layer in merged:
+            self._deviation(
+                f"{relative}#layers.{legacy_layer}",
+                ".fv/verification-plan.json",
+                f"{runs_of_layer} independently recorded runs of layer {legacy_layer!r} are merged "
+                "into one plan cohort: the legacy manifest states no relation between them, so "
+                f"their executions are keyed {legacy_layer}:run<k>.<segment> and only the last "
+                f"execution of the last recorded run carries the bare id {legacy_layer!r} that "
+                "required_evidence names",
+            )
         translated = ", ".join(
             f"{'+'.join(layers[planned])} -> {planned}" for planned in document_layers
         )
         custom = [planned for planned in document_layers if planned not in pyramid_run.PLAN_LAYERS]
+        not_gating = [planned for planned, spec in document_layers.items() if not spec["required"]]
         detail = f"colosseum-layer-runs/v2 command strings translated to argv executions ({translated})"
         if custom:
             detail += (
                 f"; {', '.join(custom)} declared as fv-verification-plan/v1 custom layer(s), having "
                 "no built-in pyramid step of their own"
             )
+        if not_gating:
+            detail += (
+                f"; {', '.join(not_gating)} written required: false, named by no migrated claim, so "
+                "a failure there does not gate the pyramid verdict"
+            )
+        provenance = [f"{name}={document[name]!r}" for name in ("generated", "source_snapshot")
+                      if isinstance(document.get(name), str)]
+        statuses = [f"{run.get('layer')}={run.get('exit_status')}" for run in runs
+                    if isinstance(run, dict) and "exit_status" in run]
+        detail += (
+            f"; translated from {relative}"
+            + (f" ({', '.join(provenance)})" if provenance else "")
+            + (f", recorded exit status(es) {', '.join(statuses)}" if statuses else "")
+            + ", which fv-verification-plan/v1 has no field for: the recorded results are history, "
+            "not evidence, and the plan declares only what to run"
+        )
         self._mapped(relative, ".fv/verification-plan.json", detail)
 
     def _plan_executions(self, planned: str, run: dict) -> tuple[list[dict] | None, str]:
@@ -984,17 +1396,75 @@ class Migration:
             data = self._read_bytes(relative)
             if data is None:
                 continue
-            self._plan_write(self._history_path(relative), data)
+            # The executable bit is the one mode bit that changes what a
+            # preserved file *is*: a legacy helper script arriving
+            # non-executable is a history copy that cannot be replayed.
+            try:
+                executable = bool((self.project / relative).stat().st_mode & 0o111)
+            except OSError:
+                executable = False
+            self._plan_write(self._history_path(relative), data,
+                             mode=0o755 if executable else None)
             if relative not in classified:
                 self._preserved(relative, "legacy history, byte-for-byte")
+
+    # ---- completeness ----------------------------------------------------
+
+    def _check_required_evidence(self) -> None:
+        """Every tool a migrated claim requires must be producible by the plan.
+
+        The no-omission rule already runs from the recorded layers to the
+        plan. This is the other direction: a `system_claim` whose
+        `required_evidence` names a tool no migrated execution declares is a
+        claim the migrated project can never discharge, which is unrun
+        verification presented as complete one artifact upstream.
+        """
+        if self._plan_blocked or not self._claim_layers:
+            return
+        claims_rel = f"{LEGACY_DIRNAME}/{LEGACY_CLAIMS}"
+        produced = self._plan_tools or set()
+        for claim_id, layers in self._claim_layers.items():
+            missing = [layer for layer in layers if layer not in produced]
+            if not missing:
+                continue
+            self._unsupported(
+                f"{claims_rel}#claims.{claim_id}.required_evidence",
+                f"required_evidence {missing} names no execution the migrated plan declares "
+                + (
+                    f"(the legacy tree records no {LEGACY_LAYER_RUNS}, so the plan declares "
+                    "nothing at all)"
+                    if self._plan_tools is None
+                    else f"(declared evidence tools: {', '.join(sorted(produced))})"
+                )
+                + ": the migrated claim would require evidence no migrated run can produce, so "
+                "the legacy manifests must agree on the tool's spelling, or the run manifest "
+                "must record it, before the migration can be honest about coverage",
+            )
 
     # ---- preflight -------------------------------------------------------
 
     def _preflight(self) -> None:
+        self._preflight_staging()
         for path, write in sorted(self._writes.items()):
             destination = self.project / path
-            if destination.is_symlink():
-                self.conflicts.append(f"{path}: destination is a symlink")
+            symlinked = self._symlinked_component(path)
+            if symlinked is not None:
+                # Both `mkdir(parents=True)` and an open on the final name
+                # follow symlinks, so a link anywhere on the path -- `.fv`
+                # itself included -- is how a write lands outside the only
+                # tree this migration may touch, or inside the legacy tree it
+                # promises to leave byte-identical.
+                self.conflicts.append(
+                    f"{path}: {symlinked} is a symlink; a write through it would leave the .fv "
+                    "tree this migration is allowed to write"
+                )
+                write.action = "conflict"
+                continue
+            unwritable = self._unwritable_ancestor(path)
+            if unwritable is not None:
+                self.conflicts.append(
+                    f"{path}: {unwritable} is not writable, so this destination cannot be created"
+                )
                 write.action = "conflict"
                 continue
             if destination.is_dir():
@@ -1014,12 +1484,24 @@ class Migration:
                 continue
             try:
                 current = destination.read_bytes()
+                current_mode = destination.stat().st_mode & 0o7777
             except OSError as error:
                 self.conflicts.append(f"{path}: destination is unreadable ({error})")
                 write.action = "conflict"
                 continue
             if current == write.data:
                 write.action = "identical"
+            elif write.adopt:
+                # The one adopted destination: an existing dispatch keeps its
+                # route and has only the two fields this migration owns
+                # rewritten, so a project initialized before the migration is
+                # migratable without moving the file aside. The replacement is
+                # a staged inode, so the existing file's mode is carried over
+                # deliberately: adopting two fields of a route an operator
+                # narrowed must not widen it to the umask default, and a
+                # failed apply already restores the mode exactly.
+                write.action = "adopt"
+                write.mode = current_mode
             else:
                 self.conflicts.append(
                     f"{path}: exists with different content "
@@ -1027,14 +1509,77 @@ class Migration:
                 )
                 write.action = "conflict"
 
+    def _preflight_staging(self) -> None:
+        """Refuse a staging prefix that cannot hold this run's bytes safely.
+
+        `.fv/.migrate-staging` is a fixed name and every migrated byte is
+        written through it before any destination sees it, so it is a write
+        path in its own right: a symlink at it (or at `.fv`) routes the whole
+        migration out of the only tree this tool may write, and an unwritable
+        or non-directory prefix aborts the apply after the report has already
+        promised a clean run. Both block here, with zero bytes written,
+        exactly as a destination in the same shape does.
+        """
+        if not self._writes:
+            return
+        symlinked = self._symlinked_component(STAGING_RELATIVE)
+        if symlinked is not None:
+            self.conflicts.append(
+                f"{STAGING_RELATIVE}: {symlinked} is a symlink; every migrated byte is staged "
+                "under this prefix first, so a write through it would leave the .fv tree this "
+                "migration is allowed to write"
+            )
+            return
+        staging_root = self.project / STAGING_RELATIVE
+        if staging_root.exists() and not staging_root.is_dir():
+            self.conflicts.append(
+                f"{STAGING_RELATIVE}: staging prefix exists and is not a directory, so no run "
+                "can stage under it"
+            )
+            return
+        # The run directory is what gets created, so the prefix itself is the
+        # ancestor that has to be writable once it exists -- checking only its
+        # parent would pass a prefix nothing can stage into.
+        unwritable = self._unwritable_ancestor(f"{STAGING_RELATIVE}/run")
+        if unwritable is not None:
+            self.conflicts.append(
+                f"{STAGING_RELATIVE}: {unwritable} is not writable, so this migration cannot "
+                "stage its writes"
+            )
+
+    def _symlinked_component(self, path: str) -> str | None:
+        """The first component of `path`, from the project root down, that is
+        a symlink. A symlink to a directory answers `is_dir()`, so only this
+        test keeps a write inside the real `.fv` tree."""
+        current = self.project
+        for part in Path(path).parts:
+            current = current / part
+            if current.is_symlink():
+                return current.relative_to(self.project).as_posix()
+        return None
+
+    def _unwritable_ancestor(self, path: str) -> str | None:
+        """The nearest existing ancestor directory of `path` that cannot be
+        written, so the common permission failure blocks in preflight with
+        zero writes instead of aborting halfway through an apply."""
+        current = (self.project / path).parent
+        while not current.exists() and current != self.project:
+            current = current.parent
+        if not current.exists() or not os.access(current, os.W_OK | os.X_OK):
+            return current.relative_to(self.project).as_posix() or "."
+        return None
+
     def build(self) -> None:
         self._scan()
-        target_spec = self._migrate_intent()
+        self.target_spec = self._migrate_intent()
         self._migrate_ledger()
         self._migrate_obligations()
         self._migrate_plan()
+        # Both manifests are translated by now, so the claim-to-plan
+        # direction of the no-omission rule can finally be checked.
+        self._check_required_evidence()
         self._migrate_verified_inputs()
-        self._migrate_dispatch(target_spec)
+        self._migrate_dispatch(self.target_spec)
         self._preserve_history()
         self._preflight()
 
@@ -1048,28 +1593,266 @@ class Migration:
         return [self._writes[path] for path in sorted(self._writes)]
 
     def apply(self) -> list[str]:
-        """Write every pending destination. Never called on a blocked run."""
+        """Write every pending destination, all of them or none of them.
+
+        Every byte is first written into a staging tree under
+        `.fv/.migrate-staging/<run>/`, so a failure while producing content
+        touches no destination at all; the destinations are then moved into
+        place with `os.replace`, which does not follow a symlink at the final
+        component. A destination that already exists is moved aside into the
+        same staging tree before the new bytes land, so putting it back is a
+        rename of its own inode and restores its mode, ownership and
+        timestamps along with its bytes -- none of which writing saved bytes
+        into a fresh file reproduces. A failure during the moves puts back
+        every destination already touched, so an interrupted apply cannot
+        leave a half-migrated project, and each write's action records what
+        actually happened to it.
+
+        The staging prefix is fixed and structurally excluded from the
+        verified-input snapshot, and each run stages under its own unique
+        subdirectory of it: a hard kill between the first and the last move
+        strands residue that no snapshot hashes and no other run reuses.
+        Because the prefix is a fixed name, it is re-checked for containment
+        here -- together with the run directory created under it -- before the
+        first staged byte, so the "only `.fv` is written" invariant does not
+        depend on nothing having replaced the prefix with a symlink since
+        preflight looked.
+        """
         if self.blocked:
             raise MigrationError("refusing to apply a blocked migration")
-        written: list[str] = []
-        for write in self.writes():
-            if write.action != "create":
-                continue
-            destination = self.project / write.path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(write.data)
-            written.append(write.path)
-        return written
+        pending = [write for write in self.writes() if write.action in ("create", "adopt")]
+        if not pending:
+            return []
+        staging_root = self.project / STAGING_RELATIVE
+        created: list[Path] = []
+        touched: list[_Moved] = []
+        current: PlannedWrite | None = None
+        staging: Path | None = None
+        try:
+            # A unique subdirectory, not the pid: a pid recurs, so a killed
+            # run's residue must never be a tree a later run stages into or
+            # has to tell apart from its own.
+            staging = self._make_run_directory(staging_root, created)
+            for write in pending:
+                current = write
+                staged = staging / "new" / Path(write.path).relative_to(".fv")
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                staged.write_bytes(write.data)
+                if write.mode is not None:
+                    os.chmod(staged, write.mode)
+            for write in pending:
+                current = write
+                destination = self.project / write.path
+                created.extend(self._make_dirs(destination.parent))
+                self._guard_destination(destination)
+                moved = _Moved(write, destination)
+                touched.append(moved)
+                if destination.is_file():
+                    # Move the original inode aside rather than copy its
+                    # bytes: the rename back is what returns the file's mode
+                    # and the rest of its metadata with its content.
+                    aside = staging / "saved" / Path(write.path).relative_to(".fv")
+                    aside.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(destination, aside)
+                    # Recorded only once the rename returned: an aside that
+                    # failed left its destination exactly where it was, so the
+                    # rollback must not be told it is holding an original it
+                    # never took, which would report an intact file as lost
+                    # and retain an empty staging tree for it forever.
+                    moved.original = aside
+                os.replace(staging / "new" / Path(write.path).relative_to(".fv"), destination)
+                moved.landed = True
+        except (OSError, MigrationError) as error:
+            stranded, lost = self._rollback(touched)
+            if not (stranded or lost):
+                # Only a rollback that finished may drop the staging tree: it
+                # holds the one copy of the original inode of every
+                # destination this apply replaced.
+                self._discard_staging(staging, staging_root)
+            self._remove_created(created)
+            landed = {moved.write.path for moved in touched if moved.landed}
+            for write in pending:
+                if write.path in stranded:
+                    write.action = "written"
+                elif write.path in lost:
+                    write.action = "lost"
+                elif write.path in landed:
+                    write.action = "rolled-back"
+                elif current is not None and write.path == current.path:
+                    write.action = "failed"
+                else:
+                    write.action = "pending"
+            raise MigrationError(
+                f"{error}; every destination already written was rolled back"
+                + (f", except {', '.join(sorted(stranded))}" if stranded else "")
+                + (f"; no longer present: {', '.join(sorted(lost))}" if lost else "")
+                + (f"; the originals this apply replaced are kept under {staging}"
+                   if (stranded or lost) and staging is not None else "")
+            ) from error
+        self._discard_staging(staging, staging_root)
+        for moved in touched:
+            moved.write.action = "written"
+        return [moved.write.path for moved in touched]
 
-    def report(self, mode: str) -> dict:
+    @staticmethod
+    def _make_dirs(directory: Path) -> list[Path]:
+        """Create `directory` and report the components this call created, so
+        a rollback removes exactly what the apply added and nothing else."""
+        missing: list[Path] = []
+        current = directory
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        made: list[Path] = []
+        for path in reversed(missing):
+            path.mkdir()
+            made.append(path)
+        return made
+
+    def _guard_destination(self, destination: Path) -> None:
+        """Refuse a destination whose real parent is outside `.fv`.
+
+        Preflight already rejects a symlinked path component; this is the
+        same invariant enforced structurally at the moment of the write, so
+        the "only `.fv` is written" guarantee does not rest on a string
+        prefix and a check made earlier.
+        """
+        root = (self.project / ".fv").resolve()
+        parent = destination.parent.resolve()
+        if parent != root and root not in parent.parents:
+            raise MigrationError(
+                f"{destination}: resolved parent {parent} is outside {root}"
+            )
+        if destination.is_symlink():
+            raise MigrationError(f"{destination}: destination became a symlink")
+
+    def _guard_staging(self, path: Path) -> None:
+        """Refuse a staging path that is a symlink or resolves outside `.fv`.
+
+        Every migrated byte is written here before any destination sees it,
+        so the staging prefix carries the same containment obligation as a
+        destination -- and more exposure, because its name is fixed and
+        therefore plantable long before a migration runs. `mkdir` and an
+        ordinary open both follow a link, and `_make_dirs` treats an existing
+        link to a directory as already created, so only this test keeps the
+        staged bytes inside the real `.fv` tree.
+        """
+        root = (self.project / ".fv").resolve()
+        shown = path.relative_to(self.project).as_posix()
+        if path.is_symlink():
+            raise MigrationError(
+                f"{shown}: staging path is a symlink, so every migrated byte would be staged "
+                f"outside {root}"
+            )
+        resolved = path.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise MigrationError(
+                f"{shown}: staging path resolves to {resolved}, outside {root}"
+            )
+
+    def _make_run_directory(self, staging_root: Path, created: list[Path]) -> Path:
+        """This run's own staging subdirectory under the shared prefix.
+
+        The prefix is shared by every concurrent migration of one project and
+        each of them removes it once it is empty, so a sibling finishing
+        between this run's `mkdir` and its `mkdtemp` is an ordinary race, not
+        a failure: the prefix is recreated and the attempt repeated. A prefix
+        that keeps vanishing is reported as the concurrent migration it is,
+        with nothing written, rather than as `ENOENT` on a temp path nobody
+        can map back to a cause.
+        """
+        for _ in range(STAGING_ATTEMPTS):
+            self._guard_staging(staging_root)
+            created.extend(self._make_dirs(staging_root))
+            try:
+                run = Path(tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=staging_root))
+            except FileNotFoundError:
+                continue
+            # The prefix could have been swapped for a link between the guard
+            # above and this call, in which case the directory just created is
+            # real but sits somewhere else entirely.
+            try:
+                self._guard_staging(run)
+            except MigrationError:
+                try:
+                    run.rmdir()
+                except OSError:
+                    pass  # nothing was staged into it; it is not ours to force
+                raise
+            return run
+        raise MigrationError(
+            f"{STAGING_RELATIVE}: another migration of this project removed the shared staging "
+            f"prefix {STAGING_ATTEMPTS} times while this run was creating its own directory; "
+            "nothing was written -- re-run once no other migration of it is in flight"
+        )
+
+    @staticmethod
+    def _rollback(touched: list[_Moved]) -> tuple[set[str], set[str]]:
+        """Put back every destination the apply already touched.
+
+        Returns the paths whose new bytes could not be removed -- they stay
+        in the report as `written` -- and the paths whose original could not
+        be renamed back, which are absent and reported as `lost`. Neither
+        set is emptied silently: the caller keeps the staging tree when
+        either is non-empty, because it holds the only copy of the originals.
+        """
+        stranded: set[str] = set()
+        lost: set[str] = set()
+        for moved in reversed(touched):
+            try:
+                if moved.original is not None:
+                    # A rename, not a rewrite: the destination gets its own
+                    # inode back, so its mode, ownership and timestamps
+                    # return with its bytes.
+                    os.replace(moved.original, moved.destination)
+                elif moved.landed:
+                    moved.destination.unlink()
+            except OSError:
+                (stranded if moved.landed else lost).add(moved.write.path)
+        return stranded, lost
+
+    @staticmethod
+    def _discard_staging(staging: Path | None, staging_root: Path) -> None:
+        """Remove this run's staging tree, and the shared staging prefix once
+        no concurrent run holds a directory under it."""
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        try:
+            staging_root.rmdir()
+        except OSError:
+            pass  # a concurrent run still stages there, or it is already gone
+
+    @staticmethod
+    def _remove_created(created: list[Path]) -> None:
+        """Remove the directories this apply created, deepest first. One that
+        is not empty holds something the rollback could not undo, or a
+        concurrent run's staging tree; either way it stays."""
+        for directory in reversed(created):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass  # not empty, or already gone with the staging tree
+
+    def report(self, *, requested: str, applied: bool, error: str | None = None) -> dict:
         counts = {name: 0 for name in CLASSIFICATIONS}
         for artifact in self.artifacts:
             counts[artifact.classification] += 1
         return {
             "schema": REPORT_SCHEMA,
-            "project_root": self.project.as_posix(),
-            "mode": mode,
+            # Repo-relative by construction: an absolute machine path in a
+            # report an operator captures is exactly what the portability
+            # rule keeps out of a persisted trust artifact. The human render
+            # names the real directory.
+            "project_root": ".",
+            "mode": "apply" if applied else "dry-run",
+            "requested_mode": requested,
+            "applied": applied,
+            "target_spec": self.target_spec,
             "status": "blocked" if self.blocked else "ok",
+            "error": error,
             "counts": counts,
             "artifacts": [
                 artifact.as_json()
@@ -1081,12 +1864,15 @@ class Migration:
         }
 
 
-def render_text(report: dict) -> str:
+def render_text(report: dict, root: str | None = None) -> str:
     actions: dict[str, int] = {}
     for write in report["writes"]:
         actions[write["action"]] = actions.get(write["action"], 0) + 1
+    requested = report.get("requested_mode", report["mode"])
+    mode = report["mode"] if requested == report["mode"] else f"{requested} requested, not applied"
     lines = [
-        f"FV shadow migration ({report['mode']}) of {report['project_root']}",
+        f"FV shadow migration ({mode}) of {root or report['project_root']}",
+        f"  dispatch target: {report.get('target_spec') or 'none'}",
         "  classified: " + "  ".join(f"{name}={report['counts'][name]}" for name in CLASSIFICATIONS),
         "  writes: " + (
             "  ".join(f"{action}={count}" for action, count in sorted(actions.items())) or "none"
@@ -1101,12 +1887,20 @@ def render_text(report: dict) -> str:
         arrow = f" -> {artifact['destination']}" if artifact["destination"] else ""
         lines.append(f"  [{artifact['classification']}] {artifact['source']}{arrow}")
         lines.append(f"      {artifact['detail']}")
+    for write in report["writes"]:
+        if write.get("detail"):
+            lines.append(f"  [{write['action']}] {write['path']}")
+            lines.append(f"      {write['detail']}")
     for label, entries in (("unsupported", report["unsupported"]), ("conflicts", report["conflicts"])):
         for entry in entries:
             lines.append(f"  [{label}] {entry}")
-    if report["status"] == "blocked":
+    if report.get("error"):
+        lines.append(f"  [error] {report['error']}")
+        lines.append("VERDICT: FAILED (see each write's action above; whatever the rollback "
+                     "could not undo is named in the error)")
+    elif report["status"] == "blocked":
         lines.append("VERDICT: BLOCKED (nothing written; resolve the entries above)")
-    elif report["mode"] == "apply":
+    elif report["applied"]:
         lines.append("VERDICT: APPLIED")
     else:
         lines.append("VERDICT: OK (dry run; re-run with --apply to write)")
@@ -1138,18 +1932,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
+    requested = "apply" if args.apply else "dry-run"
     applied = args.apply and not migration.blocked
+    failure: str | None = None
     if applied:
         try:
             migration.apply()
         except (MigrationError, OSError) as error:
-            print(f"ERROR: {error}", file=sys.stderr)
-            return 1
-    report = migration.report("apply" if applied else "dry-run")
+            # The report is the only enumeration of what landed and what did
+            # not, so an apply failure prints it rather than replacing it
+            # with one errno.
+            failure = str(error)
+            applied = False
+    report = migration.report(requested=requested, applied=applied, error=failure)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print(render_text(report))
+        print(render_text(report, root=project.as_posix()))
+    if failure is not None:
+        print(f"ERROR: {failure}", file=sys.stderr)
+        return 1
     if migration.blocked:
         if args.apply and not args.json:
             print("nothing was written: --apply refuses a blocked migration", file=sys.stderr)

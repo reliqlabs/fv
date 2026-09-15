@@ -1,0 +1,302 @@
+{
+  "scope": {
+    "files_reviewed": [
+      "scripts/fv_project.py",
+      "tools/evidence-run.ts",
+      "scripts/check_evidence_records.py",
+      "scripts/coverage_dashboard.py",
+      "tests/r34_evidence_run.py",
+      "tests/r6_manifest_failclosed.py",
+      "tests/m1_coverage.py"
+    ],
+    "authority": ".fv/changes/2026-09-15-colosseum-shadow-migration.md (read in full, untruncated)",
+    "mode": "read-only; no edits, no commits, no test/lint/prover runs. One verification probe was run in a throwaway /tmp git repo (F8), never in this repository.",
+    "seam_reads": [
+      "scripts/fv_migrate.py:520-545 (verified-inputs seam only; fv_migrate itself is migration-adversary's surface)",
+      "scripts/fv_init.py:70-105 (writer of the exclusion list my files consume)"
+    ]
+  },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "HIGH",
+      "lens": "record/schema field fidelity; who-controls; execution cohort atomicity",
+      "title": "Per-execution evidence_class decouples the record's declared class from every artifact, bypassing the unwaived-assumption rule and the obligation/class compatibility table",
+      "location": [
+        "tools/evidence-run.ts:255 (evidenceClass = entry.evidence_class ?? params.evidence_class, validated only for membership in PASS_MARKERS)",
+        "scripts/check_evidence_records.py:229 (_pass_artifact_defects judges each artifact by execution[\"evidence_class\"])",
+        "scripts/check_evidence_records.py:367-369 (record-level class is matched against an artifact only when NOT schema_v3)",
+        "scripts/check_evidence_records.py:354-357 (OBLIGATION_EVIDENCE_COMPATIBILITY applied to record[\"evidence_class\"] only)",
+        "scripts/check_evidence_records.py:602-604 (unwaived-assumption rule reads record[\"evidence_class\"] only)",
+        "scripts/coverage_dashboard.py:341 (dashboard ASSUMED_CLASSES check reads the record class only)"
+      ],
+      "authority_clause": "Section 4: \"each execution records its tool, evidence class ...\"; G2 honesty as enforced at check_evidence_records.py:602 (\"externally-assumed/unverified evidence cannot PASS without a waiver\") and the OBLIGATION_EVIDENCE_COMPATIBILITY table that keeps a witness-only class off an invariant.",
+      "failure_trace": "Producer call, no hand editing required: fv_evidence_run({claim_id:\"A1\", evidence_class:\"code-enforced\", scope:\"s\", executions:[{tool:\"verus\", command:[\"true\"], evidence_class:\"unverified\"}]}). evidence-run.ts:255 accepts \"unverified\"; the marker for that class is the tool's own always-appended \"--- fv-evidence: exit=0 ---\" trailer, so `true` matches; evidence-run.ts:406-407 yields result PASS with record evidence_class \"code-enforced\". Gate B with --manifest (A1 declared as an invariant): schema_v3 is true, so the record class is never matched against any artifact (367-369 is the v2-only branch); the execution is judged at \"unverified\" strength and passes; 354-357 checks only that \"code-enforced\" is invariant-compatible; 602 sees \"code-enforced\", not \"unverified\", so no waiver is demanded. Verdict VERIFIED[profile=producer-trusted-execution], exit 0. The dashboard renders the row as PASS and counts it under code-enforced in by_evidence_class, so the unverified artifact is invisible on every surface. Same construction puts a test-witnessed-only artifact under an invariant (record class code-enforced, execution class test-witnessed), which is exactly what OBLIGATION_EVIDENCE_COMPATIBILITY[\"invariant\"] excludes.",
+      "correction": "Keep per-artifact judging (tests/r6_manifest_failclosed.py:519-525 deliberately blesses it) but make the two record-level rules quantify over the cohort: (a) in check_evidence_records.main, fire unwaived-assumption when record[\"evidence_class\"] OR any execution's evidence_class is in {externally-assumed, unverified}; (b) pass obligation_kind into _execution_defects and require each execution's class to be in OBLIGATION_EVIDENCE_COMPATIBILITY[kind]; (c) mirror (a) in coverage_dashboard.evaluate_claim (and count execution classes in by_evidence_class); (d) in evidence-run.ts:255, reject an execution class strictly weaker than params.evidence_class so the producer cannot mint the record at all. Add the r6 mutation probe: covering cohort, executions[0].evidence_class=\"unverified\", expect INCOMPLETE.",
+      "untested": "No committed test covers a record whose declared class is stronger than any execution class; r34 and r6 only vary classes upward (bounded-checked record with a proof-discharged execution)."
+    },
+    {
+      "id": "F2",
+      "severity": "MEDIUM",
+      "lens": "raw artifact substitution",
+      "title": "raw_output_path is unconstrained beyond containment: one PASS artifact can discharge every execution of a cohort and every claim in the run",
+      "location": [
+        "scripts/check_evidence_records.py:132-146 (_read_artifact: containment + stored-hash match, nothing else)",
+        "scripts/check_evidence_records.py:231-256 (_cohort_defects pins only executions[0] to the legacy bindings; no distinctness or naming rule)",
+        "tools/evidence-run.ts:340 (producer's naming: .fv/evidence/raw/<claim_id>-<run_id>.log, run_id unique per execution)"
+      ],
+      "authority_clause": "Section 4: each execution records its \"raw-output path and hash, result, run_id\"; _read_artifact's own docstring: \"no later check can read bytes the record does not commit to\".",
+      "failure_trace": "Take the r34 cohort record S1 (required_evidence [kani, verus]). Point both executions' raw_output_path at a single committed file whose bytes are \"No violation found\\nVERIFICATION:- SUCCESSFUL\\n--- fv-evidence: exit=0 ---\\n\" and set both raw_output_hash to that file's digest (the primary's copy too, so the executions[0] derivation check at 244-247 still holds). Gate B: _read_artifact hash-matches for both, _pass_artifact_defects passes for both classes, tools kani and verus are distinct so no duplicate-tool defect, _coverage_defects sees both required tools PASS. Verdict VERIFIED. Nothing ties an execution's artifact to its run_id, to its claim, or to a distinct file, so N tools and M claims can share one log. The r6 fixture itself writes <claim>.log with no run_id (tests/r6_manifest_failclosed.py:150) and Gate B accepts it, confirming no naming rule exists.",
+      "correction": "In _cohort_defects: require pairwise-distinct raw_output_path across executions, and when bindings[\"profile\"] == \"producer-trusted-execution\" require raw_output_path == f\".fv/evidence/raw/{record['claim_id']}-{execution['run_id']}.log\" (an invariant every producer record satisfies by construction, so zero false positives). Optionally extend across records in a run: no two claims may cite the same artifact path."
+    },
+    {
+      "id": "F3",
+      "severity": "MEDIUM",
+      "lens": "deferred-cannot-silently-succeed",
+      "title": "Gate B's VERIFIED scope does not disclose that the freshness binding was skipped or operator-pinned",
+      "location": [
+        "scripts/check_evidence_records.py:544-552 (binding computed only when not allow_unbound)",
+        "scripts/check_evidence_records.py:622-625 (verdict scope carries profile and waivers only)"
+      ],
+      "authority_clause": "Section 2: \"Gate B ... recomputes the current snapshot and, by default, demands an exact match; --expect-snapshot / --allow-unbound remain the explicit escape hatches\"; G2 as the project states and self-checks it in coverage_dashboard.py:60-72 (\"VERIFIED is never a bare token; it always carries a scope\").",
+      "failure_trace": "check_evidence_records.py --records .fv/evidence/records --manifest .fv/obligations.json --allow-unbound prints \"VERDICT: VERIFIED[profile=producer-trusted-execution]\" on stderr and exits 0. The identical string is printed when the snapshot and intent were recomputed and matched. A CI step or operator that greps the banner cannot distinguish an evidence-bound VERIFIED from one where content freshness and intent binding were both switched off; the only trace is expected_snapshot: null / intent_path: null inside --json. Most of r34's own Gate B assertions run through gate(), which always passes --allow-unbound (tests/r34_evidence_run.py:243-251), so the unbound banner is the one most commonly observed in this repo.",
+      "correction": "Extend the scope token: VERIFIED[profile=...; binding=recomputed|pinned|unbound], appending pinned when --expect-snapshot/--expect-intent were supplied and unbound under --allow-unbound. The dashboard's UNSCOPED_VERDICT_RE self-check already establishes the pattern for treating the verdict string as a load-bearing artifact."
+    },
+    {
+      "id": "F4",
+      "severity": "MEDIUM",
+      "lens": "v2 downgrade paths; execution cohort atomicity",
+      "title": "coverage_dashboard validates only the v2 binding set and silently drops unreadable cohort entries, so its VERIFIED contradicts Gate B's INCOMPLETE on v3-specific defects",
+      "location": [
+        "scripts/coverage_dashboard.py:175-180 (validate_record iterates BINDING_FIELDS only; no intent_path, no executions, no per-execution shape)",
+        "scripts/coverage_dashboard.py:295-299 (cohort_coverage skips entries whose tool is not a string)",
+        "scripts/coverage_dashboard.py:261-286 (executions_of drops non-dict entries)",
+        "scripts/coverage_dashboard.py:10-16 and 20-22 (docstring: \"computes the same G2 verdict\"; \"RECORD SCHEMA - identical to check_evidence_records.py\")"
+      ],
+      "authority_clause": "Section 4 assigns cohort coverage reporting to coverage_dashboard.py, and the change record lists it under \"Affected verification surface / Gates\". The dashboard's own docstring promises schema parity with Gate B and that \"a non-PASS execution beside the required ones is still a gap\".",
+      "failure_trace": "Two concrete divergences on the same record set. (a) Take a produced v3 record for an invariant, delete bindings.executions, keep parser_schema_version \"fv-evidence-run/v3\": Gate B returns 3 with \"missing binding field 'executions'\" (check_evidence_records.py:320-327), the dashboard's validate_record never looks for it, so the row is a clean PASS and, for a non-system claim, compute_verdict returns VERIFIED and exit 0. (b) Take the covering SC1 cohort and set one extra execution to {\"tool\": 123, \"result\": \"FAIL\", ...}: Gate B returns 3 (\"malformed evidence tool id\"); the dashboard's executions_of maps tool to None, cohort_coverage:297 skips it, non_passing never sees it, required tools still PASS, so the row stays PASS and the run prints VERIFIED. In both cases the tool that exists to make gaps visible reports the gap as covered.",
+      "correction": "Give the dashboard a v3 arm: when parser_schema_version == \"fv-evidence-run/v3\" or executions is present, require intent_path and a nonempty executions list, and mark the row invalid if any entry is not an object or its tool is not a string. In cohort_coverage, count an unreadable tool id as a non-passing cohort entry rather than skipping it. Either that, or drop the docstring's schema-parity and same-verdict claims and stop emitting a VERIFIED token at all."
+    },
+    {
+      "id": "F5",
+      "severity": "MEDIUM",
+      "lens": "upgrade/migration completeness; content-set manipulation",
+      "title": ".fv/history/ is not a structural default exclusion, so fv_init --force silently pulls quarantined legacy evidence back into the content snapshot",
+      "location": [
+        "scripts/fv_project.py:31 (DEFAULT_EXCLUSIONS omits .fv/history/)",
+        "tools/evidence-run.ts:17 (same four defaults mirrored)",
+        "scripts/fv_migrate.py:532 (migrator adds HISTORY_EXCLUSION to the project file instead)",
+        "scripts/fv_init.py:81-89 (--force rewrites the file from fv_project.DEFAULT_EXCLUSIONS alone)"
+      ],
+      "authority_clause": "Section 8: \".fv/history/ is added to the verified-input exclusion list, so quarantined history cannot perturb the content snapshot that fresh evidence binds to.\"",
+      "failure_trace": "Migrate a legacy project (--apply writes .fv/verified-inputs.txt containing the four defaults plus .fv/history/), earn v3 evidence, then run fv_init.py --force (documented as replacing the file). install_verified_inputs writes only fv_project.DEFAULT_EXCLUSIONS, so .fv/history/ is gone. Every byte under .fv/history/colosseum/, including the quarantined v1/v2 evidence records, re-enters candidate selection at fv_project.py:238, the recomputed snapshot no longer equals any stored binding, and every existing v3 record reads \"stale record\" (exit 3). From then on, quarantining more legacy history invalidates all live evidence. The invariant section 8 states is contingent on a project file, whereas the sibling exclusions .fv/evidence/, .fv/verify/, .fv/panels/, .colosseum/ are structural.",
+      "correction": "Add \".fv/history/\" to fv_project.DEFAULT_EXCLUSIONS:31 and to the mirrored list in tools/evidence-run.ts:17. fv_migrate.py:532's explicit HISTORY_EXCLUSION then dedupes to a no-op, and fv_init --force can no longer drop it. Note the two lists must move together or F7's parity problem becomes a hard snapshot mismatch."
+    },
+    {
+      "id": "F6",
+      "severity": "MEDIUM-LOW",
+      "lens": "producer/gate identifier parity; record/schema field fidelity",
+      "title": "Two identifier-shape divergences let a run produce artifacts its own gate rejects, and leave unproducible obligation ids unflagged",
+      "location": [
+        "tools/evidence-run.ts:216-224 (legacy single-command form checks params.tool only for non-emptiness; falls back to path.basename(argv[0]) unchecked)",
+        "tools/evidence-run.ts:242 (cohort form does apply EVIDENCE_TOOL_ID)",
+        "scripts/check_evidence_records.py:194-196 (_execution_defects requires EVIDENCE_TOOL_ID.fullmatch)",
+        "scripts/check_evidence_records.py:61 (OBLIGATION_ID admits ':'), tools/evidence-run.ts:290 (claim_id must match ^[A-Za-z0-9][A-Za-z0-9._-]*$)"
+      ],
+      "authority_clause": "evidence-run.ts:20-22 states EVIDENCE_TOOL_ID \"mirrors\" the gate's so \"both ends agree on the shape\". Section 7/the second correction in the Adversarial review section: \"Migrated obligation ids are usable by the evidence producer without a human edit\", and an operator must never read missing-record for an obligation whose evidence was in fact earned.",
+      "failure_trace": "(a) fv_evidence_run({claim_id:\"B1\", command:[\"sh\",\"-c\",\"true\"], tool:\"cargo kani\", evidence_class:\"code-enforced\", scope:\"s\"}) prints \"PASS: B1\" and persists the record; Gate B then reports \"executions[0] malformed evidence tool id 'cargo kani'\" and exits 3. The cohort form rejects the same string up front (tested at tests/r34_evidence_run.py:127, malformedTool), the legacy form does not. (b) A hand-written or externally generated obligations.json may declare an invariant id \"verus:contract::Machine\": load_manifest accepts it (OBLIGATION_ID allows ':'), it joins the required set, and no producer can ever write .fv/evidence/records/verus:contract::Machine.json because evidence-run.ts:290 rejects the claim_id. Gate B reports missing-record forever with no hint that the id is unproducible. This is the exact defect shape the change record says was corrected inside the migrator; the gate that consumes any manifest still does not guard it.",
+      "correction": "(a) Apply EVIDENCE_TOOL_ID in the legacy branch, to both params.tool and the basename fallback, so no accepted call can write a record the gate rejects. (b) In load_manifest, fail (or emit a named defect) when an obligation id does not match the producer's claim_id grammar ^[A-Za-z0-9][A-Za-z0-9._-]*$, which is the only id shape that can ever be covered."
+    },
+    {
+      "id": "F7",
+      "severity": "LOW-MEDIUM",
+      "lens": "Python/TypeScript snapshot parity",
+      "title": "Exclusion-list parsing diverges between the gate and the producer on non-LF line terminators",
+      "location": [
+        "scripts/fv_project.py:155 (text.splitlines()) and :156 (raw.strip())",
+        "tools/evidence-run.ts:109 ((await listFile.text()).split(\"\\n\")) and :111 (line.trim())"
+      ],
+      "authority_clause": "Section 2: the producer \"recomputes the snapshot\" and \"Gate B ... recomputes the current snapshot and, by default, demands an exact match\". Byte-for-byte agreement between the two implementations is the premise of the exact-match default (fv_project.py docstring: \"Two contracts live here so producers, gates, and scaffolding agree byte for byte\").",
+      "failure_trace": "Python's str.splitlines() splits on \\r, \\x0b, \\x0c, \\x1c-\\x1e, \\x85, \\u2028 and \\u2029; JS split(\"\\n\") does not, and JS trim() does not strip \\x85 while Python strip() does. Verified language semantics: \"build/\\u2028docs/\".splitlines() == [\"build/\", \"docs/\"]. A .fv/verified-inputs.txt whose entries are separated by a lone \\r (or that contains \\u2028/\\x85) therefore yields a different exclusion set on each side: the producer keeps the line as one meaningless entry and hashes docs/**, Gate B excludes docs/** and hashes without it. Every record then reads \"stale record\" and the project can never gate. The direction is fail-closed, but the failure is unattributable: the message blames source drift, not a parse divergence, and no fv_doctor check compares the two parses.",
+      "correction": "Make the TS side split on the same terminator class (split(/\\r\\n|\\r|\\n|\\x0b|\\x0c|\\x85|\\u2028|\\u2029|\\x1c|\\x1d|\\x1e/)) and trim the same whitespace set, or, simpler and safer, have fv_project.parse_exclusions reject any entry line containing a character outside [\\x20-\\x7e] and have the TS mirror that rejection, so an unparseable list fails loudly on both sides instead of diverging."
+    },
+    {
+      "id": "F8",
+      "severity": "LOW",
+      "lens": "content-set manipulation; path containment",
+      "title": "Non-regular worktree files are an unclassified candidate class: a tracked path replaced by a FIFO hangs the snapshot forever on both sides",
+      "location": [
+        "scripts/fv_project.py:242-255 (symlink, escape, directory and deleted candidates are each explicitly classified; nothing checks S_ISREG before _file_digest)",
+        "scripts/fv_project.py:204-209 (_file_digest opens the path)",
+        "tools/evidence-run.ts:151-158 (same classification, same omission)"
+      ],
+      "authority_clause": "Section 2: \"Symlinks and candidates resolving outside the root are rejected\", alongside the deliberate directory (submodule) and deleted-file classifications. The implementation classifies every other anomaly and blocks on this one.",
+      "failure_trace": "Verified in a throwaway /tmp repository, not in this repo: commit a regular file, then `rm f && mkfifo f`. git ls-files --cached --others --exclude-standard -z still lists f (untracked FIFOs are not listed, but a tracked path whose worktree entry is now a FIFO is). For that candidate is_symlink() is False, is_dir() is False and exists() is True, so control reaches _file_digest, whose open(path,'rb') blocks until a writer appears: `timeout 2 python3 -c \"open('f','rb').read(1)\"` exited 124. Consequence: fv_project.py snapshot, Gate B's current_source_snapshot and the producer all hang with no timeout and no diagnostic, in the one code path whose whole purpose is to fail closed and explain why.",
+      "correction": "Between the directory check and the digest, require a regular file: stat the candidate once and raise ProjectError(f\"verified input is not a regular file: {relative}\") for anything that is not S_ISREG (Python's Path.is_file() already returns False for a FIFO). Mirror it in evidence-run.ts:157 using the lstat info already in hand (info.isFile())."
+    },
+    {
+      "id": "F9",
+      "severity": "LOW",
+      "lens": "v2 downgrade paths; execution cohort atomicity",
+      "title": "No gate rule forbids a PASS record whose binding is marked +dirty; prefix mode accepts it",
+      "location": [
+        "tools/evidence-run.ts:429 (source_snapshot: snapshot + (dirty ? \"+dirty\" : \"\"))",
+        "scripts/check_evidence_records.py:328-333 (prefix match unless --snapshot-exact)",
+        "no occurrence of \"dirty\" in scripts/check_evidence_records.py or scripts/coverage_dashboard.py"
+      ],
+      "authority_clause": "Section 2: bindings must have \"held still\" (the producer's own comment at evidence-run.ts:361-362); the escape hatches exist so \"a v2 record still validates\", not so a mutated-binding record does.",
+      "failure_trace": "A record with source_snapshot \"sha256:<hex>+dirty\" and result PASS validates under --expect-snapshot sha256:<hex> because line 331 uses startswith when --snapshot-exact is absent (the documented prefix behaviour, docs/dogfood-evidence.md:414-416, exercised at tests/r6_manifest_failclosed.py:376). The default path is safe (exact match rejects it as stale) and the producer never emits PASS while dirty (evidence-run.ts:407), so this requires a hand-edited or third-party record; but the gate has no positive rule that a dirty-marked binding cannot PASS, and the dirty marker carries no weight anywhere in either consumer.",
+      "correction": "In validate_record, reject any record whose source_snapshot ends with \"+dirty\" while result == \"PASS\", independently of the snapshot comparison mode. One line, and it makes the producer's honesty marker enforceable rather than advisory."
+    },
+    {
+      "id": "F10",
+      "severity": "LOW",
+      "lens": "canonical target divergence; path containment",
+      "title": "intent_path is containment-checked but never compared to the resolved canonical target",
+      "location": [
+        "scripts/check_evidence_records.py:359-363 (_contained_path_defect only)",
+        "scripts/check_evidence_records.py:536-541 and 550 (current_intent_binding resolves the canonical path, which is then only reported)",
+        "scripts/check_evidence_records.py:113-122 (_contained_path_defect does not require existence)"
+      ],
+      "authority_clause": "Section 6: \"intent_path in a v3 record is itself containment-checked against the repo root by Gate B.\" The code matches the clause exactly, so this is a scope gap in the clause, not a violation of it.",
+      "failure_trace": "Gate B resolves the canonical target and its hash at line 550, compares only intent_hash (line 344), and puts the resolved path in the report without comparing it to bindings.intent_path. A v3 record may therefore declare intent_path \"docs/whatever.md\" (or any contained, nonexistent path) while binding the canonical target's hash and pass every check. Under --expect-intent or --allow-unbound the hash is not recomputed either, so both the recorded path and the recorded hash go unverified while the record still validates. The provenance field a later reader would use to locate the intent is the one field of the pair nothing checks.",
+      "correction": "When intent_path was resolved this run (not allow_unbound), compare it to fv_project.repo_relative(repo_root, resolve_target(repo_root)) and report a drift defect on mismatch. It is the same cheap equality the intent_hash check already performs on the content."
+    },
+    {
+      "id": "F11",
+      "severity": "LOW",
+      "lens": "canonical target divergence; Python/TypeScript parity",
+      "title": "The gate expands ~ in target_spec, the producer does not",
+      "location": [
+        "scripts/fv_project.py:118 (raw = Path(str(spec)).expanduser())",
+        "tools/evidence-run.ts:91 (path.resolve(projectRoot, spec), no tilde handling)"
+      ],
+      "authority_clause": "Section 1: fv_project.py is \"the single implementation every skill, gate, and tool resolves through\", and evidence-run.ts:85-88 states it \"rejects escaping, symlinked, directory, and missing targets exactly as fv_project.resolve_target does, so producer and gate bind the same file.\"",
+      "failure_trace": "target_spec \"~/intent.md\" with a directory literally named ~ in the project: the producer resolves <root>/~/intent.md, accepts it as contained, and binds it; fv_project.resolve_target expands to $HOME/intent.md, finds it outside the root and raises \"target_spec escapes project root\", so Gate B exits 2 with \"cannot bind evidence to current source and intent\". Conversely with no ~ directory present the producer reports \"target_spec does not exist: ~/intent.md\" while the gate reports an escape. Both ends are safe; they are not the same implementation, and the comment claiming they are is what a reader would trust instead of re-deriving.",
+      "correction": "Either drop expanduser() at fv_project.py:118 (a repo-relative declaration has no use for ~, and section 1 requires resolution against the project root) or expand ~ in the TS resolver. Dropping it is the smaller change and keeps \"no absolute path enters a persisted trust artifact\" mechanical."
+    },
+    {
+      "id": "F12",
+      "severity": "LOW",
+      "lens": "execution cohort atomicity",
+      "title": "Version probes run before the baseline snapshot, so probe-induced input mutation is absorbed into the binding instead of flagged",
+      "location": [
+        "tools/evidence-run.ts:310-355 (planning loop, including the --version probe at :333)",
+        "tools/evidence-run.ts:356-364 (exclusions, baseline snapshot and baseline git status taken after the loop)"
+      ],
+      "authority_clause": "Section 2: the producer \"recomputes the snapshot, the intent hash, and the manifest hash around every execution, so a command that edits a verified input cannot ship as PASS evidence for itself or for an earlier execution in the same record.\"",
+      "failure_trace": "Every cohort member's executable is probed with --version at line 333 while the project is untouched and unrecorded; the baseline snapshot is only computed at line 357. A wrapper executable (or a cargo/quint shim that regenerates a lockfile or a generated source on any invocation) mutates a verified input during the probe phase, and that mutation is baked into the baseline snapshot as if it were the verified pre-run state: it moves no hash afterwards and sets no dirty flag. The around-every-execution guarantee holds for the recorded commands and not for the probes the same run issues.",
+      "correction": "Take the baseline snapshot, intent hash, manifest hash and git status before the planning loop, and re-check them after it (the existing per-execution check already provides the shape), so a probe that edits a verified input marks the record dirty like any other command."
+    },
+    {
+      "id": "F13",
+      "severity": "LOW",
+      "lens": "field-name fidelity",
+      "title": "The authority and three docs name a dashboard status string the code never emits",
+      "location": [
+        "scripts/coverage_dashboard.py:147 and :369 (status is \"evidence-gap\"), :43, :69, :407, :555 (same spelling throughout)",
+        "tests/m1_coverage.py:373-374, 396-397, 413-414, 424-425, 515 (assert \"evidence-gap\")",
+        ".fv/changes/2026-09-15-colosseum-shadow-migration.md:27 (\"coverage-gap\")",
+        "CONCEPTS.md:156, docs/incremental-reverification.md:130, ROADMAP.md:283 (\"coverage-gap\")"
+      ],
+      "authority_clause": "Section 4: \"coverage_dashboard.py reports the two ways that fails (coverage-gap for a required tool that never PASSed or a non-PASS execution inside an otherwise-covering cohort, dependency-gap ...)\".",
+      "failure_trace": "The tool emits rows and summary keys \"evidence-gap\"/\"evidence_gap\". A consumer written from the authority, CONCEPTS.md or docs/incremental-reverification.md (a CI job matching status == \"coverage-gap\", or an operator grepping for it) matches nothing and reads the absence as no coverage gaps, on exactly the status that exists to make unearned coverage visible. dependency-gap, the other half of the same sentence, is spelled correctly, which makes the mismatch harder to notice.",
+      "correction": "One spelling, applied everywhere. Prefer fixing the four documents to \"evidence-gap\" (code, tests and scripts/README.md:152 already agree, and renaming the emitted string would break committed assertions and any existing consumer)."
+    },
+    {
+      "id": "F14",
+      "severity": "LOW",
+      "lens": "raw artifact substitution; producer/gate parity",
+      "title": "A command whose own output contains the trailer sentinel makes the producer persist a PASS record its gate rejects",
+      "location": [
+        "tools/evidence-run.ts:372-380 (trailer appended to whatever the command printed; markerMatched is a substring/regex test over the whole artifact)",
+        "scripts/check_evidence_records.py:151-157 (_pass_artifact_defects requires exactly one exit trailer in the artifact, and it must be the last line)"
+      ],
+      "authority_clause": "Section 4 and _read_artifact's contract: the artifact is what the record commits to; a producer-written PASS record must validate at the gate it was designed for.",
+      "failure_trace": "Any verification command that echoes a previous evidence log (cat/tail of .fv/evidence/raw/*.log, a test that prints captured output, a wrapper that tees an earlier artifact) emits a line matching ^--- fv-evidence: exit=\\d+ ---$. The producer appends its own trailer and, on exit 0 with the class marker present, writes result PASS. Gate B counts two trailers and reports \"PASS artifact must end with one unique canonical exit=0 trailer\", exit 3. The operator sees PASS on the console and INCOMPLETE at the gate, with a message that reads like tampering.",
+      "correction": "In the producer, before writing the artifact, reject (or escape) command output containing a line matching /^--- fv-evidence: exit=\\d+ ---$/, with an error naming the sentinel collision. The sentinel is the producer's own, so the producer is the right place to keep it unique."
+    },
+    {
+      "id": "F15",
+      "severity": "LOW",
+      "lens": "who-controls",
+      "title": "Record-asserted fields the gate trusts without validation",
+      "location": [
+        "scripts/check_evidence_records.py:310-314 (profile gates whether toolchain identity is required for v2 records) and :622-623 (profile string is copied verbatim into the VERIFIED scope)",
+        "scripts/check_evidence_records.py:602-611 (any truthy waiver satisfies the assumption rule and adds the claim to the waived list)",
+        "scripts/check_evidence_records.py:71 and :91 (required_targets and run_id are required to be present and nonempty, and are never compared to anything)"
+      ],
+      "authority_clause": "Section 4 lists the fields a v3 record carries; G2 requires the verdict scope to be honest about what was assumed.",
+      "failure_trace": "The verdict a consumer reads, VERIFIED[profile=<x>], is whatever string the records under judgement put in bindings.profile; a record declaring profile \"x\" also skips the record-level toolchain-identity check at 310 (moot for v3, where every execution is checked at :207, live for v2). waiver may be literal true, with no id, approver, scope or expiry, and that alone converts an unverified-class record from unwaived-assumption into PASS-waived. required_targets is never diffed against the manifest (the manifest hash covers it indirectly) and run_id is never correlated with anything, including the artifact filename that embeds it (see F2). This is pre-existing v2 surface, not introduced by these commits; it is reported because F1's and F9's corrections route through exactly these fields.",
+      "correction": "No change required for this review's scope. If tightened: validate waiver as an object with id/approver/scope, and derive the verdict's profile from the gate's own configuration rather than from the records it judges."
+    },
+    {
+      "id": "F16",
+      "severity": "INFO",
+      "lens": "clause-to-line",
+      "title": "Authority citation range omits the duplicate-id rejection it names",
+      "location": [
+        ".fv/changes/2026-09-15-colosseum-shadow-migration.md:27 (\"Gate B fails duplicate IDs, unknown dependencies, and malformed claims (scripts/check_evidence_records.py:422-452)\")",
+        "scripts/check_evidence_records.py:422-452 covers _id_list (malformed, repeated) and _validate_system_claim (unknown dependency, wrong kind)",
+        "scripts/check_evidence_records.py:465-468 is where duplicate obligation ids are rejected"
+      ],
+      "authority_clause": "Section 4's own citation.",
+      "failure_trace": "Two of the three named behaviours are inside the cited range; duplicate-id rejection is in load_manifest at 465-468, outside it. A reviewer checking the clause against the cited lines finds no duplicate-id logic there. Other citations in the record verify correctly: fv_project.py:31 (DEFAULT_EXCLUSIONS), evidence-run.ts:406 (cohort verdict), fv_init.py:55 and :63 (build_dispatch_json and portable_target_spec definitions).",
+      "correction": "Cite scripts/check_evidence_records.py:422-452,465-468, or move the sentence's duplicate-id clause to its own citation."
+    },
+    {
+      "id": "F17",
+      "severity": "INFO",
+      "lens": "required_evidence coverage; composition",
+      "title": "Gate B does not expand a system claim's depends_on into the required set",
+      "location": [
+        "scripts/check_evidence_records.py:496-509 (load_manifest validates depends_on but returns only required_evidence for judging)",
+        "scripts/check_evidence_records.py:264-272 (_coverage_defects checks required_evidence only)",
+        "scripts/coverage_dashboard.py:372-398 (dependency-gap lives in the dashboard, and only for dependencies inside the required set)"
+      ],
+      "authority_clause": "Section 4 states the PASS condition as \"every one of its required_evidence tool IDs appears among PASS executions\", and assigns dependency-gap to the dashboard. The code matches; this is a scope note, not a violation.",
+      "failure_trace": "check_evidence_records.py --manifest obligations.json --require SC1 narrows the required set to the system claim alone. unknown_required passes (SC1 is in the manifest), _coverage_defects is satisfied by the cohort, and the run prints VERIFIED[profile=...] exit 0 while the invariants and witnesses SC1 depends_on have no records at all. The whole-manifest invocation (no --require) does not have this shape, because every dependency is then required in its own right, and the dashboard reports dependencies_not_evaluated for the subset case. Worth knowing before any CI job adopts --require with a system claim.",
+      "correction": "Either expand depends_on transitively into the required set whenever a system claim is required, or emit a named defect when a required system claim's dependencies are outside the required set, matching the dashboard's dependencies_not_evaluated row."
+    }
+  ],
+  "verified_sound": [
+    {
+      "item": "Snapshot byte-encoding and ordering parity",
+      "detail": "fv_project.content_snapshot:260-271 and evidence-run.ts:129-165 agree on the feed (UTF-8 path, NUL, 64-hex content digest, LF) and both sort by UTF-8 bytes (sorted(key=name.encode) vs Buffer.compare), so the UTF-16-vs-UTF-8 ordering trap for non-BMP filenames is avoided. The NUL separator plus fixed-width digest keeps the encoding unambiguous even for paths containing LF. tests/r34_evidence_run.py:329-335 exercises real parity end to end: the producer's TS-computed snapshot is accepted by Gate B's Python recomputation under default freshness."
+    },
+    {
+      "item": "Symlink, directory, deleted and escaping candidate classification",
+      "detail": "fv_project.py:242-253 and evidence-run.ts:152-158 classify identically (symlink rejected, gitlink directory skipped, worktree-deleted skipped, escape rejected). is_excluded/isExcluded agree on trailing-slash prefix versus whole-component matching."
+    },
+    {
+      "item": "Cohort atomicity in the producer",
+      "detail": "Planning resolves every cwd, executable and run id before any execution (evidence-run.ts:310-355), bindings are recomputed after each execution, dirty is monotonic, and the verdict is the conjunction (406-407). Per-execution raw artifacts get collision-free names via index plus sanitized tool. tests/r34_evidence_run.py:531-545 and 555-560 cover the passing and failing cohort shapes."
+    },
+    {
+      "item": "Gate B cohort structural checks",
+      "detail": "Missing required tool, duplicate tool id, shell-string argv, escaping cwd, FAIL execution under a PASS record, tampered later artifact, and legacy-binding derivation from executions[0] are each enforced (check_evidence_records.py:184-256) and each has a committed mutation probe (tests/r34_evidence_run.py:565-604, tests/r6_manifest_failclosed.py:536-559)."
+    },
+    {
+      "item": "Record-controlled regex cannot mask a nonzero exit",
+      "detail": "_pass_artifact_defects:151-157 checks the trailer set before consulting any record-supplied marker, and pass_marker is substring-matched rather than compiled, so the '.*' attack is blocked (tests/r34_evidence_run.py:498-506)."
+    },
+    {
+      "item": "v2 acceptance and the v2-cannot-cover-a-cohort rule",
+      "detail": "A v2 record (no executions) still validates under --expect-snapshot/--allow-unbound and is rejected under default freshness with a migration hint (check_evidence_records.py:336-342), while _coverage_defects:264-272 leaves every required tool uncovered for a cohort-less record, so downgrading a system claim's record to v2 cannot discharge it (tests/r6_manifest_failclosed.py:528-534)."
+    },
+    {
+      "item": "Path containment on record-supplied paths",
+      "detail": "_contained_path_defect:113-122 and _read_artifact:132-146 reject absolute values and '..' components lexically and then re-check after resolve(), so a symlinked component cannot carry cwd, raw_output_path or intent_path outside the repo root."
+    },
+    {
+      "item": "System-claim manifest validation",
+      "detail": "Duplicate ids across all three collections, unknown dependencies, dependencies of kind system_claim, non-array/empty/duplicate/malformed depends_on and required_evidence all raise ManifestError (check_evidence_records.py:412-475); confining depends_on to invariants and witnesses makes claim-to-claim cycles unrepresentable, so the absent cycle search is justified rather than deferred."
+    }
+  ],
+  "not_claimed": [
+    "No test, lint, formatter or prover was run, and no file in the repository was modified. F8's hang was reproduced in a throwaway /tmp repository only.",
+    "scripts/fv_migrate.py, scripts/pyramid_run.py and scripts/check_ledger_references.py were not reviewed beyond the two seam reads listed in scope; fv_migrate is a sibling agent's surface.",
+    "Findings F1, F2, F4, F6, F9 and F14 are derived from code reading and are stated as traces, not as executed reproductions. Each names the exact call or mutation that would reproduce it.",
+    "F15 and the vacuity of the code-enforced / proof-discharged / conformance-tested / externally-assumed / unverified class markers (all of which accept the producer's own always-appended exit=0 trailer, so those classes assert nothing beyond exit status) predate these four commits: git log -S attributes both marker tables to 58c1f24. They are reported as context for F1 rather than as defects introduced here."
+  ]
+}

@@ -54,7 +54,7 @@ records must be re-earned.
 every file `git ls-files --cached --others --exclude-standard` reports that does
 not fall under a `.fv/verified-inputs.txt` exclusion prefix, hashed as
 path + NUL + content-hash per input in sorted path order (CONCEPTS.md, "The
-verified-input content snapshot"). Four consequences for reuse:
+verified-input content snapshot"). Five consequences for reuse:
 
 - **Reuse is decided by content, not by commit identity.** A commit that
   rewrites history, a rebase, a fresh clone, or a second worktree does not
@@ -67,13 +67,26 @@ verified-input content snapshot"). Four consequences for reuse:
   `sha256:<hex>+dirty` and the record's result is FAIL. A `+dirty` binding is
   therefore not a weaker PASS to reuse; it is an unusable record, and the run
   has to be repeated on a settled tree.
+- **A reuse decision must read the binding mode, not just the verdict.** Gate B
+  discloses which freshness discipline produced its verdict:
+  `VERIFIED[profile=...; binding=recomputed]` means the snapshot and intent
+  hash were recomputed and matched, `binding=pinned` means an operator-supplied
+  `--expect-snapshot` / `--expect-intent` was compared instead, and
+  `binding=unbound` means `--allow-unbound` switched the comparison off. Only
+  `recomputed` is evidence that the records still match the tree, so a
+  pinned or unbound PASS is not a reuse license. The coverage dashboard, which
+  never recomputes, always reports `binding=not-recomputed`.
 - **The exclusion list is part of the binding's meaning.** FV's own generated
-  output (`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`) and quarantined
-  pre-FV history (`.fv/history/`, `.colosseum/`) are excluded, so writing
-  evidence never invalidates the evidence being written and migrated history
-  never perturbs a fresh run. Changing the exclusion list changes which files
-  the snapshot covers, which changes the snapshot: it is a binding change, and
-  every record bound to the old input set is stale.
+  output (`.fv/evidence/`, `.fv/verify/`, `.fv/panels/`), quarantined pre-FV
+  history (`.fv/history/`, `.colosseum/`), and a shadow migration's staging
+  tree (`.fv/.migrate-staging/`) are structural defaults, applied whether or
+  not a project file names them, so writing evidence never invalidates the
+  evidence being written, migrated history never perturbs a fresh run,
+  quarantining more legacy history later cannot retroactively stale a reusable
+  record, and a migration interrupted mid-apply cannot stale one either by
+  leaving its staging directory behind. Adding a project prefix changes which
+  files the snapshot covers, which changes the snapshot: it is a binding
+  change, and every record bound to the old input set is stale.
 - **The snapshot is whole-tree, so per-component reuse needs the boundary.**
   One project-wide hash cannot say *which* component moved. That is exactly what
   decomposition supplies: the per-component source set below is what makes the
@@ -127,9 +140,15 @@ That conjunction fixes the reuse rule for system claims:
   change, a tool whose re-run now FAILs, a tool dropped from `required_evidence`
   coverage, or a `depends_on` obligation that lost its own evidence each take
   the claim out of PASS. The coverage dashboard distinguishes the shapes:
-  `coverage-gap` (a required tool never PASSed, its cohort is absent, or some
+  `evidence-gap` (a required tool never PASSed, its cohort is absent, or some
   other execution in the cohort did not PASS) from `dependency-gap` (a fully
   PASSing cohort whose dependency is uncovered).
+- **Reuse is per-artifact, so a re-run writes new artifacts.** Each execution
+  commits to its own raw-output path and hash; two executions of a cohort may
+  not cite one artifact, and no two claims may cite one either. Re-earning a
+  claim therefore produces a fresh `.fv/evidence/raw/<claim_id>-<run_id>.log`
+  per execution rather than re-pointing the old record at a shared log, and a
+  reused record stays bound to the artifact bytes it was earned against.
 - **A cross-component system claim is reusable only when every contributing
   component is.** The claim's inputs span components, so its cohort's
   whole-tree `source_snapshot` moves whenever any contributor's source moves.

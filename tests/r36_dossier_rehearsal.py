@@ -47,6 +47,9 @@ What this suite holds the migration to:
     survives in `legacy_id`;
   * legacy G1 records are history, never live v3 records, and imported
     bytes are never verified inputs;
+  * the staging residue a hard-killed apply strands moves no verified-input
+    snapshot, asserted against the real git-backed snapshot this project
+    has rather than against a parsed exclusion list;
   * re-apply is byte-idempotent;
   * Gate A passes on the converted ledger under --strict-kani;
   * Gate B is INCOMPLETE for exactly one reason -- every required claim
@@ -95,6 +98,10 @@ MIGRATED_TIMEOUT = 3600
 FV_DEFAULT_EXCLUSIONS = (".fv/evidence/", ".fv/verify/", ".fv/panels/", ".colosseum/")
 HISTORY_EXCLUSION = ".fv/history/"
 HISTORY_ROOT = ".fv/history/colosseum"
+# The fixed prefix an apply stages under, one unique subdirectory per run. A
+# hard kill leaves the tree behind, so the snapshot must exclude it.
+STAGING_ROOT = ".fv/.migrate-staging"
+STAGING_EXCLUSION = ".fv/.migrate-staging/"
 PROFILE = "dossier-bounded-composition/v1"
 ENVIRONMENT_POLICY = (
     "single-host observation, unrecorded environment (TA-07); every layer ran "
@@ -396,7 +403,9 @@ def evidence_claim_id_pattern() -> re.Pattern[str]:
     decides whether a migrated obligation can be discharged at all, so a copy
     of it in this test would keep passing after the producer moved.
     """
-    match = re.search(r"/(\^\[[^/]+\$)/\.test\(params\.claim_id\)", EVIDENCE_RUN.read_text())
+    source = EVIDENCE_RUN.read_text()
+    match = re.search(r"const CLAIM_ID = /(\^\[[^/]+\$)/", source) or re.search(
+        r"/(\^\[[^/]+\$)/\.test\(params\.claim_id\)", source)
     if match is None:
         raise AssertionError(f"no claim_id guard found in {EVIDENCE_RUN}")
     return re.compile(match.group(1))
@@ -889,11 +898,15 @@ def check_dry_run(project: Path, colosseum_hash: str) -> dict:
           and report.get("mode") == "dry-run",
           f"exit={result.returncode} {str(report)[:200]}")
     check("dry-run --json still writes nothing", not (project / ".fv").exists())
-    check("dry-run leaves .colosseum byte-identical",
-          tree_hash(project / ".colosseum") == colosseum_hash)
-    check("dry-run report names the resolved project root",
-          Path(report.get("project_root", "/nonexistent")).resolve() == project.resolve(),
+    check("dry-run report carries no absolute machine path",
+          report.get("project_root") == "."
+          and not any(str(entry.get("path", "")).startswith("/")
+                      for entry in report.get("writes", [])),
           report.get("project_root"))
+    check("the text report still names the resolved project root",
+          str(project) in plain.stdout, plain.stdout.splitlines()[:1])
+    check("dry-run report names the elected dispatch target",
+          report.get("target_spec") == "docs/intent.md", report.get("target_spec"))
 
     artifacts = report.get("artifacts", [])
     sources = [entry.get("source") for entry in artifacts]
@@ -1014,10 +1027,20 @@ def check_apply(project: Path, dry_report: dict, colosseum_hash: str,
     check("apply reports status ok in apply mode",
           report.get("status") == "ok" and report.get("mode") == "apply",
           f"{report.get('status')} {report.get('mode')}")
-    check("apply keeps .colosseum byte-identical",
-          tree_hash(project / ".colosseum") == colosseum_hash)
     check("dry-run predicted exactly the writes apply performed",
-          report.get("writes") == dry_report.get("writes"))
+          [(entry["path"], entry["sha256"]) for entry in report.get("writes", [])]
+          == [(entry["path"], entry["sha256"]) for entry in dry_report.get("writes", [])])
+    check("every planned create is reported as written after the apply",
+          {entry["action"] for entry in dry_report.get("writes", [])} == {"create"}
+          and {entry["action"] for entry in report.get("writes", [])} == {"written"},
+          sorted({str(entry.get("action")) for entry in report.get("writes", [])}))
+    check("the apply report distinguishes request from outcome",
+          report.get("requested_mode") == "apply" and report.get("applied") is True
+          and report.get("error") is None,
+          {key: report.get(key) for key in ("requested_mode", "applied", "error")})
+    check("no staging directory survives the apply",
+          not [path for path in (project / ".fv").rglob("*") if "staging" in path.name],
+          [path.name for path in (project / ".fv").rglob("*") if "staging" in path.name])
     for entry in report.get("writes", []):
         path = project / entry["path"]
         if not path.is_file():
@@ -1279,6 +1302,8 @@ def check_verified_inputs(project: Path) -> None:
           set(FV_DEFAULT_EXCLUSIONS) <= set(exclusions), exclusions)
     check("imported history is excluded too",
           HISTORY_EXCLUSION in exclusions, exclusions)
+    check("in-flight migration staging is excluded too",
+          STAGING_EXCLUSION in exclusions, exclusions)
     check("the legacy include list is not reused as exclusion semantics",
           not (set(LEGACY_INCLUDE_LIST) & set(exclusions)),
           sorted(set(LEGACY_INCLUDE_LIST) & set(exclusions)))
@@ -1295,6 +1320,41 @@ def check_verified_inputs(project: Path) -> None:
           not [path for path in paths
                if path.startswith(".colosseum/") or path.startswith(".fv/history/")],
           [path for path in paths if path.startswith((".colosseum/", ".fv/history/"))][:5])
+
+
+def check_killed_staging_residue(project: Path) -> None:
+    """Staging residue cannot move the snapshot evidence is bound to.
+
+    A hard-killed apply runs no cleanup, so its staging tree stays on disk
+    under `.fv/.migrate-staging/<run>/`. This project is a real git
+    repository with real verified inputs, which makes it the place the claim
+    is testable end to end rather than by reading an exclusion list: the
+    snapshot every evidence record binds to must be the same digit for digit
+    before the residue appears, while it sits there, and after it is removed.
+    The residue is synthesized here instead of produced by a kill, because
+    what is under test is the snapshot, not the kill -- R35 kills a real
+    apply and asserts the residue lands nowhere else.
+    """
+    before = fv_project.content_snapshot(project)
+    staging = project / STAGING_ROOT / "4242-abcdefgh"
+    (staging / "new").mkdir(parents=True)
+    (staging / "new" / "obligations.json").write_text('{"strand": "half-staged"}\n')
+    (staging / "saved").mkdir()
+    (staging / "saved" / "dispatch.json").write_text('{"strand": "replaced original"}\n')
+    during = fv_project.content_snapshot(project)
+    entries = [path for path, _ in fv_project.snapshot_entries(project)]
+    check("staging residue does not move the verified-input snapshot",
+          during == before, f"{before} -> {during}")
+    check("no staged or saved byte is a verified input",
+          not [path for path in entries if path.startswith(STAGING_ROOT)],
+          [path for path in entries if path.startswith(STAGING_ROOT)][:3])
+    check("git would otherwise have offered the residue as a candidate",
+          any(path.startswith(STAGING_ROOT) for path in fv_project.candidate_paths(project)),
+          [path for path in fv_project.candidate_paths(project)
+           if path.startswith(".fv/")][:3])
+    shutil.rmtree(project / STAGING_ROOT)
+    check("removing the residue by hand does not move it either",
+          fv_project.content_snapshot(project) == before)
 
 
 def check_history(project: Path, report: dict) -> None:
@@ -1467,6 +1527,133 @@ def check_move(root: Path, project: Path, colosseum_hash: str,
     check_gate_b(moved, "after move")
 
 
+def check_intent_election(root: Path, project: Path) -> None:
+    """The dispatch target comes from the stub, and ambiguity blocks.
+
+    The dossier ledger is long prose that names documents many times. If the
+    election counted mentions, a "Superseded:" paragraph could outvote the
+    entrypoint's own pointer and bind every migrated evidence record to a
+    document the project stopped maintaining.
+    """
+    superseded = root / "intent-superseded"
+    shutil.copytree(project, superseded, symlinks=True)
+    (superseded / "docs" / "old-intent.md").write_text("# superseded dossier intent\n")
+    ledger = superseded / ".colosseum" / "ledger.md"
+    ledger.write_text(
+        "## Superseded\n\nSee docs/old-intent.md, docs/old-intent.md and docs/old-intent.md.\n\n"
+        + ledger.read_text())
+    result, report = migrate_json(superseded)
+    check("the pointer stub outranks every ledger mention of another intent",
+          result.returncode == 0 and report.get("target_spec") == "docs/intent.md",
+          f"exit={result.returncode} {report.get('target_spec')}")
+
+    ambiguous = root / "intent-ambiguous"
+    shutil.copytree(project, ambiguous, symlinks=True)
+    (ambiguous / "docs" / "old-intent.md").write_text("# superseded dossier intent\n")
+    (ambiguous / ".colosseum" / "intent.md").write_text(
+        "# Intent: dossier\nThe canonical intent document is [`docs/intent.md`]"
+        "(../docs/intent.md), or `docs/old-intent.md` while the move finishes.\n")
+    legacy_hash = tree_hash(ambiguous / ".colosseum")
+    result, report = migrate_json(ambiguous, "--apply")
+    check("a stub citing two existing intents blocks instead of electing one",
+          result.returncode == 1 and report.get("status") == "blocked"
+          and report.get("target_spec") is None
+          and any("#intent" in str(entry) for entry in report.get("unsupported", [])),
+          f"exit={result.returncode} {report.get('unsupported')}")
+    check("the ambiguous run writes nothing and touches no legacy byte",
+          not (ambiguous / ".fv").exists()
+          and tree_hash(ambiguous / ".colosseum") == legacy_hash)
+
+
+def check_write_containment(root: Path, project: Path, colosseum_hash: str) -> None:
+    """A symlinked `.fv` component cannot carry a write out of the FV tree.
+
+    The digest assertions elsewhere in this suite only fire if a write can
+    reach `.colosseum` at all; this is the shape that made that reachable.
+    """
+    for label, link, target in (
+        ("fv-root", Path(".fv"), Path("..") / "escaped"),
+        ("history", Path(".fv") / "history", Path("..") / ".colosseum" / "imported"),
+    ):
+        copy = root / f"containment-{label}"
+        shutil.copytree(project, copy, symlinks=True)
+        (copy / "escaped").mkdir(exist_ok=True)
+        (copy / ".colosseum" / "imported").mkdir(exist_ok=True)
+        (copy / link).parent.mkdir(parents=True, exist_ok=True)
+        (copy / link).symlink_to(target)
+        legacy_hash = tree_hash(copy / ".colosseum")
+        result, report = migrate_json(copy, "--apply")
+        check(f"{label}: a symlinked .fv component blocks every write",
+              result.returncode == 1 and report.get("status") == "blocked"
+              and any("is a symlink" in str(entry) for entry in report.get("conflicts", [])),
+              f"exit={result.returncode} {report.get('conflicts', [])[:1]}")
+        check(f"{label}: nothing landed outside the FV tree",
+              tree_hash(copy / ".colosseum") == legacy_hash
+              and not list((copy / "escaped").rglob("*"))
+              and not list((copy / ".colosseum" / "imported").rglob("*")),
+              sorted(path.name for path in (copy / "escaped").rglob("*")))
+    check("the untouched project's legacy tree is still the one that was read",
+          tree_hash(project / ".colosseum") == colosseum_hash)
+
+
+def check_uncovered_required_evidence(root: Path, project: Path) -> None:
+    """A claim whose required evidence no migrated run can produce blocks.
+
+    Eight of the nine dossier claims name `quint`. Dropping its recorded run
+    leaves a manifest whose required evidence the migrated plan can never
+    produce -- the same defect as omitting a recorded layer, one artifact
+    upstream -- so it is unsupported rather than a status-ok migration.
+    """
+    copy = root / "uncovered-evidence"
+    shutil.copytree(project, copy, symlinks=True)
+    path = copy / ".colosseum" / "evidence" / "runs" / "layer-runs.json"
+    document = json.loads(path.read_text())
+    document["runs"] = [entry for entry in document["runs"] if entry["layer"] != "quint"]
+    path.write_text(json.dumps(document, indent=4) + "\n")
+    before = file_map(copy)
+    result, report = migrate_json(copy, "--apply")
+    rows = [entry for entry in report.get("unsupported", []) if "required_evidence" in str(entry)]
+    check("a claim requiring an unrecorded layer blocks the migration",
+          result.returncode == 1 and report.get("status") == "blocked" and rows,
+          f"exit={result.returncode} {report.get('unsupported', [])[:1]}")
+    check("every claim that names the missing layer is reported, none summarized",
+          len(rows) == len([claim for claim in CLAIMS if "quint" in claim["layers"]]),
+          f"{len(rows)} rows")
+    check("the blocked run writes nothing at all",
+          not (copy / ".fv").exists() and file_map(copy) == before)
+
+
+def check_dispatch_adoption(root: Path, project: Path) -> None:
+    """An existing dispatch keeps its route; only the two owned fields move."""
+    copy = root / "dispatch-adoption"
+    shutil.copytree(project, copy, symlinks=True)
+    (copy / ".fv").mkdir(parents=True, exist_ok=True)
+    (copy / ".fv" / "dispatch.json").write_text(json.dumps({
+        "omp_native": {"project_root": "/absolute/elsewhere",
+                       "target_spec": ".fv/intent.md",
+                       "profile": "canonical-4@sha256:deadbeef"},
+        "panel": {"roster": ["alpha", "beta"]},
+    }, indent=2) + "\n")
+    result, report = migrate_json(copy, "--apply")
+    route = json.loads((copy / ".fv" / "dispatch.json").read_text())
+    check("an existing dispatch is adopted rather than blocking the migration",
+          result.returncode == 0 and report.get("status") == "ok"
+          and any(entry["path"] == ".fv/dispatch.json" and entry["action"] == "written"
+                  and "adopted" in entry.get("detail", "")
+                  for entry in report.get("writes", [])),
+          f"exit={result.returncode} "
+          f"{[e for e in report.get('writes', []) if 'dispatch' in e['path']]}")
+    check("adoption rewrites only project_root and target_spec",
+          route["omp_native"]["target_spec"] == "docs/intent.md"
+          and route["omp_native"]["project_root"] == "."
+          and route["omp_native"]["profile"] == "canonical-4@sha256:deadbeef"
+          and route["panel"] == {"roster": ["alpha", "beta"]},
+          json.dumps(route, sort_keys=True))
+    resolved = resolver(copy, "target")
+    check("the adopted project resolves the migrated target",
+          resolved.get("target_spec") == "docs/intent.md", resolved)
+
+
 def main() -> int:
     for binary in ("git", "python3"):
         if shutil.which(binary) is None:
@@ -1487,6 +1674,10 @@ def main() -> int:
         dry_report = check_dry_run(project, colosseum_hash)
         check_blocked_before_writes(root, project)
         check_untranslatable_required_layer(root, project)
+        check_intent_election(root, project)
+        check_write_containment(root, project, colosseum_hash)
+        check_uncovered_required_evidence(root, project)
+        check_dispatch_adoption(root, project)
 
         print("\n── apply ────────────────────────────────────────────────")
         report = check_apply(project, dry_report, colosseum_hash, outside_before)
@@ -1495,6 +1686,7 @@ def main() -> int:
         check_manifest(project)
         check_plan(project, report, root / "probe-runs.log")
         check_verified_inputs(project)
+        check_killed_staging_residue(project)
         check_history(project, report)
         check_no_live_legacy_records(project)
 
