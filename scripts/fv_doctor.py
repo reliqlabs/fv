@@ -262,6 +262,55 @@ def configured_isolation(config_path: Path) -> bool:
         isinstance(isolation, dict)
         and isolation.get("mode") in ISOLATION_MODES
     )
+
+
+def check_canonical_target(report: Report, project: Path) -> None:
+    """Resolve the canonical target through the one shared implementation."""
+    try:
+        helper = load_module("fv_project", REPO / "scripts" / "fv_project.py")
+    except (OSError, RuntimeError, ImportError, SyntaxError) as error:
+        report.add("project", "target-spec", "fail", f"cannot load scripts/fv_project.py: {error}")
+        return
+    try:
+        route = helper.dispatch_route(project)
+    except (helper.ProjectError, OSError):
+        route = {}
+    try:
+        target = helper.resolve_target(project)
+    except (helper.ProjectError, OSError) as error:
+        report.add("project", "target-spec", "fail", str(error))
+    else:
+        report.add(
+            "project", "target-spec", "ok",
+            f"canonical target {helper.repo_relative(project, target)}",
+        )
+    declared_root = route.get("project_root")
+    declared_spec = route.get("target_spec")
+    drift = []
+    if declared_root is not None and declared_root != ".":
+        drift.append(f"project_root={declared_root!r} is not clone-portable")
+    if isinstance(declared_spec, str) and Path(declared_spec).is_absolute():
+        drift.append(f"target_spec={declared_spec!r} is absolute")
+    report.add(
+        "project", "portable-state", "warn" if drift else "ok",
+        "; ".join([*drift, 'rerun fv_init.py to store "." and a repo-relative target'])
+        if drift else "dispatch paths survive a clone or a move",
+    )
+    # The frozen defaults always apply, so the only real drift the doctor can
+    # report here is a project list it cannot parse.
+    try:
+        effective = helper.load_exclusions(project)
+    except (helper.ProjectError, OSError) as error:
+        report.add("project", "verified-inputs", "fail", str(error))
+    else:
+        seeded = (project / helper.VERIFIED_INPUTS_RELATIVE).is_file()
+        report.add(
+            "project", "verified-inputs", "ok",
+            f"{len(effective)} exclusion prefix(es)"
+            + ("" if seeded else f"; {helper.VERIFIED_INPUTS_RELATIVE} absent, defaults apply"),
+        )
+
+
 def check_project(report: Report, project: Path) -> None:
     state = project / ".fv"
     if not state.is_dir():
@@ -301,6 +350,7 @@ def check_project(report: Report, project: Path) -> None:
         "fail" if errors else "ok",
         "; ".join(errors) if errors else "omp_native block valid",
     )
+    check_canonical_target(report, project)
 
     config_path = project / ".omp" / "config.yml"
     try:
@@ -325,7 +375,7 @@ def check_project(report: Report, project: Path) -> None:
         "; ".join(panel_errors) if panel_errors else "OMP owns a structurally valid fv-canonical panel role",
     )
 
-    for name in ("check_evidence_records.py", "check_ledger_references.py"):
+    for name in ("check_evidence_records.py", "check_ledger_references.py", "fv_project.py"):
         installed = state / "scripts" / name
         canonical = REPO / "scripts" / name
         current = installed.is_file() and sha256(installed) == sha256(canonical)

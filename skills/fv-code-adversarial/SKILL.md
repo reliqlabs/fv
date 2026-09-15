@@ -53,7 +53,7 @@ Same-agent self-review is invalid unless the user explicitly accepts the drift c
 Ask the user for, or determine from context:
 
 - **Project root** — absolute path. Required.
-- **Intent document** — check `<project>/.fv/intent.md` first (canonical), then `<project>/intent.md`, then ask. Required.
+- **Intent document** — resolve the canonical target from `<project>/.fv/dispatch.json` → `omp_native.target_spec`; when the key is absent the target is `<project>/.fv/intent.md`. `target_spec` is persisted repo-relative to the project root, so resolve it against the project root, not the cwd; an absolute value is valid only when it resolves inside the project root. Never fall back to a fixed search order. `uv run --script $FV_ROOT/scripts/fv_project.py target --root <project>` prints the resolved path. Required.
 - **Integration ledger** — usually `<project>/.fv/ledger.md`. Required if the project has one (the ledger's trust-chain links feed lens 2 directly).
 - **Code roots under review** — typically inferrable: `crates/contract/src/`, `crates/runtime/`, etc. Confirm with the user. Out-of-scope code (UI layer with no trust-bearing computation, dev-only tooling, generated code) is named explicitly so the lenses don't drag it in.
 - **Prior audit reports** (if any) — `<project>/.fv/audit/*.md`. Required input to lens 6 (deferral-justification audit).

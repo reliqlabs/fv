@@ -40,7 +40,7 @@ Ask the user for, or determine from context:
 
 - **Project root** — absolute path.
 - **Quint spec root** — usually `<project>/specs/<name>.qnt`. Required.
-- **Intent document** — usually `<project>/.fv/intent.md`. Required.
+- **Intent document** — the canonical target declared by `<project>/.fv/dispatch.json` under `omp_native.target_spec`, or `<project>/.fv/intent.md` when that key (or the file) is absent. Resolve a declared `target_spec` against the project root, since it is persisted repo-relative; an absolute value counts only when it resolves inside the project root. No fixed search order over candidate filenames. Required: stop if the resolved target is missing or empty.
 - **The triggering commit / change record** — the commit or change-record path that introduced the multi-tx admin feature. Required input.
 - **Code root for the new feature** — typically `<project>/crates/contract/src/`. Used to confirm the transition signatures the Quint model must mirror.
 

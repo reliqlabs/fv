@@ -60,7 +60,8 @@ The verbs you actually run. Each is a SKILL the harness can invoke.
 
 Canonical locations within a FV-managed project. Skills cite these; do not invent alternatives per skill.
 
-- `<project>/.fv/intent.md` — the intent document (canonical). `<project>/intent.md` at the root is the recognized alternative for projects that want the intent visible at top level; a skill that needs the intent checks `.fv/intent.md` first, then `intent.md`, then asks.
+- `<project>/.fv/dispatch.json` → `omp_native.target_spec` — **the canonical intent/target declaration**. Its value is the intent document, persisted repo-relative to the project root; when the key is absent the target is `<project>/.fv/intent.md`. A skill that needs the intent resolves the declaration against the project root (never the cwd, never a fixed search order); an absolute value is valid only when it resolves inside the project root, and a missing, directory, symlink, or escaping target is an error, not a cue to look elsewhere. A project that wants the intent visible at top level declares `target_spec: "intent.md"` rather than relying on a fallback. `scripts/fv_project.py` (`resolve_target`, or `fv_project.py target --root <project>`) is the one implementation of these rules; installs also carry it at `<project>/.fv/scripts/fv_project.py`.
+- `<project>/.fv/intent.md` — the default location of the intent document, used when `dispatch.json` declares no `target_spec`
 - `<project>/.fv/ledger.md` — the trust ledger
 - `<project>/.fv/attacks/` — spec adversarial reports, verbatim (`fv-adversarial`)
 - `<project>/.fv/code-adversarial/` — code adversarial review reports (`fv-code-adversarial`)

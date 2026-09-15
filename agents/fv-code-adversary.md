@@ -21,10 +21,18 @@ project files. Report your own identity as `fv-code-adversary via OMP
 task`. If the declared author is that identity, return `STATUS: BLOCKED`; this
 is author self-review.
 
-Read the intent at `<PROJECT_ROOT>/.fv/intent.md` before reviewing code.
-Read `<PROJECT_ROOT>/.fv/ledger.md` when it exists. If the intent is
-missing or empty, return `STATUS: BLOCKED`; code review without an intent has
-no grounded target.
+Resolve the intent before reviewing code: read
+`<PROJECT_ROOT>/.fv/dispatch.json` and use `omp_native.target_spec` as the
+canonical target. When that key or that file is absent, the canonical target is
+`<PROJECT_ROOT>/.fv/intent.md`. `target_spec` is persisted repo-relative, so
+join it onto `PROJECT_ROOT` rather than the working directory; accept an
+absolute value only when it resolves inside `PROJECT_ROOT`. Do not fall back to
+a fixed search order over candidate filenames.
+
+Read `<PROJECT_ROOT>/.fv/ledger.md` when it exists. If the resolved target is
+missing, empty, a directory, or outside `PROJECT_ROOT`, return
+`STATUS: BLOCKED` and name the path you resolved; code review without an intent
+has no grounded target.
 
 ## Scope and evidence discipline
 

@@ -10,9 +10,11 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fv_project  # noqa: E402  sibling module, copied beside this gate in project installs
 
 EVIDENCE_CLASSES = {
     "code-enforced",
@@ -166,8 +168,14 @@ def validate_record(
         )
         if not matched:
             qualifier = "exactly " if snapshot_exact else ""
+            hint = ""
+            if fv_project.is_content_snapshot(expect_snapshot) and not fv_project.is_content_snapshot(snapshot):
+                hint = (
+                    f" (record schema {bindings.get('parser_schema_version')!r} predates verified-input"
+                    " snapshots; pass --expect-snapshot or --allow-unbound to validate it)"
+                )
             defects.append(
-                f"stale record: bound to snapshot {snapshot!r}, expected {qualifier}{expect_snapshot!r}"
+                f"stale record: bound to snapshot {snapshot!r}, expected {qualifier}{expect_snapshot!r}{hint}"
             )
     if expect_intent and bindings.get("intent_hash") != expect_intent:
         defects.append(
@@ -224,21 +232,16 @@ def load_manifest(path: Path) -> tuple[list[str], dict[str, str]]:
                 kinds[claim_id] = kind
     return required, kinds
 
+
 def current_source_snapshot(repo_root: Path) -> str:
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True, check=False
-    )
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=repo_root, capture_output=True, text=True, check=False,
-    )
-    if revision.returncode != 0 or not revision.stdout.strip() or status.returncode != 0:
-        raise ValueError("cannot derive current Git source snapshot")
-    source_changes = [line for line in status.stdout.splitlines()
-                      if line[3:] != ".fv" and not line[3:].startswith(".fv/")]
-    if source_changes:
-        raise ValueError("current source tree is dirty; refusing freshness verification")
-    return revision.stdout.strip()
+    """Recompute the verified-input content snapshot records must be bound to."""
+    return fv_project.content_snapshot(repo_root)
+
+
+def current_intent_binding(repo_root: Path) -> tuple[str, str]:
+    """Canonical target's repo-relative path and content hash."""
+    target = fv_project.resolve_target(repo_root)
+    return fv_project.repo_relative(repo_root, target), fv_project.target_hash(repo_root)
 
 
 def main() -> int:
@@ -286,15 +289,14 @@ def main() -> int:
 
     required = sorted(dict.fromkeys(required))
     repo_root = args.root.resolve() if args.root else infer_repo_root(args.records)
+    intent_path: str | None = None
     if not args.allow_unbound:
         try:
             if args.expect_snapshot is None:
                 args.expect_snapshot = current_source_snapshot(repo_root)
                 args.snapshot_exact = True
             if args.expect_intent is None:
-                args.expect_intent = hashlib.sha256(
-                    (repo_root / ".fv" / "intent.md").read_bytes()
-                ).hexdigest()
+                intent_path, args.expect_intent = current_intent_binding(repo_root)
         except (OSError, ValueError) as error:
             print(f"ERROR: cannot bind evidence to current source and intent: {error}")
             print("\nVERDICT: ERROR")
@@ -374,6 +376,8 @@ def main() -> int:
         "gate": "semantic-evidence",
         "records": str(args.records),
         "repo_root": str(repo_root),
+        "expected_snapshot": args.expect_snapshot,
+        "intent_path": intent_path,
         "required_claims": required,
         "per_claim": per_claim,
         "failed": failed,

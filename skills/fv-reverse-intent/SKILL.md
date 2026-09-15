@@ -48,9 +48,11 @@ Ask the user for, or determine from context:
 - **Target scope** — which module, crate, or service is this intent for? Reverse-intent should be narrow; if the answer is "the whole monorepo," push back and pick a single coherent surface (one crate, one bounded subsystem).
 - **Code root** — absolute path to the directory you should read.
 - **Auxiliary docs** — paths to relevant CLAUDE.md, AGENTS.md, README, ARCHITECTURE.md, ADRs. Default: walk the code root and pick up anything matching those names.
-- **Output location** — default `<code_root>/.fv/intent.md` (canonical per CONCEPTS.md "Project layout"); `<code_root>/intent.md` is the recognized alternative. Confirm before overwriting.
+- **Output location** — the canonical target declared by `<project>/.fv/dispatch.json` under `omp_native.target_spec`, where `<project>` is the FV project root containing the code root. When that key (or that file) is absent, the canonical target is `<project>/.fv/intent.md`. `target_spec` is persisted repo-relative to the project root: resolve it against the project root, not the current working directory, and accept an absolute value only when it resolves inside the project root. Do not apply a fixed search order over candidate filenames. Confirm before overwriting; if the user picks a different path, tell them the project's `target_spec` must be updated to that repo-relative path or downstream stages keep reading the old target.
 
-If a `intent.md` already exists, ask whether this is a refresh (read existing, fold in changes) or a starting-fresh authoring (rename or back up the existing file first). Do not silently overwrite a prior intent doc.
+If a document already exists at the resolved target, ask whether this is a refresh (read existing, fold in changes) or a starting-fresh authoring (rename or back up the existing file first). Do not silently overwrite a prior intent doc.
+
+The same rule is implemented once in `$FV_ROOT/scripts/fv_project.py` as `resolve_target(project_root)` (copied into `<project>/.fv/scripts/` by the initializer). It raises on a missing, directory, or escaping target, so use it after saving to confirm downstream stages resolve the document you just wrote; do not reimplement the resolution.
 
 ## Step 2: Extraction pass
 
@@ -106,11 +108,11 @@ These become work items for the team's review, separate from the methodology. Do
 
 Before saving, sweep the Non-Goals section: no entry may remain tagged `PROVISIONAL:` in the committed document. Every one must be either confirmed (tag removed, now a committed Non-Goal) or converted to a `TBD:` marker in Open Questions if the user could not decide. Do not save a document with an unresolved `PROVISIONAL:` non-goal silently standing in as a committed claim.
 
-Write the document to the chosen path. Confirm the save succeeded by reading the file back.
+Write the document to the resolved target path. Confirm the save succeeded by reading the file back.
 
 Then summarize for the user:
 
-- Absolute path to the saved file
+- Path to the saved file relative to the project root, and whether it matches the project's `target_spec` (flag the mismatch explicitly when it does not)
 - **Tensions surfaced** — count of `TENSION:` blocks, with one-line summary of each. These are the most valuable output of this skill.
 - **TBDs recorded** — count of open questions
 - **Sections that came clean** — sections where the code and the (claimed) intent agreed, with no tensions

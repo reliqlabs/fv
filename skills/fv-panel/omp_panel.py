@@ -7,6 +7,13 @@ The canonical provider of ``secure`` is the fv-adversarial skill's
 ``omp_fanout`` module; this engine never reimplements the secret scanner or the
 session-root gate, so there is exactly one copy of that logic per install.
 
+The canonical intent/target artifact is likewise resolved by exactly one
+module: ``scripts/fv_project.py`` (``resolve_target``), located via
+``$FV_ROOT/scripts`` or the project's ``.fv/scripts`` copy. This engine never
+assumes ``.fv/intent.md``; the project's ``.fv/dispatch.json``
+``omp_native.target_spec`` decides, and that default only applies when the key
+is absent.
+
 The module performs no model calls when imported. It runs three barriered waves:
 
   Wave 1  drafts     — every seat works the frozen brief independently, blind to
@@ -27,16 +34,20 @@ its structured output — panel agreement never manufactures verification eviden
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import os
 import random
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 import re
 
@@ -48,6 +59,9 @@ _RESERVED_SUMMARY = {
     "lineup_hash",
 }
 _VALID_MODES = ("project-plan", "milestone-review")
+_OBLIGATIONS_REL = ".fv/obligations.json"
+_RESOLVER_MODULE = "fv_project"
+_resolver_cache: dict[str, ModuleType] = {}
 
 
 def _iso_now() -> str:
@@ -78,7 +92,92 @@ def _require_secure(secure: Any) -> None:
                 "fv-adversarial omp_fanout module (never a stub)")
 
 
-def _target_snapshot(project: Path, exclude_rel: str | None) -> dict[str, Any]:
+def load_target_resolver(project: str | Path) -> ModuleType:
+    """Import the canonical target resolver ``scripts/fv_project.py``.
+
+    This engine never reimplements target resolution: the precedence rules
+    (``.fv/dispatch.json`` ``omp_native.target_spec``, default
+    ``.fv/intent.md``, relative-under-root, absolute-only-inside-root,
+    reject missing/directory/symlink/escaping) live in exactly one module.
+    The skill loads this file with ``exec(read("skill://..."))``, where there
+    is no ``__file__`` to walk from; the resolver is located via an already
+    imported ``fv_project``, then ``$FV_ROOT/scripts``, then this file's own
+    install (``<fv repo>/scripts``, when imported normally), then the
+    project's scaffolded ``.fv/scripts`` copy.
+    """
+    module = sys.modules.get(_RESOLVER_MODULE)
+    if module is not None and hasattr(module, "resolve_target"):
+        return module
+    searched: list[str] = []
+    fv_root = os.environ.get("FV_ROOT")
+    candidates = [Path(fv_root) / "scripts"] if fv_root else []
+    here = globals().get("__file__")
+    if here:  # skills/fv-panel/omp_panel.py -> <fv repo>/scripts
+        candidates.append(Path(here).resolve().parents[2] / "scripts")
+    candidates.append(Path(project) / ".fv" / "scripts")
+    for directory in candidates:
+        source = directory / f"{_RESOLVER_MODULE}.py"
+        searched.append(str(source))
+        if not source.is_file():
+            continue
+        key = str(source.resolve())
+        cached = _resolver_cache.get(key)
+        if cached is not None:
+            return cached
+        spec = importlib.util.spec_from_file_location(_RESOLVER_MODULE, source)
+        if spec is None or spec.loader is None:
+            continue
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+        _resolver_cache[key] = loaded
+        return loaded
+    try:
+        import fv_project  # type: ignore[import-not-found]  # noqa: PLC0415
+    except ImportError:
+        raise RuntimeError(
+            "cannot locate the canonical target resolver "
+            f"({_RESOLVER_MODULE}.py); export FV_ROOT=<fv repo>, scaffold the "
+            "project so .fv/scripts holds it, or pass an explicit intent_path. "
+            f"Searched: {searched}") from None
+    return fv_project
+
+
+def resolve_intent_path(project: str | Path,
+                        intent_path: str | Path | None = None) -> Path:
+    """Resolve the project's canonical intent/target artifact to a real file.
+
+    Delegates to ``fv_project.resolve_target``: the canonical target is
+    ``.fv/dispatch.json`` → ``omp_native.target_spec`` and only defaults to
+    ``.fv/intent.md`` when that key is absent. Callers that need the Gate B
+    ``intent_hash`` pass the result to ``panel_contract.intent_binding`` so the
+    panel and the evidence records bind the same bytes.
+    """
+    resolver = load_target_resolver(project)
+    return resolver.resolve_target(Path(project).resolve(), intent_path)
+
+
+def _intent_binding(project: Path, intent_path: str | Path | None,
+                    *, required: bool) -> dict[str, Any]:
+    """Resolve the canonical intent for drift binding.
+
+    ``required`` (milestone-review) makes an unresolvable target fatal — a
+    verdict may not be bound to an intent nobody could read. A project-plan
+    run predates its intent often enough that an unresolvable target only
+    records the reason and drops the intent hash; it never falls back to
+    hashing a fixed path.
+    """
+    try:
+        resolved = resolve_intent_path(project, intent_path)
+    except Exception as exc:
+        if required:
+            raise
+        return {"path": None, "resolved": None, "error": f"{type(exc).__name__}: {exc}"}
+    return {"path": resolved.relative_to(project).as_posix(),
+            "resolved": resolved, "error": None}
+
+
+def _target_snapshot(project: Path, exclude_rel: str | None,
+                     intent_rel: str | None = None) -> dict[str, Any]:
     """Content snapshot of the target SOURCE tree for drift detection.
 
     Hashes ``git diff HEAD`` (all tracked staged+unstaged changes vs HEAD) plus
@@ -94,8 +193,12 @@ def _target_snapshot(project: Path, exclude_rel: str | None) -> dict[str, Any]:
     an error); drift is only enforced when a snapshot is actually known.
     """
     def _canonical_state_hashes() -> dict[str, str | None]:
+        """Hash the canonical state files the panel binds to: the resolved
+        intent target (``intent_rel``, never a fixed path — it is whatever
+        ``.fv/dispatch.json`` declares) and the obligations manifest."""
         hashes: dict[str, str | None] = {}
-        for relative in (".fv/intent.md", ".fv/obligations.json"):
+        relatives = [rel for rel in (intent_rel, _OBLIGATIONS_REL) if rel]
+        for relative in dict.fromkeys(relatives):
             candidate = project / relative
             hashes[relative] = (
                 "sha256:" + hashlib.sha256(candidate.read_bytes()).hexdigest()
@@ -251,6 +354,7 @@ def run_panel(
     synthesizer_seat: Mapping[str, Any],
     project_root: str | Path,
     brief_path: str | Path,
+    intent_path: str | Path | None = None,
     run_dir: str | Path,
     draft_prompt_builder: Callable[[Mapping[str, Any]], str],
     review_prompt_builder: Callable[[Mapping[str, Any], str, Sequence[Mapping[str, Any]]], str],
@@ -282,6 +386,14 @@ def run_panel(
     ``PI_SESSION_FILE`` header cwd) is rooted at ``project_root``. Isolation is
     stamped ``unverified``: a matching root is a precondition, not a mechanical
     guarantee the subagent filesystem is confined.
+
+    ``intent_path`` names the canonical intent/target artifact whose bytes the
+    run binds for drift detection. Omitted, it is resolved through
+    ``fv_project.resolve_target`` (``.fv/dispatch.json`` →
+    ``omp_native.target_spec``, defaulting to ``.fv/intent.md`` only when that
+    key is absent) — the engine never assumes a fixed intent location. A
+    milestone-review run refuses to start when the target cannot be resolved;
+    a project-plan run records the reason and binds no intent hash.
     """
     _require_secure(secure)
     if mode not in _VALID_MODES:
@@ -363,6 +475,11 @@ def run_panel(
     if not brief.is_relative_to(project) or not brief.is_file():
         raise ValueError(f"brief_path must be a file inside project_root: {brief}")
 
+    # Resolved before the run directory exists: a milestone-review bound to an
+    # unresolvable canonical target must fail without leaving a half-run behind.
+    intent = _intent_binding(project, intent_path, required=(mode == "milestone-review"))
+    intent_rel = intent["path"]
+
     panels_root = (project / ".fv" / "panels").resolve()
     destination = Path(run_dir)
     if not destination.is_absolute():
@@ -373,7 +490,7 @@ def run_panel(
     destination.mkdir(parents=True, exist_ok=False)
 
     exclude_rel = destination.relative_to(project).as_posix()
-    target_before = _target_snapshot(project, exclude_rel)
+    target_before = _target_snapshot(project, exclude_rel, intent_rel)
     violations = _sec(secure, "preflight_scan")(project)
     staging = Path(tempfile.mkdtemp(prefix="fv-panel-"))
     persisted_staging: set[str] = set()
@@ -384,6 +501,8 @@ def run_panel(
         "project_root": str(project),
         "brief_path": str(brief.relative_to(project)),
         "brief_sha256": brief_hash,
+        "intent_path": intent_rel,
+        "intent_resolution_error": intent["error"],
         "target_revision": target_before,
         "violations": violations,
         "staging_dir": "withheld until panel completion",
@@ -629,7 +748,7 @@ def run_panel(
         except OSError:
             brief_after = None
         brief_stable = brief_after == brief_hash
-        target_after = _target_snapshot(project, exclude_rel)
+        target_after = _target_snapshot(project, exclude_rel, intent_rel)
         if not target_before["available"]:
             revision_stable = True  # revision unknown -> cannot enforce drift
         else:
@@ -680,6 +799,7 @@ def run_panel(
             "brief_sha256": brief_hash,
             "brief_sha256_after": brief_after,
             "brief_stable": brief_stable,
+            "intent_path": intent_rel,
             "target_revision_before": target_before,
             "target_revision_after": target_after,
             "revision_stable": revision_stable,

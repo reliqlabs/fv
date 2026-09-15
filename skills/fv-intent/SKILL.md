@@ -40,7 +40,11 @@ You work conversationally with the user. Walk them through the document one sect
 
 ## Step 1: Locate the document
 
-Ask the user where the intent document should live. Default to `<project>/.fv/intent.md` (the canonical location per CONCEPTS.md "Project layout"); `<project>/intent.md` at the root is the recognized alternative if they want it visible at top level. Create the `.fv/` directory if it doesn't exist.
+The canonical target is whatever `<project>/.fv/dispatch.json` declares under `omp_native.target_spec`. Read that file first. When the key (or the file) is absent, the canonical target is `<project>/.fv/intent.md`. A declared `target_spec` is persisted repo-relative to the project root, so resolve it against the project root, never against the current working directory; an absolute value is valid only when it resolves inside the project root. Do not apply a fixed search order over candidate filenames.
+
+You are creating the target, so it normally does not exist yet: take the declared path straight from `dispatch.json` without demanding that the file be there. The consumer-side helper `resolve_target(project_root)` in `$FV_ROOT/scripts/fv_project.py` (also copied into `<project>/.fv/scripts/`) applies the same rule but raises on a missing, directory, or escaping target; use it after the document is saved to confirm downstream stages will find it.
+
+Offer the resolved canonical target as the destination and confirm it with the user. If they want the intent somewhere else, write it there and tell them the project's `target_spec` must name that path relative to the project root, or every downstream skill, agent, and gate keeps reading the old target. Create the parent directory if it doesn't exist.
 
 Confirm the path is writable and the file does not silently overwrite existing content. If a file exists at that path, ask whether to revise it or create a new one alongside.
 
@@ -116,11 +120,11 @@ Before handing the document off, verify all of the following. Any unchecked item
 
 ## Output
 
-The deliverable is a single Markdown file at the user's chosen path, following the structure in `template.md`. The document should be self-contained — a downstream spec writer should not need to ask the user anything not present in the document.
+The deliverable is a single Markdown file at the resolved canonical target (or the path the user chose instead), following the structure in `template.md`. The document should be self-contained — a downstream spec writer should not need to ask the user anything not present in the document.
 
 End the session with:
 
-- The absolute path of the saved file
+- The saved file's path relative to the project root, and whether it matches the project's `target_spec`
 - The frontmatter `version` and `status` the document was saved with
 - A short summary of the sections produced and any `TBD:` markers that remain
 - A suggested next FV step. Dispatch `fv-quint-spec-generator` with `isolated=True, apply=False`. Inspect its returned patch and apply it only after `$FV_ROOT/scripts/obligation_check.py` accepts every frozen obligation; rejection leaves the parent tree untouched.

@@ -14,7 +14,11 @@ check replaced by a trivial stub); Rust `#[...]` attribute lines are
 valid citation targets; every `axiom:` occurrence needs a meaningful
 justification (placeholders fail, one check per occurrence); per-link
 Kani coverage gates under --strict-kani; --suggest-hashes emits binding
-suffixes.
+suffixes. Citation parsing accepts every dossier form — backticked path,
+fully backticked `code: path:line@sha256:hash`, plain `code:`
+annotation, `**Depends on:**` block headers — keeps containment and
+content-hash checks on each, refuses prose and inline code as citations,
+and fails malformed `code:` annotations loudly.
 
 Gate B (semantic evidence, check_evidence_records.py):
 R27: a G1 record missing any binding field (or the waiver key) is
@@ -154,6 +158,84 @@ def main() -> int:
         code, out = gate_a(root, linked, "--strict-kani")
         check("R21: link without kani fails under --strict-kani",
               code == 1 and "trust-chain link without" in out)
+
+        # ── dossier-shaped citation forms (explicit parser) ─────────────
+        # A real fv-compose Step 3 dependency entry: bold block header,
+        # `at` citations, one fully backticked `code:` annotation, one
+        # plain one. The legacy alternation read the backticked annotation
+        # as a path named "code: src/guard.rs" and never saw the bold
+        # header, so neither the link nor its citation was checked.
+        dossier = (
+            "## Cross-component link — attestation binds the handle\n"
+            "\n"
+            "Theorem: cross_component_attestation_bind\n"
+            f"Located at: `src/guard.rs:1@sha256:{h1}`\n"
+            "**Depends on:**\n"
+            f"  - inv_attest at `src/guard.rs:2@sha256:{h}` [Verus / proven]  "
+            f"`code: src/guard.rs:2@sha256:{h}`  kani: harness_check\n"
+            f"  - harness_check at `src/guard.rs:5@sha256:{h5}` [verified]  "
+            f"code: src/guard.rs:5@sha256:{h5}.  kani: harness_check\n"
+            f"**Trust boundary:** {GOOD_AXIOM}\n"
+        )
+        code, out = gate_a(root, dossier, "--strict-kani")
+        check("parser: dossier entry with every citation form passes",
+              code == 0 and "Citations checked: 5 (5 content-bound)" in out,
+              out[-400:])
+        check("parser: bold **Depends on:** header opens the link block",
+              "Trust-chain links: 2" in out, out[-200:])
+
+        bold_missing = ("**Depends on:**\n"
+                        f"  - inv_attest at `src/guard.rs:2@sha256:{h}` [proven]  "
+                        f"code: src/guard.rs:2@sha256:{h}\n"
+                        f"\n- {GOOD_AXIOM} {KANI_OK}\n")
+        code, out = gate_a(root, bold_missing)
+        check("parser: bold-header link without kani warns by default",
+              code == 0 and "trust-chain link without" in out, out[-300:])
+        code, out = gate_a(root, bold_missing, "--strict-kani")
+        check("parser: bold-header link without kani fails under --strict-kani",
+              code == 1 and "trust-chain link without" in out)
+
+        # Containment and hash checks apply to the backticked `code:` form
+        # exactly as they do to a bare backticked path.
+        code, out = gate_a(root, f"- L1 `code: ../outside.rs:1@sha256:{h}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: backticked `code:` citation is containment-checked",
+              code == 1 and "escapes the canonical root" in out, out[-300:])
+        code, out = gate_a(root, f"- L1 `code: src/guard.rs:2@sha256:{h5}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: backticked `code:` citation is hash-checked",
+              code == 1 and "content hash mismatch" in out, out[-300:])
+        code, out = gate_a(root, f"- L1 `code: src/guard.rs:2`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n", "--suggest-hashes")
+        check("parser: unhashed backticked `code:` citation demands a binding",
+              code == 1 and "missing required content hash" in out
+              and f"src/guard.rs:2@sha256:{h}" in out, out[-300:])
+
+        # Malformed annotations fail loudly; they are never skipped checks.
+        code, out = gate_a(root, f"- L1 `code: src/guard.rs:2@sha256:{h[:6]}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: truncated hash in a `code:` annotation is unparseable",
+              code == 1 and "unparseable" in out, out[-300:])
+        code, out = gate_a(root, f"- L1 code: src/my guard.rs:2@sha256:{h}. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: unquoted space path in a plain `code:` annotation fails",
+              code == 1 and "unparseable" in out, out[-300:])
+        code, out = gate_a(root, f"- L1 at `src/guard.rs:2@sha256:{h[:6]}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: truncated hash in a backticked path citation fails",
+              code == 1 and "malformed content binding" in out, out[-300:])
+
+        # Prose and ordinary inline code are not citations: this paragraph
+        # carries exactly one, and the ratio, symbol names, script name and
+        # `Code side:` prose must not inflate the count.
+        prose = (f"- B1 holds at a `5:1` win ratio; `inv_b1` in `specs/jobq.qnt` is\n"
+                 f"  checked by `check_evidence_records.py`. Code side: the guard at\n"
+                 f"  `src/guard.rs:2@sha256:{h}` rejects zero. {KANI_OK}\n"
+                 f"- {GOOD_AXIOM}\n")
+        code, out = gate_a(root, prose)
+        check("parser: prose, ratios and inline code are not citations",
+              code == 0 and "Citations checked: 1 (1 content-bound)" in out,
+              out[-400:])
 
         # ── --suggest-hashes ────────────────────────────────────────────
         code, out = gate_a(root, f"- B1 at `src/guard.rs:2`. {KANI_OK}\n"

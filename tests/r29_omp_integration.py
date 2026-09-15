@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -128,12 +129,55 @@ def main() -> int:
         dispatch = json.loads((project / ".fv" / "dispatch.json").read_text())
         check("dispatch top level is omp_native only", set(dispatch) == {"omp_native"})
         route = dispatch["omp_native"]
-        check("dispatch project root filled", route["project_root"] == str(project.resolve()))
-        check("dispatch target spec filled", route["target_spec"] == str(target.resolve()))
+        check("dispatch project root is portable", route["project_root"] == ".")
+        check("dispatch target spec is repo-relative", route["target_spec"] == "intent.md")
         check("no project agent copies", not (project / ".omp" / "agents").exists())
         check("no project skill copies", not (project / ".omp" / "skills").exists())
         check("no project tool copies", not (project / ".omp" / "tools").exists())
         check("no project MCP copy", not (project / ".omp" / "mcp.json").exists())
+
+        verified_inputs = project / ".fv" / "verified-inputs.txt"
+        frozen = (".fv/evidence/", ".fv/verify/", ".fv/panels/", ".colosseum/")
+        seeded = verified_inputs.read_text()
+        check("initializer seeds frozen verified-input exclusions",
+              all(f"{prefix}\n" in seeded for prefix in frozen), seeded)
+        verified_inputs.write_text(seeded + "build/\n")
+        kept = subprocess.run(command, capture_output=True, text=True)
+        check("initializer preserves project verified-input entries",
+              kept.returncode == 0 and "build/\n" in verified_inputs.read_text(),
+              verified_inputs.read_text())
+        verified_inputs.write_text("build/\n")
+        restored = subprocess.run(command, capture_output=True, text=True)
+        restored_text = verified_inputs.read_text()
+        check("initializer restores frozen exclusions dropped from the list",
+              restored.returncode == 0 and "build/\n" in restored_text
+              and all(f"{prefix}\n" in restored_text for prefix in frozen),
+              restored_text)
+
+        # Older scaffolds stored absolute inside-project paths. A rerun without
+        # --target-spec must migrate them instead of resetting the declaration.
+        default_command = command[:5]
+        legacy_route = dict(route)
+        legacy_route["project_root"] = str(project.resolve())
+        legacy_route["target_spec"] = str(target.resolve())
+        (project / ".fv" / "dispatch.json").write_text(
+            json.dumps({"omp_native": legacy_route}, indent=2) + "\n")
+        migrated_run = subprocess.run(default_command, capture_output=True, text=True)
+        migrated = json.loads((project / ".fv" / "dispatch.json").read_text())["omp_native"]
+        check("initializer migrates legacy inside-project absolute paths",
+              migrated_run.returncode == 0 and migrated["project_root"] == "."
+              and migrated["target_spec"] == "intent.md",
+              migrated_run.stdout + json.dumps(migrated))
+        outside_target = Path(temporary) / "outside-intent.md"
+        outside_target.write_text("# Intent\n")
+        escaping = subprocess.run(
+            [*default_command, "--target-spec", str(outside_target)],
+            capture_output=True, text=True)
+        check("initializer rejects a target outside the project",
+              escaping.returncode == 1
+              and json.loads((project / ".fv" / "dispatch.json").read_text())
+                  ["omp_native"]["target_spec"] == "intent.md",
+              escaping.stdout + escaping.stderr)
 
         registry = json.loads((REPO / "registry" / "voices.json").read_text())
         canonical = next(profile for profile in registry["profiles"] if profile["name"] == "canonical-4")
@@ -159,7 +203,8 @@ def main() -> int:
             "futureCapability": True,
         }
 
-        def write_omp_stub(path: Path, payload: object, version: str = "omp/99.0.0") -> Path:
+        def write_omp_stub(path: Path, payload: object, version: str = "omp/99.0.0",
+                           cwd: Path | None = None) -> Path:
             path.write_text("\n".join([
                 "#!/usr/bin/env python3",
                 "import os, sys",
@@ -167,7 +212,7 @@ def main() -> int:
                 f"contract = {json.dumps(payload)!r}",
                 f"catalog = {json.dumps(catalog)!r}",
                 f"panel = {json.dumps(panel_seed)!r}",
-                f"expected_cwd = {str(project.resolve())!r}",
+                f"expected_cwd = {str((cwd or project).resolve())!r}",
                 "catalog_out = catalog if os.getcwd() == expected_cwd else '{\"models\": []}'",
                 "print(version if '--version' in sys.argv else "
                 "contract if '--agent-bridge-contract' in sys.argv else "
@@ -197,6 +242,15 @@ def main() -> int:
               any(item["name"] == "omp-model-contract" and item["status"] == "ok"
                       and "member-3->fireworks/glm-5.2" in item["detail"]
                       for item in checked_report["findings"]), checked.stdout)
+        check("doctor resolves the canonical target through the shared helper",
+              any(item["name"] == "target-spec" and item["status"] == "ok"
+                  and item["detail"].endswith("intent.md")
+                  for item in checked_report["findings"])
+              and any(item["name"] == "portable-state" and item["status"] == "ok"
+                      for item in checked_report["findings"]), checked.stdout)
+        check("doctor requires the project copy of the resolver",
+              any(item["name"] == "fv_project.py" and item["status"] == "ok"
+                  for item in checked_report["findings"]), checked.stdout)
 
         missing_capability = dict(contract)
         missing_capability.pop("perCallTimeout")
@@ -283,6 +337,36 @@ def main() -> int:
         check("initializer accepts a structurally valid customized OMP panel role",
               customized_run.returncode == 0 and config_path.read_text() == customized,
               customized_run.stdout + customized_run.stderr)
+
+        # Clone portability: relocated state must resolve without a rewrite,
+        # and a rerun at the new path must leave OMP's own config alone.
+        moved = Path(temporary) / "moved-project"
+        dispatch_before = (project / ".fv" / "dispatch.json").read_text()
+        shutil.move(str(project), str(moved))
+        moved_init = subprocess.run(
+            ["uv", "run", "--script", str(REPO / "scripts" / "fv_init.py"), str(moved)],
+            capture_output=True, text=True)
+        check("initializer rerun after a move keeps dispatch byte-identical",
+              moved_init.returncode == 0
+              and (moved / ".fv" / "dispatch.json").read_text() == dispatch_before,
+              moved_init.stdout + moved_init.stderr)
+        check("moved project preserves the customized OMP panel config",
+              (moved / ".omp" / "config.yml").read_text() == customized,
+              (moved / ".omp" / "config.yml").read_text())
+        moved_stub = write_omp_stub(Path(temporary) / "omp-moved", contract, cwd=moved)
+        moved_doctor = subprocess.run(
+            ["uv", "run", "--script", str(doctor), "--project", str(moved),
+             "--omp", str(moved_stub), "--json"],
+            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True)
+        moved_report = json.loads(moved_doctor.stdout)
+        check("doctor passes against the relocated project",
+              moved_doctor.returncode == 0 and moved_report["status"] == "PASS",
+              moved_doctor.stdout + moved_doctor.stderr)
+        check("relocated project resolves its canonical target",
+              any(item["name"] == "target-spec" and item["status"] == "ok"
+                  and item["detail"].endswith("intent.md")
+                  for item in moved_report["findings"]), moved_doctor.stdout)
+        shutil.move(str(moved), str(project))
         config_path.write_text(config_path.read_text().replace("mode: rcopy", "mode: bogus"))
         invalid_mode = subprocess.run(command, capture_output=True, text=True)
         check("initializer rejects an invalid isolation backend",

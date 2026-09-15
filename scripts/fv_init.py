@@ -9,11 +9,24 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
+
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
-PROJECT_SCRIPT_NAMES = ("check_ledger_references.py", "check_evidence_records.py")
+sys.path.insert(0, str(REPO / "scripts"))
+import fv_project  # noqa: E402  canonical project-root and target resolution
+
+PROJECT_SCRIPT_NAMES = (
+    "check_ledger_references.py",
+    "check_evidence_records.py",
+    "fv_project.py",
+)
+VERIFIED_INPUTS_HEADER = (
+    "# Verified-input exclusion prefixes for the FV evidence content snapshot.\n"
+    "# Blank lines and # comments are ignored; directory prefixes end in /.\n"
+)
 CONFIG_EXAMPLE = REPO / "scripts" / "dispatch.config.example.json"
 PANEL_SETTINGS = REPO / "templates" / "omp-panel.json"
 PACKAGE_REQUIREMENTS = (
@@ -39,22 +52,69 @@ def _copy_owned_file(
     results.append(("overwrote" if existed else "wrote", destination))
 
 
-def build_dispatch_json(project: Path, target_spec: Path) -> str:
+def build_dispatch_json(target_spec: str) -> str:
     config = json.loads(CONFIG_EXAMPLE.read_text())
     route = config["omp_native"]
-    route["project_root"] = str(project)
-    route["target_spec"] = str(target_spec)
+    route["project_root"] = "."
+    route["target_spec"] = target_spec
     return json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+
+
+def portable_target_spec(project: Path, declared: str) -> str:
+    """Normalize a declared target to the repo-relative form dispatch stores.
+
+    The candidate is resolved first so a symlinked ancestor (``/var`` on macOS)
+    is not mistaken for an escape from the resolved project root.
+    """
+    candidate = Path(declared).expanduser()
+    if not candidate.is_absolute():
+        candidate = project / candidate
+    return fv_project.relative_target_spec(project, candidate.resolve())
+
+
+def install_verified_inputs(
+    project: Path,
+    force: bool,
+    results: list[tuple[str, Path]],
+) -> list[str]:
+    """Seed the frozen exclusion prefixes the evidence snapshot depends on."""
+    destination = project / ".fv" / "verified-inputs.txt"
+    defaults = list(fv_project.DEFAULT_EXCLUSIONS)
+    existed = destination.exists()
+    if not existed or force:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            VERIFIED_INPUTS_HEADER + "".join(f"{prefix}\n" for prefix in defaults)
+        )
+        results.append(("overwrote" if existed else "wrote", destination))
+        return []
+    try:
+        text = destination.read_text()
+        present = set(fv_project.parse_exclusions(text))
+    except (OSError, fv_project.ProjectError) as error:
+        return [f"{destination}: {error}; use --force to replace it"]
+    missing = [prefix for prefix in defaults if prefix not in present]
+    if not missing:
+        results.append(("skip", destination))
+        return []
+    # The frozen prefixes apply whether or not they are listed; restoring them
+    # keeps the file an honest record. Project-specific entries stay untouched.
+    if text and not text.endswith("\n"):
+        text += "\n"
+    destination.write_text(text + "".join(f"{prefix}\n" for prefix in missing))
+    results.append(("updated", destination))
+    return []
 
 
 def install_dispatch_config(
     project: Path,
-    target_spec: Path,
+    target_spec: str,
+    explicit_target: bool,
     force: bool,
     results: list[tuple[str, Path]],
 ) -> list[str]:
     destination = project / ".fv" / "dispatch.json"
-    canonical = json.loads(build_dispatch_json(project, target_spec))
+    canonical = json.loads(build_dispatch_json(target_spec))
     existed = destination.exists()
     if not existed or force:
         destination.write_text(json.dumps(canonical, indent=2, ensure_ascii=False) + "\n")
@@ -75,11 +135,24 @@ def install_dispatch_config(
         if current_route.get(key) != value:
             current_route[key] = value
             changed = True
-    if current_route.get("project_root") != str(project):
-        current_route["project_root"] = str(project)
+    # Scaffolded state must survive a clone or a move: the canonical root is
+    # whatever project the caller names, so stored roots are always ".".
+    if current_route.get("project_root") != ".":
+        current_route["project_root"] = "."
         changed = True
-    if current_route.get("target_spec") != str(target_spec):
-        current_route["target_spec"] = str(target_spec)
+    declared = current_route.get("target_spec")
+    if explicit_target or not isinstance(declared, str) or not declared.strip():
+        spec = target_spec
+    else:
+        try:
+            spec = portable_target_spec(project, declared)
+        except fv_project.ProjectError as error:
+            return [
+                f"{destination}: target_spec {declared!r} is not inside {project} ({error}); "
+                "pass --target-spec or --force to replace it"
+            ]
+    if current_route.get("target_spec") != spec:
+        current_route["target_spec"] = spec
         changed = True
     if changed:
         destination.write_text(json.dumps(current, indent=2, ensure_ascii=False) + "\n")
@@ -285,7 +358,8 @@ def main() -> int:
         "--target-spec",
         type=Path,
         default=None,
-        help="spec or intent path (default: <project>/.fv/intent.md)",
+        help="spec or intent path inside the project, absolute or project-relative "
+             "(default: .fv/intent.md, or the target already declared in .fv/dispatch.json)",
     )
     parser.add_argument("--force", action="store_true", help="replace FV-owned project state")
     args = parser.parse_args()
@@ -303,7 +377,16 @@ def main() -> int:
 
     project = args.project.resolve()
     project.mkdir(parents=True, exist_ok=True)
-    target_spec = args.target_spec.resolve() if args.target_spec else project / ".fv" / "intent.md"
+    try:
+        project = fv_project.resolve_project_root(project)
+        target_spec = (
+            fv_project.DEFAULT_TARGET_SPEC
+            if args.target_spec is None
+            else portable_target_spec(project, str(args.target_spec))
+        )
+    except fv_project.ProjectError as error:
+        print(f"FATAL: {error}")
+        return 1
     results: list[tuple[str, Path]] = []
     errors: list[str] = []
 
@@ -312,7 +395,10 @@ def main() -> int:
     for name in PROJECT_SCRIPT_NAMES:
         source = REPO / "scripts" / name
         _copy_owned_file(source, project / ".fv" / "scripts" / name, args.force, results)
-    errors.extend(install_dispatch_config(project, target_spec, args.force, results))
+    errors.extend(install_dispatch_config(
+        project, target_spec, args.target_spec is not None, args.force, results,
+    ))
+    errors.extend(install_verified_inputs(project, args.force, results))
     errors.extend(install_extension_config(project, args.force, results))
     errors.extend(install_isolation_config(project, results))
     if not errors:
@@ -332,9 +418,14 @@ def main() -> int:
         print(f"  [{action:>9}] {path.relative_to(project)}")
     for error in errors:
         print(f"  [    ERROR] {error}")
+    try:
+        effective_spec = fv_project.declared_target_spec(project) or fv_project.DEFAULT_TARGET_SPEC
+    except fv_project.ProjectError:
+        effective_spec = target_spec
     print(f"\nScaffolded {project} for the FV OMP extension at {REPO}")
-    if not args.target_spec:
-        print(f"  target_spec defaults to {target_spec}")
+    print(f'  dispatch project_root is "." and target_spec is {effective_spec}')
+    if not (project / effective_spec).is_file():
+        print(f"  target_spec {effective_spec} does not exist yet; create it before running FV gates")
     print("\nNext steps:")
     print(f"  1. Export FV_ROOT={REPO} and optional proof-tool binary variables.")
     print("  2. Start OMP in the project and run `/reload-plugins` in any session already open.")

@@ -16,6 +16,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 HELPER = REPO / "skills" / "fv-adversarial" / "omp_fanout.py"
 CONFIG = REPO / "scripts" / "dispatch.config.example.json"
+CHECKER = REPO / "scripts" / "check_dispatch_config.py"
 FAILURES: list[str] = []
 
 
@@ -39,12 +40,16 @@ def check(label: str, ok: bool, detail: object = "") -> None:
         FAILURES.append(label)
 
 
-def load_helper():
-    spec = importlib.util.spec_from_file_location("omp_fanout", HELPER)
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_helper():
+    return load_module("omp_fanout", HELPER)
 
 
 def raises(fn, text: str) -> bool:
@@ -531,6 +536,75 @@ def main() -> int:
               any("planted.rs" in x for x in v2)
               and "review/target" not in skipped2,
               {"violations": v2, "skipped": skipped2})
+
+    # --require-paths must measure a project config from the project root, not
+    # from the .fv directory that holds it. Resolving "." against .fv looked
+    # for <project>/.fv/.fv/intent.md, so every canonical project config failed
+    # path validation, and a moved project failed for the same reason.
+    checker = load_module("check_dispatch_config", CHECKER)
+    with tempfile.TemporaryDirectory(prefix="r30-paths-") as td:
+        tmp = Path(td)
+        canonical = json.loads(CONFIG.read_text())
+
+        def config_at(path: Path, project_root: str, target_spec: str) -> Path:
+            route = json.loads(json.dumps(canonical))
+            route["omp_native"]["project_root"] = project_root
+            route["omp_native"]["target_spec"] = target_spec
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(route))
+            return path
+
+        alpha = tmp / "alpha"
+        (alpha / ".fv").mkdir(parents=True)
+        (alpha / ".fv" / "intent.md").write_text("# intent\n")
+        dispatch = config_at(alpha / ".fv" / "dispatch.json", ".", ".fv/intent.md")
+        check("a project config's '.' is the project root, not its .fv dir",
+              checker.project_base(dispatch) == alpha,
+              checker.project_base(dispatch))
+        errors = checker.check_file(dispatch, True)
+        check("canonical repo-relative project config passes --require-paths",
+              errors == [], errors)
+
+        # The regression: the bytes on disk never change, only the project's
+        # location. A repo-relative config is portable by construction.
+        beta = tmp / "moved" / "beta"
+        beta.parent.mkdir(parents=True)
+        alpha.rename(beta)
+        moved = beta / ".fv" / "dispatch.json"
+        errors = checker.check_file(moved, True)
+        check("the identical config still passes after the project moves",
+              errors == [], errors)
+
+        # Arbitrary config locations keep resolving against their own directory.
+        outside = config_at(tmp / "elsewhere" / "dispatch.json",
+                            "../moved/beta", ".fv/intent.md")
+        errors = checker.check_file(outside, True)
+        check("a config kept outside .fv resolves from its own directory",
+              errors == [], errors)
+        stale = config_at(tmp / "elsewhere" / "stale.json", "no-such-project",
+                          ".fv/intent.md")
+        errors = checker.check_file(stale, True)
+        check("a bad project_root is still reported",
+              any("project_root does not exist" in item for item in errors),
+              errors)
+
+        # Legacy absolute values inside the project remain acceptable.
+        legacy = config_at(beta / ".fv" / "legacy.json", str(beta),
+                           str(beta / ".fv" / "intent.md"))
+        errors = checker.check_file(legacy, True)
+        check("legacy absolute inside-project values still validate",
+              errors == [], errors)
+        (tmp / "outsider.md").write_text("# not ours\n")
+        escaping = config_at(beta / ".fv" / "escape.json", ".",
+                             "../../outsider.md")
+        errors = checker.check_file(escaping, True)
+        check("a target escaping the project root is rejected",
+              any("escapes project_root" in item for item in errors), errors)
+        absent = config_at(beta / ".fv" / "absent.json", ".", ".fv/missing.md")
+        errors = checker.check_file(absent, True)
+        check("a missing target_spec is rejected",
+              any("target_spec does not exist" in item for item in errors),
+              errors)
 
     print()
     if FAILURES:

@@ -134,9 +134,14 @@ panelist:
 ```
 
 For **`milestone-review`**, the criteria are **not** defined by the brief. The
-trusted criterion source is the project's **canonical intent artifact**
-(`.fv/intent.md`) — the same file the Gate B evidence records bind their
-`intent_hash` to. The user brief is context only and may never redefine a clause.
+trusted criterion source is the project's **canonical intent artifact** — the
+same file the Gate B evidence records bind their `intent_hash` to. Resolve it
+from `<project>/.fv/dispatch.json` → `omp_native.target_spec`; when the key is
+absent the target is `<project>/.fv/intent.md`. `target_spec` is persisted
+repo-relative to the project root, so resolve it against the project root, not
+the cwd; an absolute value is valid only when it resolves inside the project
+root. Never fall back to a fixed search order. The user brief is context only
+and may never redefine a clause.
 You supply an explicit `required_claim_ids` list — canonical intent/Gate B clause
 IDs such as `B1`, `S4`, `A2` (selected, never redefined; never parsed from brief
 prose) — and each must already exist as a Gate B claim. A milestone `PASS`
@@ -206,7 +211,10 @@ if mode == "milestone-review":
     # and may NOT redefine a clause. Required claim IDs are an EXPLICIT input
     # (intent clause IDs like B1/S4/A2 — never parsed from brief prose); each must
     # already exist as a Gate B claim for the run to mean anything.
-    intent_path = str(proj) + "/.fv/intent.md"    # project canonical intent
+    # Resolve the canonical target: .fv/dispatch.json -> omp_native.target_spec,
+    # defaulting to .fv/intent.md only when that key is absent. run_panel binds
+    # the same file for drift detection.
+    intent_path = panel["resolve_intent_path"](proj)
     intent_text, intent_hash = pc["intent_binding"](intent_path)   # bytes-exact hash
     required_claim_ids = [...]                            # caller supplies, e.g. ["B1","S4"]
     db, rb, sb = pc["make_builders"](
@@ -224,12 +232,14 @@ if mode == "milestone-review":
 else:
     task, evidence = pc["split_brief"](read(brief_rel))
     db, rb, sb = pc["make_builders"](mode, task, evidence)
+    intent_path = None            # run_panel resolves the declared target itself
 
 # 4. Run the panel.
 summary = panel["run_panel"](
     agent_fn=agent, parallel_fn=parallel, secure=secure, mode=mode,
     seats=seats, synthesizer_seat=synthesizer_seat,
     project_root=str(proj), brief_path=brief_rel,
+    intent_path=intent_path,      # omitted -> resolved from dispatch.json target_spec
     run_dir=f".fv/panels/{ts}-{mode}",
     draft_prompt_builder=db, review_prompt_builder=rb, synthesis_prompt_builder=sb,
     draft_schema=S["draft"], review_schema=S["review"], synthesis_schema=S["synthesis"],
@@ -256,6 +266,13 @@ decisions, or `CONTESTED` criteria.
   escaping symlinks before any model call; a hit blocks the whole run.
 - **≥ `min_families` distinct declared families** among the seats, and the same
   quorum among *successful* drafts, or the run stops `INCOMPLETE` before review.
+- **Resolvable canonical target** (`milestone-review`): the intent named by
+  `.fv/dispatch.json` → `omp_native.target_spec` (default `.fv/intent.md`) must
+  exist inside the project, or the run refuses before creating the run
+  directory. A `project-plan` run tolerates an unresolvable target: it records
+  the reason in `preflight.json` and binds no intent hash. The engine locates
+  the resolver (`scripts/fv_project.py`) via `$FV_ROOT/scripts` or the
+  project's `.fv/scripts` copy.
 
 ## Blinding
 
@@ -296,7 +313,7 @@ moving target invalidates a milestone verdict.
 ```
 .fv/panels/<ts>-<mode>/
   brief.md              # snapshot of the frozen brief (hashed)
-  preflight.json        # project root, brief hash, target revision, scan verdict
+  preflight.json        # project root, brief hash, resolved intent path, target revision, scan verdict
   route.json            # resolved seats + synthesizer + anon map (written at finish)
   meta.json             # immutable run header (written at finish)
   prompts/drafts/<label>.md   prompts/reviews/<label>.md   prompts/synthesis.md

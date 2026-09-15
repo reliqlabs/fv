@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import re
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -59,6 +60,48 @@ def route_hash(route: dict) -> str:
     }
     blob = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def project_base(config_path: Path) -> Path:
+    """Directory a relative ``project_root`` is measured from.
+
+    A project's config lives at ``<project>/.fv/dispatch.json``, so
+    ``project_root: "."`` names the project root, not the ``.fv`` directory
+    holding the config. Configs kept anywhere else resolve against their own
+    directory, which keeps ad-hoc and example configs checkable in place.
+    """
+    parent = config_path.parent
+    return parent.parent if parent.name == ".fv" else parent
+
+
+def path_errors(route: dict, root: Path) -> list[str]:
+    """Resolve and check the declared project root and target spec.
+
+    ``root`` is the project-root base from :func:`project_base`. The target is
+    measured from the *resolved* project root, so a moved project with a
+    repo-relative config keeps validating. Legacy absolute values are honoured
+    as written, but a target outside the project root is an escape.
+    """
+    project_value = route["project_root"]
+    target_value = route["target_spec"]
+    if not isinstance(project_value, str) or not isinstance(target_value, str):
+        return []
+    project = Path(project_value)
+    if not project.is_absolute():
+        project = root / project
+    project = project.resolve()
+    errors: list[str] = []
+    if not project.is_dir():
+        errors.append(f"project_root does not exist: {project_value}")
+    target = Path(target_value)
+    if not target.is_absolute():
+        target = project / target
+    target = target.resolve()
+    if not target.is_file():
+        errors.append(f"target_spec does not exist: {target_value}")
+    elif not target.is_relative_to(project):
+        errors.append(f"target_spec escapes project_root: {target_value}")
+    return errors
 
 
 def validate(config: dict, *, require_paths: bool = False, base: Path | None = None) -> list[str]:
@@ -118,17 +161,7 @@ def validate(config: dict, *, require_paths: bool = False, base: Path | None = N
                 f"OMP route hash drift: stored={route['route_hash']} recomputed={expected}"
             )
     if require_paths:
-        root = base or Path.cwd()
-        project = Path(route["project_root"])
-        if not project.is_absolute():
-            project = root / project
-        target = Path(route["target_spec"])
-        if not target.is_absolute():
-            target = project / target
-        if not project.is_dir():
-            errors.append(f"project_root does not exist: {route['project_root']}")
-        if not target.is_file():
-            errors.append(f"target_spec does not exist: {route['target_spec']}")
+        errors.extend(path_errors(route, base or Path.cwd()))
     return errors
 
 
@@ -137,7 +170,7 @@ def check_file(path: Path, require_paths: bool) -> list[str]:
         config = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         return [f"cannot parse {path}: {error}"]
-    return validate(config, require_paths=require_paths, base=path.parent)
+    return validate(config, require_paths=require_paths, base=project_base(path))
 
 
 def selftest() -> int:
@@ -151,6 +184,22 @@ def selftest() -> int:
     duplicate = json.loads(example.read_text())
     duplicate["omp_native"]["voices"].append(dict(duplicate["omp_native"]["voices"][0]))
     checks.append(("duplicate voice id rejected", any("duplicate voice id" in item for item in validate(duplicate))))
+    with tempfile.TemporaryDirectory(prefix="dispatch-paths-") as td:
+        alpha = Path(td) / "alpha"
+        (alpha / ".fv").mkdir(parents=True)
+        (alpha / ".fv" / "intent.md").write_text("# intent\n")
+        config_path = alpha / ".fv" / "dispatch.json"
+        config_path.write_text(json.dumps(base))
+        checks.append((
+            "repo-relative project config passes --require-paths",
+            not check_file(config_path, True),
+        ))
+        beta = Path(td) / "beta"
+        alpha.rename(beta)
+        checks.append((
+            "the same config still passes after the project moves",
+            not check_file(beta / ".fv" / "dispatch.json", True),
+        ))
     ok = True
     for label, passed in checks:
         print(f"  [{'ok' if passed else 'FAIL'}] {label}")

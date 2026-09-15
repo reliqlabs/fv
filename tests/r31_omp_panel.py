@@ -14,6 +14,7 @@ production code. Exit 0 pass, 1 fail.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -65,15 +66,29 @@ SYNTH = {"seat_id": "synth", "declared_family": "OpenAI", "resolved_family": "op
 LINEUP_HASH = "sha256:" + "ab" * 32
 
 
-def _project(tmp: Path) -> Path:
+def _project(tmp: Path, *, target: str | None = ".fv/intent.md") -> Path:
     root = tmp / "proj"
     (root / ".fv" / "panels").mkdir(parents=True)
+    if target:  # the canonical dispatch target, at its default location
+        declared = root / target
+        declared.parent.mkdir(parents=True, exist_ok=True)
+        declared.write_text("# Intent\n")
     sess = root / "session.jsonl"
     sess.write_text('{"type":"title","v":1}\n'
                     + json.dumps({"type": "session", "id": "r31", "cwd": str(root)}) + "\n")
     os.environ["PI_SESSION_FILE"] = str(sess)
     (root / "brief.md").write_text("Build a rate limiter for the gateway.")
     return root
+
+
+def _declare_target(project: Path, spec: str) -> None:
+    """Write .fv/dispatch.json declaring omp_native.target_spec."""
+    (project / ".fv" / "dispatch.json").write_text(
+        json.dumps({"omp_native": {"project_root": ".", "target_spec": spec}}, indent=2) + "\n")
+
+
+def _file_hash(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main() -> int:  # noqa: C901 — one linear fixture, readability over decomposition
@@ -471,13 +486,22 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
     check("guard: PASS-waived counts as G1 PASS",
           gv({"A1": "PASS", "A2": "PASS-waived"}, synth(crit(("A1", "PASS"), ("A2", "PASS"))))["verdict"] == "PASS")
 
-    def git_ms(tmp, seats_ok=SEATS):
+    def git_ms(tmp, seats_ok=SEATS, *, target_spec=None):
+        """Milestone fixture. ``.fv/intent.md`` always exists; when
+        ``target_spec`` is given, dispatch.json declares that file instead, so a
+        run that silently fell back to the fixed path would bind the decoy."""
         g = tmp / "ms"
         g.mkdir()
         subprocess.run(["git", "init", "-q", str(g)], check=True)
         subprocess.run(["git", "-C", str(g), "config", "user.email", "t@t"], check=True)
         subprocess.run(["git", "-C", str(g), "config", "user.name", "t"], check=True)
         (g / ".fv" / "panels").mkdir(parents=True)
+        (g / ".fv" / "intent.md").write_text("# Default intent\n")
+        if target_spec:
+            declared = g / target_spec
+            declared.parent.mkdir(parents=True, exist_ok=True)
+            declared.write_text("# Declared intent\n")
+            _declare_target(g, target_spec)
         (g / "m.md").write_text(mtask)
         (g / "code.py").write_text("x=1\n")
         subprocess.run(["git", "-C", str(g), "add", "-A"], check=True)
@@ -803,6 +827,98 @@ def main() -> int:  # noqa: C901 — one linear fixture, readability over decomp
             allow_unverified_isolation=True)
         check("canonical intent drift -> INCOMPLETE",
               s3["revision_stable"] is False and s3["run_status"] == "INCOMPLETE")
+
+    # ── Canonical target: .fv/dispatch.json -> omp_native.target_spec ─
+    def ms_agent_editing(criteria, path: Path, text: str):
+        """Milestone agent that rewrites ``path`` while the panel is mid-run."""
+        inner = ms_agent(criteria)
+
+        def a(prompt, **options):
+            if options["label"].startswith("panel-synthesis"):
+                path.write_text(text)
+            return inner(prompt, **options)
+        return a
+
+    pass_crit = crit(("A1", "PASS"), ("A2", "PASS"))
+    pass_status = {"A1": "PASS", "A2": "PASS"}
+
+    with tempfile.TemporaryDirectory(prefix="r31-target-") as td:
+        g = git_ms(Path(td), target_spec="docs/intent.md")
+        declared = g / "docs" / "intent.md"
+        s = ms_run(g, ms_agent(pass_crit), pass_status, "declared")
+        rd = g / ".fv" / "panels" / "declared"
+        pre = json.loads((rd / "preflight.json").read_text())
+        persisted = json.loads((rd / "summary.json").read_text())
+        state = s["target_revision_before"]["canonical_state_sha256"]
+        check("declared target_spec binds docs/intent.md, never the .fv/intent.md decoy",
+              pre["intent_path"] == "docs/intent.md" and pre["intent_resolution_error"] is None
+              and persisted["intent_path"] == "docs/intent.md"
+              and ".fv/intent.md" not in state, (pre.get("intent_path"), state))
+        check("bound target hash is the Gate B intent_hash over the same bytes",
+              state.get("docs/intent.md") == _file_hash(declared)
+              == "sha256:" + pc.intent_binding(declared)[1], state)
+        check("declared external target still adjudicates PASS",
+              s["adjudication"]["verdict"] == "PASS" and s["run_status"] == "COMPLETE",
+              s["adjudication"])
+
+        s2 = ms_run(g, ms_agent_editing(pass_crit, declared, "# Retargeted intent\n"),
+                    pass_status, "declared-drift")
+        before = s2["target_revision_before"]["canonical_state_sha256"]["docs/intent.md"]
+        after = s2["target_revision_after"]["canonical_state_sha256"]["docs/intent.md"]
+        check("declared target edited mid-run -> revision unstable, PASS withheld",
+              s2["revision_stable"] is False and s2["run_status"] == "INCOMPLETE"
+              and s2["adjudication"]["verdict"] == "INCOMPLETE" and before != after,
+              s2["adjudication"])
+
+    # A target declared inside .fv/ is invisible to the source snapshot (the
+    # whole tree is excluded), so only the canonical-state binding can catch it.
+    with tempfile.TemporaryDirectory(prefix="r31-tinner-") as td:
+        g = git_ms(Path(td), target_spec=".fv/specs/m1.md")
+        s = ms_run(g, ms_agent_editing(pass_crit, g / ".fv" / "specs" / "m1.md", "# Moved\n"),
+                   pass_status, "inner-drift")
+        check("declared .fv target is drift-checked though the source snapshot excludes .fv",
+              s["revision_stable"] is False and s["run_status"] == "INCOMPLETE"
+              and s["target_revision_before"]["snapshot_sha256"]
+              == s["target_revision_after"]["snapshot_sha256"],
+              (s.get("revision_stable"), s["target_revision_before"]["snapshot_sha256"]))
+        s2 = ms_run(g, ms_agent_editing(pass_crit, g / ".fv" / "intent.md", "# decoy edited\n"),
+                    pass_status, "undeclared-edit")
+        check("editing the undeclared .fv/intent.md leaves a run bound elsewhere stable",
+              s2["revision_stable"] is True and s2["adjudication"]["verdict"] == "PASS",
+              s2["adjudication"])
+
+    # Fail-closed: a milestone verdict may not bind an intent nobody can read,
+    # and a declared target never degrades into a search for another file.
+    with tempfile.TemporaryDirectory(prefix="r31-tfail-") as td:
+        g = git_ms(Path(td))
+        (g / "docs").mkdir()
+        outside = Path(td) / "outside-intent.md"
+        outside.write_text("# Outside\n")
+        for rundir, spec, message in (
+            ("missing", "docs/missing.md", "target_spec does not exist"),
+            ("directory", "docs", "target_spec is a directory"),
+            ("escaping", "../outside-intent.md", "escapes project root"),
+            ("absolute-outside", str(outside.resolve()), "escapes project root"),
+        ):
+            _declare_target(g, spec)
+            check(f"milestone refuses an unresolvable target ({rundir}) before any run dir",
+                  raises(lambda run_dir=rundir: ms_run(g, ok_agent, pass_status, run_dir), message)
+                  and not (g / ".fv" / "panels" / rundir).exists(), spec)
+        (g / ".fv" / "dispatch.json").unlink()
+        (g / ".fv" / "intent.md").unlink()
+        check("milestone with no dispatch and no default target refuses",
+              raises(lambda: ms_run(g, ok_agent, pass_status, "nodefault"),
+                     "target_spec does not exist: .fv/intent.md")
+              and not (g / ".fv" / "panels" / "nodefault").exists())
+
+    with tempfile.TemporaryDirectory(prefix="r31-ptol-") as td:
+        root = _project(Path(td), target=None)
+        s = run(root, ok_agent, rundir="notarget")
+        pre = json.loads((root / ".fv" / "panels" / "notarget" / "preflight.json").read_text())
+        check("project-plan tolerates an unresolvable target and records the reason",
+              s["run_status"] == "COMPLETE" and s["intent_path"] is None
+              and pre["intent_path"] is None
+              and "target_spec does not exist" in (pre["intent_resolution_error"] or ""), pre)
 
     os.environ.pop("PI_SESSION_FILE", None)
     print()

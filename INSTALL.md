@@ -75,17 +75,43 @@ Optional explicit intent/spec target:
 ```bash
 uv run --script "$FV_ROOT/scripts/fv_init.py" \
   /absolute/path/to/project \
-  --target-spec /absolute/path/to/project/.fv/intent.md
+  --target-spec .fv/intent.md
 ```
+
+`--target-spec` takes a path inside the project: either project-relative (as
+above) or absolute. A target outside the project root is rejected. A fresh init
+without the flag declares `.fv/intent.md`; a rerun without the flag preserves
+the already-declared target.
 
 The initializer:
 
 - creates `.fv/{attacks,verify,evidence,scripts,panels}`;
 - writes the OMP-only `.fv/dispatch.json`;
-- copies the Gate A/B validators into `.fv/scripts/`;
+- copies the Gate A/B validators and the shared `fv_project.py` target resolver into `.fv/scripts/`;
 - installs the default `fv-canonical` role under OMP's project `panel.roles` settings;
 - merges the FV checkout into `.omp/config.yml` `extensions:`;
 - writes `.fv/harness` as `omp`.
+
+`.fv/dispatch.json` is the project's declaration of its canonical verification
+target. It is written portably: `omp_native.project_root` is `"."` and
+`omp_native.target_spec` is a repo-relative POSIX path, so the file stays valid
+when the project is cloned, moved, or checked out on another machine. Every
+skill, agent, and gate that needs the intent resolves `target_spec` against the
+project root rather than the current working directory, and uses
+`.fv/intent.md` when `target_spec` is absent. A legacy absolute
+`project_root`/`target_spec` pointing inside the project is still accepted and
+is rewritten to the portable form on the next init run; a target that is
+missing, a directory, or outside the project root is an error rather than a
+silent fallback.
+
+`fv_project.py` exposes `resolve_target(project_root)`, the single
+implementation of that rule. Skills and gates call it; the read-only review
+agents, which cannot execute code, read `dispatch.json` directly and apply the
+same rule. Neither searches for candidate filenames.
+
+To move the intent later, move the file and update `omp_native.target_spec` to
+the new repo-relative path. Editing one without the other leaves downstream
+stages reading the old target.
 
 It does not copy package agents, skills, tools, or MCP definitions. Existing extension entries are preserved. Use `--force` only to replace FV-owned project state.
 

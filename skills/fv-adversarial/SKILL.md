@@ -40,7 +40,7 @@ must run the `fv-spec-adversary` agent with repository file access.
 Ask the user for, or determine from context:
 
 - **Path to the spec under review** — the artifact being attacked. May be a Lean file, Quint module, Verus annotations in a Rust source, a `#[kani::proof]` harness, or any other spec artifact.
-- **Path to the intent document** — the human-anchored source of truth the spec is supposed to encode. Check `<project>/.fv/intent.md` first (canonical per CONCEPTS.md "Project layout"), then `<project>/intent.md`, then ask.
+- **Path to the intent document** — the human-anchored source of truth the spec is supposed to encode. Resolve the canonical target from `<project>/.fv/dispatch.json` → `omp_native.target_spec`; when the key is absent the target is `<project>/.fv/intent.md`. `target_spec` is persisted repo-relative to the project root, so resolve it against the project root, not the cwd; an absolute value is valid only when it resolves inside the project root. Never fall back to a fixed search order. `uv run --script $FV_ROOT/scripts/fv_project.py target --root <project>` prints the resolved path.
 - **Optional context** — paths to existing tests, related specs, prior attack reports, type signatures, anything that strengthens grounding.
 - **Project root** — where `.fv/attacks/` should be created. Infer from the spec's location if not given.
 - **Voices to dispatch** — explicit registry voice IDs, never provider buckets or
@@ -165,6 +165,13 @@ First confirm every requested pattern is reachable in OMP's `/model` picker.
 Then run the helper from an OMP Python `eval` cell:
 
 ```python
+import os, sys
+sys.path.insert(0, os.environ["FV_ROOT"] + "/scripts")   # or "<project>/.fv/scripts"
+import fv_project
+
+project_root = fv_project.resolve_project_root(os.getcwd())   # session cwd == project root
+target_spec = fv_project.resolve_target(project_root)         # dispatch target_spec, else .fv/intent.md
+
 omp_fanout_ns = {}
 exec(read("skill://fv-adversarial/omp_fanout.py"), omp_fanout_ns)
 omp_route = omp_fanout_ns["load_omp_native_config"](
@@ -178,8 +185,8 @@ omp_result = omp_fanout_ns["run_omp_fanout"](
     agent_fn=agent,
     parallel_fn=parallel,
     voices=omp_route["voices"],
-    project_root=omp_route["project_root"],
-    target_spec=omp_route["target_spec"],
+    project_root=project_root,     # the tool's project root, not the stored string
+    target_spec=target_spec,       # resolved canonical target, never a fixed path
     prompt=attack_prompt,
     run_dir=run_dir,
     agent_name=omp_route["agent"],

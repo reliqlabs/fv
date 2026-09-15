@@ -1,7 +1,7 @@
 {
   "omp_native": {
-    "project_root": "/absolute/path/to/your/project",
-    "target_spec": "/absolute/path/to/your/project/intent.md",
+    "project_root": ".",
+    "target_spec": ".fv/intent.md",
     "profile": "canonical-4@sha256:0f73580ef4e3fdf2",
     "agent": "fv-spec-adversary",
     "thinking_policy": "one-below-max",

@@ -16,10 +16,17 @@ Copy to <project>/.fv/scripts/ and invoke from CI on every revision.
 
 Checks:
 
-1. Citation resolution — every `<file>:<line>` citation in the ledger
-   (either backtick-quoted, e.g. `specs/RcvSpec.lean:263`, or an explicit
-   `code: <file>:<line>` annotation) must point at an existing file and a
-   line number within that file, contained inside the canonical root.
+1. Citation resolution — every `<file>:<line>` citation in the ledger must
+   point at an existing file and a line number within that file, contained
+   inside the canonical root. Four citation forms are parsed explicitly
+   (each may carry the `@sha256:<12hex>` binding described in 3):
+       `specs/RcvSpec.lean:263`          backticked path citation
+       `code: src/handle.rs:201`         fully backticked code annotation
+       code: src/handle.rs:201           plain code annotation
+       code: `src/my file.rs:201`        annotation with a quoted path
+   A backticked path may contain spaces (the backticks delimit it); a
+   plain `code:` path may not. A `code:` annotation whose value does not
+   parse fails the gate loudly rather than being silently skipped.
 2. Citation content sanity — the cited line must be non-empty and not a
    comment-only line (Rust `#[...]` attribute lines are valid targets).
    A citation pointing at `// TODO` is the same shape of drift as a
@@ -30,8 +37,9 @@ Checks:
    required suffix for each unhashed citation.
 4. No vacuous pass — an empty ledger, or one containing zero citations,
    FAILS. A gate with nothing to check has checked nothing.
-5. Kani coverage — every trust-chain link (a `Depends on:` entry line)
-   should carry either a `kani:` harness reference or a
+5. Kani coverage — every trust-chain link (an entry line under a
+   `Depends on:` or `**Depends on:**` header) should carry either a
+   `kani:` harness reference or a
    `kani: skipped because <reason>` annotation. Per-link misses WARN by
    default and fail under --strict-kani (use once your ledger's kani
    annotations are complete). Zero `kani:` annotations in the whole
@@ -58,23 +66,47 @@ import argparse
 import hashlib
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-# `path:line` citations: backtick-quoted or after a `code:` annotation,
-# optionally content-bound with an `@sha256:<12hex>` suffix.
-# Path must contain a dot-extension to avoid matching prose ratios ("5:1").
-# Backtick-quoted paths may contain spaces (the backticks delimit them);
-# bare `code:` paths cannot, and a space-path there fails loudly below.
-CITATION_RE = re.compile(
-    r"`(?P<path>[^`\n]+?\.[A-Za-z0-9]+):(?P<line>\d+)(?:@sha256:(?P<hash>[0-9a-f]{12}))?`"
-    r"|code:\s*(?P<path2>[^\s`]+\.[A-Za-z0-9]+):(?P<line2>\d+)(?:@sha256:(?P<hash2>[0-9a-f]{12}))?"
+# ── Citation grammar ───────────────────────────────────────────────────
+# Citations are parsed explicitly, one line at a time, instead of being
+# matched by a single alternation. The legacy regex was ambiguous about
+# where a `code:` annotation ended: a fully backticked annotation
+# (`code: src/guard.rs:2@sha256:...`) parsed as a path literally named
+# "code: src/guard.rs", which then failed as a missing file, and the
+# malformed-annotation check had to guess at span overlaps to avoid
+# double-reporting. The parser below tokenizes each line into backticked
+# spans and plain text, then reads each token against one grammar:
+#
+#     citation := <path> ":" <line> [ "@sha256:" <12hex> ]
+#
+# Backticked spans delimit the path, so it may contain spaces. In plain
+# text the path runs to the next whitespace or backtick.
+CODE_PREFIX = "code:"
+# `code:` as an annotation marker, not the tail of a word ("barcode:").
+CODE_MARK_RE = re.compile(r"(?<![A-Za-z0-9_\-])code:[ \t]*")
+CITATION_BODY_RE = re.compile(
+    r"^(?P<path>\S(?:.*\S)?):(?P<line>\d+)(?:@sha256:(?P<hash>[0-9a-f]{12}))?$"
 )
-# A `code:` annotation whose value looks like a citation but did not parse
-# (spaces in an unquoted path, stray characters): fail loudly instead of
-# silently skipping the check.
-UNPARSED_CODE_RE = re.compile(r"code:\s*(?P<rest>[^\n]*\.[A-Za-z0-9]+:\d+)")
+# A bare backticked span is a citation only when its path carries a
+# dot-extension; that is what separates `src/guard.rs:2` from prose ratios
+# ("5:1") and from ordinary inline code (`inv_b1`). An explicit `code:`
+# marker already declares intent, so extension-less paths (`code:
+# Makefile:12`) are accepted there.
+EXTENSION_RE = re.compile(r"\.[A-Za-z0-9]+$")
+PLAIN_PATH_TOKEN_RE = re.compile(r"[^\s`]+")
+# An unquoted annotation that ends a sentence or a parenthetical carries
+# the punctuation into its token: `code: src/guard.rs:2@sha256:ab...cd).`
+# Trailing sentence punctuation is not part of the path.
+TRAILING_PUNCTUATION = ".,;:!?)]}\"'"
+# A `code:` value that did not parse but still carries a
+# `<path>.<ext>:<line>`-shaped substring was meant as a citation (an
+# unquoted path with spaces splits at the first space).
+CITATION_SHAPE_RE = re.compile(r"\S*\.[A-Za-z0-9]+:\d+")
+HASH_MARKER = "@sha256:"
+
 KANI_RE = re.compile(r"kani:\s*(?P<body>.*)$")
-DEPENDS_HEADER_RE = re.compile(r"^\s*Depends on:\s*$")
 LINK_LINE_RE = re.compile(r"^\s*-\s+\S")
 
 COMMENT_PREFIXES = ("//", "#", "--", "/*", "*", ";")
@@ -97,6 +129,123 @@ def line_hash(line: str) -> str:
     """Content binding for a cited line: SHA-256 of the line with trailing
     whitespace stripped, truncated to 12 hex chars (hand-writable)."""
     return hashlib.sha256(line.rstrip().encode()).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class Citation:
+    """One parsed `<path>:<line>[@sha256:<hex>]` reference."""
+    path: str
+    line: int
+    bound_hash: str | None
+
+
+def parse_citation_body(body: str, *, require_extension: bool) -> Citation | None:
+    """Parse one citation body. Returns None when `body` is not a citation
+    at all (ordinary inline code, prose, a ratio)."""
+    m = CITATION_BODY_RE.match(body.strip())
+    if m is None:
+        return None
+    path = m.group("path")
+    if require_extension and not EXTENSION_RE.search(path):
+        return None
+    return Citation(path, int(m.group("line")), m.group("hash"))
+
+
+def split_code_spans(text: str) -> list[tuple[bool, str]]:
+    """Tokenize a ledger line into (is_backticked, content) segments. An
+    unterminated backtick leaves the rest of the line as plain text."""
+    segments: list[tuple[bool, str]] = []
+    pos = 0
+    while True:
+        opened = text.find("`", pos)
+        closed = text.find("`", opened + 1) if opened >= 0 else -1
+        if opened < 0 or closed < 0:
+            segments.append((False, text[pos:]))
+            return segments
+        segments.append((False, text[pos:opened]))
+        segments.append((True, text[opened + 1:closed]))
+        pos = closed + 1
+
+
+def looks_like_citation(token: str, value: str) -> bool:
+    """Whether a `code:` value that failed to parse was nonetheless meant
+    as a citation — a path-shaped first token, or a `<path>.<ext>:<line>`
+    further into the value (`code: src/my file.rs:1`, where the unquoted
+    space truncated the path)."""
+    if any(ch in token for ch in "/.:"):
+        return True
+    return CITATION_SHAPE_RE.search(value) is not None
+
+
+def unparseable_code_failure(value: str) -> str:
+    shown = value.strip()
+    if len(shown) > 80:
+        shown = shown[:77] + "..."
+    return (f"unparseable `code:` citation {shown!r} — expected "
+            f"`code: <path>:<line>@sha256:<12hex>`; quote the whole "
+            f"path:line in backticks when the path contains spaces")
+
+
+def parse_line(text: str) -> tuple[list[Citation], list[str]]:
+    """Explicit citation parse of one ledger line. Returns the citations in
+    source order plus malformed-annotation failures (each without the
+    `ledger:<n>: ` prefix)."""
+    citations: list[Citation] = []
+    problems: list[str] = []
+    for is_backticked, content in split_code_spans(text):
+        if is_backticked:
+            body = content.strip()
+            if body.startswith(CODE_PREFIX):
+                # `code: src/guard.rs:2@sha256:...` — the whole annotation
+                # is quoted, so the path may contain spaces.
+                cited = parse_citation_body(body[len(CODE_PREFIX):],
+                                            require_extension=False)
+                if cited is not None:
+                    citations.append(cited)
+                else:
+                    problems.append(unparseable_code_failure(body))
+                continue
+            cited = parse_citation_body(body, require_extension=True)
+            if cited is not None:
+                citations.append(cited)
+            elif HASH_MARKER in body:
+                # Content-bound shape with a broken binding: a truncated or
+                # non-hex hash is drift, not prose. Never silently skipped.
+                problems.append(
+                    f"malformed content binding in citation `{body}` — expected "
+                    f"`<path>:<line>@sha256:<12hex>`")
+            continue
+        # Each `code:` marker owns the text up to the next marker, so one
+        # annotation's value can never be read as another's.
+        marks = list(CODE_MARK_RE.finditer(content))
+        for index, mark in enumerate(marks):
+            end = marks[index + 1].start() if index + 1 < len(marks) else len(content)
+            value = content[mark.end():end]
+            if not value.strip():
+                # A trailing `code:` takes its value from the backticked
+                # span that follows (or the next line); nothing to parse.
+                continue
+            token_match = PLAIN_PATH_TOKEN_RE.match(value)
+            token = token_match.group(0).rstrip(TRAILING_PUNCTUATION) if token_match else ""
+            cited = parse_citation_body(token, require_extension=False) if token else None
+            if cited is not None:
+                citations.append(cited)
+            elif looks_like_citation(token, value):
+                problems.append(unparseable_code_failure(value))
+    return citations, problems
+
+
+def is_depends_header(text: str) -> bool:
+    """A `Depends on:` trust-chain block header, with or without Markdown
+    emphasis or a heading prefix: `Depends on:`, `**Depends on:**`,
+    `**Depends on**:`, `### Depends on:`."""
+    core = text.strip().lstrip("#").strip()
+    if ":" not in core:
+        return False
+    core = core.strip("*_` ")
+    if core.endswith(":"):
+        core = core[:-1].strip("*_` ")
+    return core.casefold() == "depends on"
 
 
 def meaningful_justification(just: str) -> bool:
@@ -145,12 +294,14 @@ def main() -> int:
         return file_cache[p]
 
     for lineno, text in enumerate(ledger_lines, start=1):
-        matched_spans: list[tuple[int, int]] = []
-        for m in CITATION_RE.finditer(text):
-            matched_spans.append(m.span())
-            rel = m.group("path") or m.group("path2")
-            cited_line = int(m.group("line") or m.group("line2"))
-            bound_hash = m.group("hash") or m.group("hash2")
+        citations, malformed = parse_line(text)
+        # A `code:` annotation that does not parse is a failure, not a
+        # skipped check: the gate says nothing about code it never read.
+        failures.extend(f"ledger:{lineno}: {problem}" for problem in malformed)
+        for citation in citations:
+            rel = citation.path
+            cited_line = citation.line
+            bound_hash = citation.bound_hash
             n_citations += 1
             # Containment: citations resolve inside the canonical root only.
             # `..` segments are rejected textually; resolve() then also
@@ -201,16 +352,6 @@ def main() -> int:
                 if args.suggest_hashes:
                     suggestions.append(f"{rel}:{cited_line}@sha256:{line_hash(cited)}")
 
-        for um in UNPARSED_CODE_RE.finditer(text):
-            overlaps = any(s <= um.start() < e or s < um.end() <= e
-                           for s, e in matched_spans)
-            if not overlaps:
-                failures.append(
-                    f"ledger:{lineno}: unparseable `code:` citation "
-                    f"{um.group('rest')!r} — spaces in an unquoted path? "
-                    f"Quote the whole path:line in backticks."
-                )
-
         # Every `axiom:` occurrence on the line is checked, not just the
         # first; each is anchored to its own justification segment.
         if "axiom:" in text:
@@ -238,7 +379,7 @@ def main() -> int:
         # Per-link Kani coverage: every entry line of a `Depends on:` block
         # is a trust-chain link and must carry `kani:` (harness or explicit
         # skip). Warn by default; gate under --strict-kani.
-        if DEPENDS_HEADER_RE.match(text):
+        if is_depends_header(text):
             in_depends_block = True
         elif in_depends_block:
             if LINK_LINE_RE.match(text):
