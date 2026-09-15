@@ -137,35 +137,96 @@ def main() -> int:
              "thinking": voices[seat["id"]].get("omp_thinking_ladder")}
             for seat in canonical["voices"]
         ]}
+        bom = json.loads((REPO / "bom.json").read_text())
+        required_contract = bom["omp_contract"]
         contract = {
-            "version": 1, "restrictTools": True, "perCallModel": True,
-            "perCallTimeout": True, "servedModel": True, "servedFamily": True,
-            "panelLineupFreeze": True,
+            "version": required_contract["version"],
+            **required_contract["required"],
+            # Additive OMP capabilities must not break FV compatibility.
+            "futureCapability": True,
         }
-        omp_stub = Path(temporary) / "omp-stub"
-        omp_stub.write_text(
-            "#!/usr/bin/env python3\nimport os, sys\n"
-            # From the BOM, so a deliberate pin bump cannot leave this fixture
-            # asserting compatibility against a version the repo no longer pins.
-            f"version = {repr('omp/' + json.loads((REPO / 'bom.json').read_text())['tools']['omp'])}\n"
-            f"contract = {repr(json.dumps(contract))}\n"
-            f"catalog = {repr(json.dumps(catalog))}\n"
-            f"expected_cwd = {repr(str(project.resolve()))}\n"
-            "catalog_out = catalog if os.getcwd() == expected_cwd else '{\"models\": []}'\n"
-            "print(version if '--version' in sys.argv else "
-            "contract if '--agent-bridge-contract' in sys.argv else catalog_out)\n"
-        )
-        omp_stub.chmod(0o755)
+
+        def write_omp_stub(path: Path, payload: object, version: str = "omp/99.0.0") -> Path:
+            path.write_text("\n".join([
+                "#!/usr/bin/env python3",
+                "import os, sys",
+                f"version = {version!r}",
+                f"contract = {json.dumps(payload)!r}",
+                f"catalog = {json.dumps(catalog)!r}",
+                f"expected_cwd = {str(project.resolve())!r}",
+                "catalog_out = catalog if os.getcwd() == expected_cwd else '{\"models\": []}'",
+                "print(version if '--version' in sys.argv else "
+                "contract if '--agent-bridge-contract' in sys.argv else catalog_out)",
+            ]) + "\n")
+            path.chmod(0o755)
+            return path
+
         doctor = REPO / "scripts" / "fv_doctor.py"
+        omp_stub = write_omp_stub(Path(temporary) / "omp-stub", contract)
         checked = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(omp_stub), "--json"],
             env={**os.environ, "FV_ROOT": str(REPO)},
             capture_output=True, text=True,
         )
-        check("doctor accepts an explicit compatible OMP executable",
-              checked.returncode == 0 and json.loads(checked.stdout)["status"] == "PASS",
+        checked_report = json.loads(checked.stdout)
+        check("doctor accepts a different OMP version with the required capability subset",
+              checked.returncode == 0 and checked_report["status"] == "PASS"
+              and any(item["name"] == "omp" and item["detail"] == "omp/99.0.0"
+                      for item in checked_report["findings"]),
               checked.stdout + checked.stderr)
+        check("doctor accepts additive bridge capabilities",
+              any(item["name"] == "omp-agent-bridge-contract" and item["status"] == "ok"
+                  for item in checked_report["findings"]), checked.stdout)
+
+        missing_capability = dict(contract)
+        missing_capability.pop("perCallTimeout")
+        bad_capability_stub = write_omp_stub(
+            Path(temporary) / "omp-missing-capability", missing_capability)
+        bad_capability = subprocess.run(
+            ["uv", "run", "--script", str(doctor), "--project", str(project),
+             "--omp", str(bad_capability_stub), "--json"],
+            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True,
+        )
+        bad_capability_report = json.loads(bad_capability.stdout)
+        check("doctor fails when a required OMP capability is missing",
+              bad_capability.returncode == 1
+              and any(item["name"] == "omp-agent-bridge-contract" and item["status"] == "fail"
+                      and "perCallTimeout" in item["detail"]
+                      for item in bad_capability_report["findings"]), bad_capability.stdout)
+
+        false_capability = dict(contract)
+        false_capability["perCallTimeout"] = False
+        false_capability_stub = write_omp_stub(
+            Path(temporary) / "omp-false-capability", false_capability)
+        false_capability_run = subprocess.run(
+            ["uv", "run", "--script", str(doctor), "--project", str(project),
+             "--omp", str(false_capability_stub), "--json"],
+            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True,
+        )
+        false_capability_report = json.loads(false_capability_run.stdout)
+        check("doctor fails when a required OMP capability is false",
+              false_capability_run.returncode == 1
+              and any(item["name"] == "omp-agent-bridge-contract" and item["status"] == "fail"
+                      and "perCallTimeout=False" in item["detail"]
+                      for item in false_capability_report["findings"]),
+              false_capability_run.stdout)
+
+        wrong_version_contract = dict(contract)
+        wrong_version_contract["version"] = required_contract["version"] + 1
+        wrong_contract_stub = write_omp_stub(
+            Path(temporary) / "omp-wrong-contract-version", wrong_version_contract)
+        wrong_contract = subprocess.run(
+            ["uv", "run", "--script", str(doctor), "--project", str(project),
+             "--omp", str(wrong_contract_stub), "--json"],
+            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True,
+        )
+        wrong_contract_report = json.loads(wrong_contract.stdout)
+        check("doctor fails on an incompatible OMP bridge-contract version",
+              wrong_contract.returncode == 1
+              and any(item["name"] == "omp-agent-bridge-contract" and item["status"] == "fail"
+                      and "contract version" in item["detail"]
+                      for item in wrong_contract_report["findings"]), wrong_contract.stdout)
         missing_omp = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(Path(temporary) / "missing-omp"), "--json"],

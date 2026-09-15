@@ -135,7 +135,7 @@ python3 "$FV_ROOT/scripts/check_dispatch_config.py" \
   /absolute/path/to/project/.fv/dispatch.json
 ```
 
-The doctor fails for missing extension configuration, package MCP wiring, package agents or skills, dispatch state, profile/registry route drift, an incompatible agent bridge, or live model-ladder drift. Use `--omp /absolute/path/to/omp` when verifying a source build or an executable outside `PATH`.
+The doctor fails for missing extension configuration, package MCP wiring, package agents or skills, dispatch state, profile/registry route drift, an incompatible OMP bridge contract, or live model-ladder drift. OMP compatibility is capability-based: its live version is recorded as provenance, the bridge-contract version and every capability required by `bom.json` must match, and additive capabilities are accepted. Use `--omp /absolute/path/to/omp` when verifying a source build or an executable outside `PATH`.
 
 ## CI
 

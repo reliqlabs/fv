@@ -339,11 +339,14 @@ def check_toolchain(report: Report, project: Path, omp_command: str = "omp") -> 
         output = (result.stdout + result.stderr).strip()
         pin = bom["tools"].get(name)
         if result.returncode != 0:
-            report.add("toolchain", name, "warn", output or "version probe failed")
+            status = "fail" if name == "omp" else "warn"
+            report.add("toolchain", name, status, output or "version probe failed")
         elif pin and pin not in output:
             status = "warn" if name == "uv" else "fail"
             report.add("toolchain", name, status, f"live={output!r}, pin={pin!r}")
         else:
+            # OMP's live version is provenance. Compatibility is decided by the
+            # bridge contract below, so routine tau upgrades stay admissible.
             report.add("toolchain", name, "ok", output)
     if omp is None:
         return
@@ -351,25 +354,35 @@ def check_toolchain(report: Report, project: Path, omp_command: str = "omp") -> 
         [omp, "--agent-bridge-contract"], cwd=project,
         capture_output=True, text=True,
     )
-    expected_contract = {
-        "version": 1,
-        "restrictTools": True,
-        "perCallModel": True,
-        "perCallTimeout": True,
-        "servedModel": True,
-        "servedFamily": True,
-        "panelLineupFreeze": True,
-    }
+    specification = bom.get("omp_contract")
+    required_version = specification.get("version") if isinstance(specification, dict) else None
+    required = specification.get("required") if isinstance(specification, dict) else None
     try:
         contract_data = json.loads(contract.stdout) if contract.returncode == 0 else None
     except json.JSONDecodeError:
         contract_data = None
+    violations = []
+    if not isinstance(contract_data, dict):
+        violations.append("agent bridge contract unavailable or malformed")
+    if not isinstance(required_version, int) or not isinstance(required, dict):
+        violations.append("bom.json omp_contract is malformed")
+    elif isinstance(contract_data, dict):
+        if contract_data.get("version") != required_version:
+            violations.append(
+                f"contract version={contract_data.get('version')!r}, required={required_version!r}"
+            )
+        for capability, expected in required.items():
+            if not isinstance(expected, bool):
+                violations.append(f"invalid required capability value {capability}={expected!r}")
+            elif contract_data.get(capability) is not expected:
+                violations.append(
+                    f"capability {capability}={contract_data.get(capability)!r}, required={expected!r}"
+                )
     report.add(
         "toolchain", "omp-agent-bridge-contract",
-        "ok" if contract_data == expected_contract else "fail",
-        "bridge capabilities present, including panel lineup freeze"
-        if contract_data == expected_contract
-        else (contract.stdout + contract.stderr).strip() or "agent bridge contract unavailable",
+        "fail" if violations else "ok",
+        "; ".join(violations) if violations
+        else f"required OMP bridge contract satisfied (version {required_version}); extra capabilities accepted",
     )
     catalog = subprocess.run(
         [omp, "models", "--json", "-e", str(REPO)],

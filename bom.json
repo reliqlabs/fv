@@ -1,13 +1,23 @@
 {
-  "_comment": "Locked compatibility BOM (E6). These are the versions the repo is dogfooded against. tests/r14_cli_contracts.py fails when a live tool drifts from these pins or when a CLI flag the pipeline depends on disappears: update a pin deliberately, re-run the suite, and record the bump in the commit message. Do not point installs at latest/stable; pin here first.",
+  "_comment": "Locked proof-tool compatibility BOM (E6). Proof tools remain exactly pinned because accepted syntax, generated artifacts, and solver behavior may vary by release. OMP is the evolving host: fv_doctor records its live version as provenance and gates compatibility on omp_contract instead of semver equality.",
   "tools": {
-    "omp": "18.1.4",
     "quint": "0.32.0",
     "apalache": "0.56.1",
     "lean": "4.29.0",
     "cargo-kani": "0.67.0",
     "verus": null,
     "uv": "0.11.6"
+  },
+  "omp_contract": {
+    "version": 1,
+    "required": {
+      "restrictTools": true,
+      "perCallModel": true,
+      "perCallTimeout": true,
+      "servedModel": true,
+      "servedFamily": true,
+      "panelLineupFreeze": true
+    }
   },
   "_verus_note": "verus is not installed in the dogfood environment; pin the exact release here on first install (see INSTALL.md) before treating Verus layers as required.",
   "python": {

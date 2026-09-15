@@ -5,7 +5,7 @@ All live orchestration is OMP-native. Historical calibration artifacts retain th
 ## Project setup and diagnostics
 
 - `fv_init.py`: creates project `.fv/` state and merges the FV checkout into `.omp/config.yml` `extensions:`.
-- `fv_doctor.py`: checks tool pins, extension discovery, MCP wiring, dispatch state, static frontmatter, and profile hashes.
+- `fv_doctor.py`: checks exact proof-tool pins, the required OMP capability contract (recording OMP semver as provenance), extension discovery, MCP wiring, dispatch state, static frontmatter, and profile hashes.
 - `validate_frontmatter.py`: validates `skills/*/SKILL.md` and static `agents/*.md` against the OMP contract.
 - `check_dispatch_config.py`: validates the OMP-only `dispatch.json` schema and route hash.
 - `gen_roster_docs.py`: regenerates OMP roster blocks and dispatch routes from `registry/voices.json`.
