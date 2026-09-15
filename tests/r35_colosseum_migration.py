@@ -28,6 +28,15 @@ only record of past verification is that it cannot lose or rewrite anything:
     metadata return with its bytes; a move-aside that itself fails is
     reported as the failed write it is rather than as a lost destination,
     because the file never moved;
+  * the legacy `.colosseum/ledger.md` is run against the current Gate A
+    (`scripts/check_ledger_references.py`, `--root PROJECT`, default
+    strictness) before anything is mapped, because a ledger the project's
+    own copied gate accepted is not automatically one the current gate
+    accepts: an unbound or stale citation, a comment-only cited line, a
+    prose-only ledger and a ledger the gate cannot read at all each block
+    the run with one bounded `.colosseum/ledger.md#gate-a` row, write
+    nothing, and leave the legacy bytes alone -- the readiness of the
+    ledger is reported, never repaired here;
   * a hard-killed apply strands nothing a verified-input snapshot hashes: the
     staging tree sits under one fixed, structurally excluded prefix, with a
     unique subdirectory per run that no later apply reuses or disturbs, and a
@@ -83,6 +92,7 @@ import pyramid_run  # noqa: E402  the runner the migrated plan must satisfy
 
 MIGRATE = REPO / "scripts" / "fv_migrate.py"
 EVIDENCE_RUN = REPO / "tools" / "evidence-run.ts"
+GATE_A = REPO / "scripts" / "check_ledger_references.py"
 FAILURES: list[str] = []
 
 MAPPED = "mapped"
@@ -129,15 +139,100 @@ def migrated_id(target: str) -> str:
 # fixtures: a dossier-shaped legacy project
 # --------------------------------------------------------------------------
 
-LEDGER = """# Ledger
+# The files a fixture ledger cites. Gate A resolves every citation against
+# the project root, requires an `@sha256` content binding, and refuses a
+# cited line that is empty or comment-only, so the fixture carries real
+# files with real citable lines instead of plausible prose.
+INTENT_FILE = "docs/intent.md"
+CODE_FILE = "crates/contract/src/machine/mod.rs"
+INTENT_S7 = "S7. Roots stay canonical."
+INTENT_B18 = "B18. The sentinel occurs only after a failed finalization."
+CODE_ADMIT = "        self.entries_root = recompute_root(&self.entries);"
+CODE_FINALIZE = "        self.sentinel = Sentinel::AfterFailure;"
+CODE_COMMENT = "    // admission recomputes the canonical root"
 
-## C-01
-- Intent S7 at `docs/intent.md:313`; `code: crates/contract/src/machine/mod.rs:157`
-- **Depends on:** `kani: merkle_promotion_not_duplication`
+INTENT_DOC = f"""# dossier intent
 
-## C-02
-- Intent B18 at `docs/intent.md:339`; `code: crates/contract/src/machine/mod.rs:694`
+{INTENT_S7}
+
+{INTENT_B18}
 """
+
+CODE_DOC = f"""use crate::merkle::recompute_root;
+
+impl Machine {{
+{CODE_COMMENT}
+    pub fn admit(&mut self) -> Result<()> {{
+{CODE_ADMIT}
+        Ok(())
+    }}
+
+    pub fn finalize(&mut self) -> Result<()> {{
+{CODE_FINALIZE}
+        Ok(())
+    }}
+}}
+"""
+
+
+def line_hash(line: str) -> str:
+    """Gate A's content binding: sha256 of the rstripped line, 12 hex chars.
+    Spelled out rather than imported so a fixture citation cannot inherit a
+    binding the gate stopped computing that way."""
+    return hashlib.sha256(line.rstrip().encode()).hexdigest()[:12]
+
+
+def line_number(root: Path, relative: str, text: str) -> int:
+    lines = (root / relative).read_text().splitlines()
+    matches = [index for index, line in enumerate(lines, start=1) if line == text]
+    if len(matches) != 1:
+        raise AssertionError(f"{relative}: {text!r} appears {len(matches)} times")
+    return matches[0]
+
+
+def cite(root: Path, relative: str, text: str, *, bind: str | None = "") -> str:
+    """A citation of a known line in one of the three shapes Gate A tells
+    apart: content-bound to the line as it stands (the default), unbound
+    (`bind=None`), or bound to the binding given."""
+    location = f"{relative}:{line_number(root, relative, text)}"
+    if bind is None:
+        return location
+    return f"{location}@sha256:{bind or line_hash(text)}"
+
+
+def ledger_text(root: Path) -> str:
+    """The ledger the fixture carries: every citation resolves under the
+    project root and carries the binding the current Gate A requires, so a
+    migration of this project is never blocked on ledger readiness."""
+    return (
+        "# Ledger\n"
+        "\n"
+        "## C-01\n"
+        f"- Intent S7 at `{cite(root, INTENT_FILE, INTENT_S7)}`; "
+        f"`code: {cite(root, CODE_FILE, CODE_ADMIT)}`\n"
+        "- **Depends on:** `kani: merkle_promotion_not_duplication`\n"
+        "\n"
+        "## C-02\n"
+        f"- Intent B18 at `{cite(root, INTENT_FILE, INTENT_B18)}`; "
+        f"`code: {cite(root, CODE_FILE, CODE_FINALIZE)}`\n"
+    )
+
+
+def code_only_ledger(root: Path, *prose: str) -> str:
+    """A Gate-A-clean ledger that cites code only and names no canonical
+    intent document, so the ledger elects no dispatch target and whatever
+    `prose` says is the only thing an election can read in it."""
+    lines = ["# Ledger", ""]
+    lines.extend(prose)
+    if prose:
+        lines.append("")
+    lines += [
+        "## C-01",
+        f"- `code: {cite(root, CODE_FILE, CODE_ADMIT)}`; "
+        "`kani: merkle_promotion_not_duplication`",
+    ]
+    return "\n".join(lines) + "\n"
+
 
 INTENT_STUB = """# Intent: dossier
 The canonical intent document is [`docs/intent.md`](../docs/intent.md). Read
@@ -279,11 +374,14 @@ def scaffold(root: Path) -> Path:
     historical directory the legacy layout used."""
     legacy = root / ".colosseum"
     (root / "docs").mkdir(parents=True, exist_ok=True)
-    (root / "docs" / "intent.md").write_text("# dossier intent\n\nS7. Roots stay canonical.\n")
+    (root / "docs" / "intent.md").write_text(INTENT_DOC)
+    code = root / CODE_FILE
+    code.parent.mkdir(parents=True, exist_ok=True)
+    code.write_text(CODE_DOC)
     (root / "proofs" / "lean").mkdir(parents=True, exist_ok=True)
     legacy.mkdir(parents=True, exist_ok=True)
     (legacy / "intent.md").write_text(INTENT_STUB)
-    (legacy / "ledger.md").write_text(LEDGER)
+    (legacy / "ledger.md").write_text(ledger_text(root))
     (legacy / "verified-inputs.txt").write_text(VERIFIED_INPUTS)
     write_json(legacy / "obligations.json", OBLIGATIONS)
     write_json(legacy / "g1-claims.json", G1_CLAIMS)
@@ -463,7 +561,7 @@ def check_mapping(tmp: Path) -> None:
     # Fallback: no ledger citation, so the legacy entrypoint is the target.
     plain = tmp / "plain"
     scaffold(plain)
-    (plain / ".colosseum/ledger.md").write_text("# Ledger\n\nNo citations.\n")
+    (plain / ".colosseum/ledger.md").write_text(code_only_ledger(plain))
     (plain / "docs/intent.md").unlink()
     code, report, err = report_of(plain, "--apply")
     artifact = artifact_of(report, ".colosseum/intent.md")
@@ -486,9 +584,10 @@ def check_mapping(tmp: Path) -> None:
     superseded = tmp / "intent-superseded"
     scaffold(superseded)
     (superseded / "docs/old-intent.md").write_text("# superseded\n")
-    (superseded / ".colosseum/ledger.md").write_text(
-        "# Ledger\n\nSuperseded: docs/old-intent.md, docs/old-intent.md, docs/old-intent.md.\n"
-        "Current: docs/intent.md.\n")
+    (superseded / ".colosseum/ledger.md").write_text(code_only_ledger(
+        superseded,
+        "Superseded: docs/old-intent.md, docs/old-intent.md, docs/old-intent.md.",
+        "Current: docs/intent.md."))
     code, report, err = report_of(superseded, "--apply")
     check("the pointer stub outranks every ledger mention",
           code == 0 and report["target_spec"] == "docs/intent.md"
@@ -497,17 +596,19 @@ def check_mapping(tmp: Path) -> None:
           f"exit={code} {report.get('target_spec')} {err[-160:]}")
 
     # Ambiguity is a refusal, not a vote, in whichever document decides.
-    for label, stub, ledger, source in (
+    for label, stub, prose, source in (
         ("stub", "# Intent\nSee `docs/intent.md` or `docs/old-intent.md`.\n",
-         "# Ledger\n\nNo citations.\n", ".colosseum/intent.md#intent"),
+         (), ".colosseum/intent.md#intent"),
         ("ledger", "# Intent\nThe canonical document is elsewhere.\n",
-         "# Ledger\n\nSee docs/intent.md and docs/old-intent.md.\n", ".colosseum/ledger.md#intent"),
+         ("See docs/intent.md and docs/old-intent.md.",),
+         ".colosseum/ledger.md#intent"),
     ):
         ambiguous = tmp / f"intent-ambiguous-{label}"
         scaffold(ambiguous)
         (ambiguous / "docs/old-intent.md").write_text("# other\n")
         (ambiguous / ".colosseum/intent.md").write_text(stub)
-        (ambiguous / ".colosseum/ledger.md").write_text(ledger)
+        (ambiguous / ".colosseum/ledger.md").write_text(
+            code_only_ledger(ambiguous, *prose))
         dry_code, dry_report, _ = report_of(ambiguous)
         code, report, _ = report_of(ambiguous, "--apply")
         row = artifact_of(report, source)
@@ -523,7 +624,7 @@ def check_mapping(tmp: Path) -> None:
     rootless = tmp / "intent-absent"
     scaffold(rootless)
     (rootless / ".colosseum/intent.md").unlink()
-    (rootless / ".colosseum/ledger.md").write_text("# Ledger\n\nNo citations.\n")
+    (rootless / ".colosseum/ledger.md").write_text(code_only_ledger(rootless))
     (rootless / "docs/intent.md").unlink()
     dry_code, dry_report, _ = report_of(rootless)
     code, report, _ = report_of(rootless, "--apply")
@@ -2181,6 +2282,255 @@ def check_killed_apply_residue(tmp: Path) -> None:
           str(sorted({path.split("/")[2] for path in after})))
 
 
+# --------------------------------------------------------------------------
+# ledger readiness: the current Gate A, not the one the project copied
+# --------------------------------------------------------------------------
+
+GATE_A_SOURCE = ".colosseum/ledger.md#gate-a"
+# One artifact row carrying an excerpt, not the gate's whole transcript. The
+# ceiling is the point: a row wide enough for a handful of truncated refusal
+# lines and the sentence that frames them, and no wider however many
+# citations the gate refused.
+DIAGNOSTIC_LIMIT = 3000
+LEGACY_GATE_COPY = ".colosseum/scripts/check_ledger_references.py"
+LEGACY_GATE_SOURCE = (
+    "#!/usr/bin/env python3\n"
+    '"""The project-local Gate A copy that predates the FV scripts: it read\n'
+    'the ledger for shape only, so an unbound or stale citation passed."""\n'
+    "raise SystemExit(0)\n"
+)
+
+
+def run_gate_a(project: Path) -> tuple[int, str]:
+    """The current extension gate over the legacy ledger, invoked the way the
+    migration's readiness check must invoke it: default strictness, `--root`
+    at the project."""
+    result = subprocess.run(
+        [sys.executable, str(GATE_A), str(project / ".colosseum/ledger.md"),
+         "--root", str(project)],
+        capture_output=True, text=True, timeout=300,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def gate_a_fragments(output: str) -> list[str]:
+    """Distinctive pieces of the gate's own first refusal line: the locator
+    and the explanation. The migrated diagnostic must quote the gate rather
+    than paraphrase it; which side of the em dash survives truncation is the
+    migration's business, so either counts."""
+    for line in output.splitlines():
+        if line.startswith("FAIL: "):
+            reason = line[len("FAIL: "):]
+            return [piece.strip()[:24] for piece in reason.split("\u2014")
+                    if len(piece.strip()) > 8]
+    return []
+
+
+def ledger_missing_hash(root: Path) -> str:
+    """Citations with no content binding: the shape a ledger written against
+    the older copied gate carries, since that gate required none."""
+    return (
+        "# Ledger\n\n## C-01\n"
+        f"- Intent S7 at `{cite(root, INTENT_FILE, INTENT_S7, bind=None)}`; "
+        f"`code: {cite(root, CODE_FILE, CODE_ADMIT, bind=None)}`\n"
+    )
+
+
+def ledger_stale_hash(root: Path) -> str:
+    """A citation bound to the line the file used to carry: still a binding,
+    no longer the content."""
+    return (
+        "# Ledger\n\n## C-01\n"
+        f"- Intent S7 at `{cite(root, INTENT_FILE, INTENT_S7)}`; "
+        f"`code: {cite(root, CODE_FILE, CODE_ADMIT, bind=line_hash(CODE_FINALIZE))}`\n"
+    )
+
+
+def ledger_comment_only(root: Path) -> str:
+    """A citation that resolves to a comment line: whatever enforcement it
+    named has moved, and the line it points at decides nothing."""
+    return (
+        "# Ledger\n\n## C-01\n"
+        f"- Intent S7 at `{cite(root, INTENT_FILE, INTENT_S7)}`; "
+        f"`code: {cite(root, CODE_FILE, CODE_COMMENT)}`\n"
+    )
+
+
+def ledger_prose_only(root: Path) -> str:
+    """A ledger with nothing to check at all: the copied gate's vacuous pass."""
+    return ("# Ledger\n\nEvery claim is discharged by the runs recorded under\n"
+            "`evidence/runs`. No citations.\n")
+
+
+def ledger_malformed_binding(root: Path) -> str:
+    """A binding that is not one: truncated hex, which the copied gate read as
+    prose and the current gate reads as drift it cannot check."""
+    return (
+        "# Ledger\n\n## C-01\n"
+        f"- Intent S7 at `{cite(root, INTENT_FILE, INTENT_S7)}`; "
+        f"`{cite(root, CODE_FILE, CODE_ADMIT, bind='abc123')}`\n"
+    )
+
+
+def ledger_many_failures(root: Path, count: int = 120) -> str:
+    """A ledger whose every citation is refused: one row must not carry one
+    diagnostic per refusal."""
+    lines = ["# Ledger", "", "## C-01"]
+    citation = cite(root, CODE_FILE, CODE_ADMIT, bind=None)
+    lines += [f"- `code: {citation}`" for _ in range(count)]
+    return "\n".join(lines) + "\n"
+
+
+def check_gate_a_readiness(tmp: Path) -> None:
+    """The migration runs the current Gate A over the legacy ledger before it
+    maps anything.
+
+    A legacy project carries its own copy of the gate under
+    `.colosseum/scripts/`, and that copy is older than the rules the current
+    one enforces: it accepted a citation with no content binding, a binding
+    that no longer matches, a citation into a comment, and a ledger with
+    nothing to check. Such a ledger is not migratable -- copied verbatim to
+    `.fv/ledger.md` it fails the first FV gate run against it -- so it blocks
+    with one bounded row instead of being rewritten here or landing as-is.
+    The fixture's own ledger passes, so readiness never blocks a clean tree.
+    """
+    clean = tmp / "gate-a-clean"
+    scaffold(clean)
+    gate_code, gate_out = run_gate_a(clean)
+    check("the fixture ledger passes the current Gate A as written",
+          gate_code == 0, gate_out[-400:])
+    dry_code, dry_report, dry_err = report_of(clean)
+    check("a Gate-A-clean legacy ledger migrates with no readiness row",
+          dry_code == 0 and dry_report.get("status") == "ok"
+          and artifact_of(dry_report, GATE_A_SOURCE) is None,
+          f"exit={dry_code} {dry_report.get('unsupported')} {dry_err[-200:]}")
+    apply_code, apply_report, apply_err = report_of(clean, "--apply")
+    mapped = artifact_of(apply_report, ".colosseum/ledger.md")
+    check("a Gate-A-clean ledger is still mapped verbatim to .fv/ledger.md",
+          apply_code == 0 and mapped is not None
+          and mapped["classification"] == MAPPED
+          and mapped["destination"] == ".fv/ledger.md"
+          and (clean / ".fv/ledger.md").read_text()
+          == (clean / ".colosseum/ledger.md").read_text(),
+          f"exit={apply_code} {mapped} {apply_err[-200:]}")
+
+    for label, build in (
+        ("missing-hash", ledger_missing_hash),
+        ("stale-hash", ledger_stale_hash),
+        ("comment-only", ledger_comment_only),
+        ("prose-only", ledger_prose_only),
+        ("malformed-binding", ledger_malformed_binding),
+    ):
+        root = tmp / f"gate-a-{label}"
+        scaffold(root)
+        copied_gate = root / LEGACY_GATE_COPY
+        copied_gate.write_text(LEGACY_GATE_SOURCE)
+        ledger = root / ".colosseum/ledger.md"
+        ledger.write_text(build(root))
+        legacy_before = tree_digest(root / ".colosseum")
+        project_before = tree_digest(root)
+
+        copied = subprocess.run(
+            [sys.executable, str(copied_gate), str(ledger), "--root", str(root)],
+            capture_output=True, text=True, timeout=300)
+        check(f"{label}: the project's own copied gate accepts this ledger",
+              copied.returncode == 0, f"exit={copied.returncode}")
+        gate_code, gate_out = run_gate_a(root)
+        check(f"{label}: the current Gate A refuses this ledger",
+              gate_code == 1, f"exit={gate_code} {gate_out[-300:]}")
+        fragments = gate_a_fragments(gate_out)
+
+        for mode, flags in (("dry run", ()), ("apply", ("--apply",))):
+            code, report, err = report_of(root, *flags)
+            row = artifact_of(report, GATE_A_SOURCE)
+            detail = (row or {}).get("detail") or ""
+            ledger_row = artifact_of(report, ".colosseum/ledger.md")
+            sources = [entry["source"] for entry in report.get("artifacts", [])]
+            check(f"{label}: the {mode} is blocked on ledger readiness",
+                  code == 1 and report.get("status") == "blocked"
+                  and row is not None and row["classification"] == UNSUPPORTED
+                  and row.get("destination") is None,
+                  f"exit={code} {row} {err[-200:]}")
+            check(f"{label}: the {mode} sources the block at {GATE_A_SOURCE}",
+                  any(GATE_A_SOURCE in entry for entry in report.get("unsupported", [])),
+                  str(report.get("unsupported"))[:300])
+            check(f"{label}: the {mode} diagnostic is bounded",
+                  0 < len(detail) <= DIAGNOSTIC_LIMIT, f"{len(detail)} chars")
+            check(f"{label}: the {mode} diagnostic quotes the gate's refusal",
+                  bool(fragments) and any(piece in detail for piece in fragments),
+                  f"{fragments} :: {detail[:200]}")
+            check(f"{label}: the {mode} proposes no .fv/ledger.md write",
+                  not any(write["path"] == ".fv/ledger.md"
+                          for write in report.get("writes", [])),
+                  str([w for w in report.get("writes", []) if "ledger" in w["path"]]))
+            check(f"{label}: the refused ledger is still classified exactly once",
+                  sources.count(".colosseum/ledger.md") == 1
+                  and ledger_row is not None
+                  and ledger_row["classification"] != MAPPED,
+                  str(ledger_row))
+            check(f"{label}: the {mode} writes nothing at all",
+                  not (root / ".fv").exists() and tree_digest(root) == project_before)
+            check(f"{label}: the {mode} leaves the legacy tree byte-identical",
+                  tree_digest(root / ".colosseum") == legacy_before)
+
+    # Boundedness has to bite: the row must not grow with the number of
+    # refusals, or a ledger whose every citation is unbound turns one report
+    # row into the gate's whole transcript. The two ledgers below differ in
+    # nothing but how many times the same refused citation appears, so the
+    # comparison isolates the count from the length of a refusal line.
+    few = tmp / "gate-a-few-failures"
+    scaffold(few)
+    (few / ".colosseum/ledger.md").write_text(ledger_many_failures(few, count=2))
+    small = (artifact_of(report_of(few)[1], GATE_A_SOURCE) or {}).get("detail") or ""
+
+    many = tmp / "gate-a-many-failures"
+    scaffold(many)
+    (many / ".colosseum/ledger.md").write_text(ledger_many_failures(many))
+    gate_code, gate_out = run_gate_a(many)
+    code, report, err = report_of(many)
+    rows = [entry for entry in report.get("artifacts", [])
+            if entry["source"] == GATE_A_SOURCE]
+    detail = rows[0]["detail"] if rows else ""
+    check("a ledger of refused citations blocks on exactly one readiness row",
+          gate_code == 1 and code == 1 and report.get("status") == "blocked"
+          and len(rows) == 1, f"gate={gate_code} exit={code} rows={len(rows)} {err[-200:]}")
+    check("the diagnostic does not grow with the number of refusals",
+          0 < len(small) and 0 < len(detail) <= DIAGNOSTIC_LIMIT
+          and len(detail) <= 3 * len(small)
+          and len(detail) < len(gate_out) // 3,
+          f"two refusals {len(small)} chars, {len(gate_out)} of gate output "
+          f"reported as {len(detail)}")
+
+    # Infrastructure, not a verdict: a ledger the gate cannot read is a
+    # failure of the check, so it blocks without claiming the bytes were
+    # judged. Injected as a ledger that is not UTF-8, which is what the real
+    # legacy trees produced when an editor wrote one region in latin-1.
+    unreadable = tmp / "gate-a-unreadable"
+    scaffold(unreadable)
+    (unreadable / ".colosseum/ledger.md").write_bytes(
+        "# Ledger\n\n## C-01\n- `code: ".encode()
+        + cite(unreadable, CODE_FILE, CODE_ADMIT).encode()
+        + b"`  \xff\xfe reviewed by M\xfcller\n")
+    legacy_before = tree_digest(unreadable / ".colosseum")
+    project_before = tree_digest(unreadable)
+    for mode, flags in (("dry run", ()), ("apply", ("--apply",))):
+        code, report, err = report_of(unreadable, *flags)
+        row = artifact_of(report, GATE_A_SOURCE)
+        detail = (row or {}).get("detail") or ""
+        check(f"a ledger the gate cannot read blocks the {mode}",
+              code == 1 and report.get("status") == "blocked"
+              and row is not None and row["classification"] == UNSUPPORTED,
+              f"exit={code} {row} {err[-200:]}")
+        check(f"the {mode} diagnostic stays bounded when the check cannot run",
+              0 < len(detail) <= DIAGNOSTIC_LIMIT, f"{len(detail)} chars")
+        check(f"the {mode} quotes no verdict the gate never reached",
+              "GATE FAILED" not in detail and "FAIL:" not in detail, detail[:200])
+        check(f"the {mode} on an unreadable ledger writes nothing",
+              not (unreadable / ".fv").exists()
+              and tree_digest(unreadable) == project_before
+              and tree_digest(unreadable / ".colosseum") == legacy_before)
+
+
 def check_cli(tmp: Path) -> None:
     root = tmp / "cli"
     scaffold(root)
@@ -2223,6 +2573,8 @@ def main() -> int:
         check_plan(tmp)
         print("unsupported artifacts")
         check_unsupported(tmp)
+        print("ledger readiness")
+        check_gate_a_readiness(tmp)
         print("apply and idempotency")
         check_apply_and_idempotency(tmp)
         print("conflicts")

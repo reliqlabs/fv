@@ -41,6 +41,11 @@ What this suite holds the migration to:
   * a required legacy layer that cannot be translated blocks the run:
     dry-run reports it unsupported and writes nothing instead of
     downgrading it to history;
+  * the legacy ledger is run against the current Gate A before anything is
+    mapped: strip the content bindings the project's own copied gate under
+    `.colosseum/scripts/` never required and the migration blocks with one
+    bounded `.colosseum/ledger.md#gate-a` row, writing nothing, rather than
+    copying a ledger no FV gate accepts into `.fv/ledger.md`;
   * every obligation the manifest declares is keyed by an id
     `fv_evidence_run` accepts, so a migrated claim is dischargeable with no
     post-migration rename, while the exact legacy `<layer>:<name>` target
@@ -106,6 +111,11 @@ HISTORY_ROOT = ".fv/history/colosseum"
 # hard kill leaves the tree behind, so the snapshot must exclude it.
 STAGING_ROOT = ".fv/.migrate-staging"
 STAGING_EXCLUSION = ".fv/.migrate-staging/"
+# The readiness row a ledger the current Gate A refuses must produce, and the
+# ceiling on the diagnostic it carries: a handful of truncated refusal lines
+# and the sentence framing them, never the gate's transcript.
+GATE_A_SOURCE = ".colosseum/ledger.md#gate-a"
+DIAGNOSTIC_LIMIT = 3000
 PROFILE = "dossier-bounded-composition/v1"
 ENVIRONMENT_POLICY = (
     "single-host observation, unrecorded environment (TA-07); every layer ran "
@@ -960,6 +970,72 @@ def check_blocked_before_writes(root: Path, project: Path) -> None:
     check("blocked apply writes no .fv tree at all", not (copy / ".fv").exists())
 
 
+def strip_content_bindings(text: str) -> str:
+    """The ledger shape the project's own copied gate accepted: citations with
+    no `@sha256` binding, because that copy never required one."""
+    return re.sub(r"@sha256:[0-9a-f]{12}", "", text)
+
+
+def check_gate_a_readiness(root: Path, project: Path) -> None:
+    """A ledger the copied gate accepted and the current Gate A refuses blocks.
+
+    The dossier project carries its own `check_ledger_references.py` under
+    `.colosseum/scripts/`, and that copy predates the content-binding
+    requirement: it exits 0 on a ledger whose citations carry no `@sha256`
+    suffix. Migrating such a ledger would land it at `.fv/ledger.md` as a
+    ledger the first FV gate run against the migrated project rejects, so
+    readiness is checked against the current gate before anything is mapped
+    -- and reported, not repaired, since rewriting a trust artifact is not a
+    migration.
+    """
+    pristine = run(["python3", str(GATE_A), str(project / ".colosseum" / "ledger.md"),
+                    "--root", str(project)])
+    check("the legacy ledger passes the current Gate A as written",
+          pristine.returncode == 0, (pristine.stdout + pristine.stderr)[-400:])
+
+    copy = root / "gate-a-unbound"
+    shutil.copytree(project, copy, symlinks=True)
+    ledger = copy / ".colosseum" / "ledger.md"
+    ledger.write_text(strip_content_bindings(ledger.read_text()))
+    legacy_hash = tree_hash(copy / ".colosseum")
+    before = file_map(copy)
+
+    copied_gate = copy / ".colosseum" / "scripts" / "check_ledger_references.py"
+    accepted = run(["python3", str(copied_gate), str(ledger), "--root", str(copy)])
+    check("the project's own copied gate accepts the unbound ledger",
+          accepted.returncode == 0, f"exit={accepted.returncode}")
+    refused = run(["python3", str(GATE_A), str(ledger), "--root", str(copy)])
+    transcript = refused.stdout + refused.stderr
+    check("the current Gate A refuses the unbound ledger",
+          refused.returncode == 1, f"exit={refused.returncode} {transcript[-300:]}")
+
+    for label, flags in (("dry-run", ()), ("apply", ("--apply",))):
+        result, report = migrate_json(copy, *flags)
+        rows = {entry["source"]: entry for entry in report.get("artifacts", [])}
+        row = rows.get(GATE_A_SOURCE, {})
+        detail = str(row.get("detail") or "")
+        check(f"{label}: the migration is blocked on ledger readiness",
+              result.returncode == 1 and report.get("status") == "blocked"
+              and row.get("classification") == "unsupported"
+              and row.get("destination") is None,
+              f"exit={result.returncode} {report.get('status')} {row}")
+        check(f"{label}: the block is sourced at {GATE_A_SOURCE}",
+              any(GATE_A_SOURCE in str(entry) for entry in report.get("unsupported", [])),
+              str(report.get("unsupported"))[:300])
+        check(f"{label}: the diagnostic is a bounded excerpt of the gate output",
+              0 < len(detail) <= DIAGNOSTIC_LIMIT and len(detail) < len(transcript),
+              f"{len(detail)} chars against {len(transcript)} of gate output")
+        check(f"{label}: the refused ledger is never mapped to .fv/ledger.md",
+              not any(entry["path"] == ".fv/ledger.md"
+                      for entry in report.get("writes", []))
+              and rows.get(".colosseum/ledger.md", {}).get("classification") != "mapped",
+              str(rows.get(".colosseum/ledger.md")))
+        check(f"{label}: nothing is written and no legacy byte moves",
+              not (copy / ".fv").exists() and file_map(copy) == before
+              and tree_hash(copy / ".colosseum") == legacy_hash,
+              sorted(set(file_map(copy)) ^ set(before))[:5])
+
+
 def mutate_layer_run(copy: Path, layer: str, changes: dict) -> None:
     """Rewrite one run of a copied legacy layer-runs manifest."""
     path = copy / ".colosseum" / "evidence" / "runs" / "layer-runs.json"
@@ -1696,6 +1772,7 @@ def main() -> int:
         print("\n── dry run ──────────────────────────────────────────────")
         dry_report = check_dry_run(project, colosseum_hash)
         check_blocked_before_writes(root, project)
+        check_gate_a_readiness(root, project)
         check_untranslatable_required_layer(root, project)
         check_intent_election(root, project)
         check_write_containment(root, project, colosseum_hash)

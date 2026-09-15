@@ -248,7 +248,12 @@ A **shadow migration** brings a pre-FV `.colosseum` project under FV without
 touching it: `scripts/fv_migrate.py PROJECT [--apply]` reads the legacy tree,
 writes only under `.fv/`, and leaves `.colosseum/` byte-identical as the
 auditable original for everything the translation cannot carry. Dry run is the
-default. Every legacy file is classified exactly once as `mapped`,
+default. Before proposing `.fv/ledger.md`, the migrator runs the current Gate A
+against the legacy ledger at default strictness. A rejection or checker
+infrastructure failure becomes one bounded `.colosseum/ledger.md#gate-a`
+unsupported row and blocks dry-run/apply without rewriting citations. Legacy
+ledgers must therefore meet the FV citation contract before their trust claims
+can be mapped live. Every legacy file is classified exactly once as `mapped`,
 `preserved-history`, or `unsupported`, and any `unsupported` row or
 destination conflict blocks the run rather than producing a partial `.fv/`.
 

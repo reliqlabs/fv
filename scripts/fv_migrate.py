@@ -33,7 +33,8 @@ INVENTORY
     whole.
 
     mapped
-        `.colosseum/ledger.md`                  -> `.fv/ledger.md` (verbatim)
+        `.colosseum/ledger.md`                  -> `.fv/ledger.md` (verbatim,
+                                                   Gate A permitting)
         `.colosseum/intent.md`                  -> the dispatch target
         `.colosseum/obligations.json`           -> `.fv/obligations.json`
         `.colosseum/g1-claims.json`             -> `.fv/obligations.json`
@@ -55,9 +56,10 @@ INVENTORY
         a non-regular or unreadable file, a directory that cannot be listed,
         an unknown or malformed legacy schema, a malformed claim, a legacy
         verification layer no plan execution can carry, a claim whose
-        `required_evidence` no migrated execution can produce, an ambiguous or
-        absent dispatch target, or a destination that already exists with
-        different content.
+        `required_evidence` no migrated execution can produce, a ledger the
+        extension's current Gate A refuses or cannot be run against, an
+        ambiguous or absent dispatch target, or a destination that already
+        exists with different content.
 
 DISPATCH TARGET
     The canonical intent is elected from the legacy pointer stub first and
@@ -72,6 +74,35 @@ DISPATCH TARGET
     for any gate, producer, or skill. The elected spec is a top-level
     `target_spec` field of the report, not only a sentence inside a detail
     string, so a dry-run consumer can check the decision.
+
+LEDGER READINESS
+    `.fv/ledger.md` is the legacy ledger's bytes unchanged, and Gate A
+    resolves a citation against the project root from either location, so
+    whether the migrated project can pass Gate A is already decided by bytes
+    that exist before anything is written. It is decided here: when
+    `.colosseum/ledger.md` exists, the extension's own current
+    `scripts/check_ledger_references.py` is run over it with `--root PROJECT`
+    at default strictness, and only exit 0 permits the mapping. The gate is
+    loaded from its own path and called in-process, never through a shell: a
+    stale copy earlier on `sys.path` -- a project's own `.fv/scripts/` copy
+    is exactly that -- must not be what decides readiness, and the answer
+    must not depend on the cwd, on an interpreter on PATH, or on quoting.
+
+    A nonzero exit the gate returns is a rejection of the ledger. Anything
+    that stops it from returning a status at all -- a missing or unimportable
+    script, an unreadable or non-UTF-8 ledger, a CLI that no longer accepts
+    those two arguments -- is an infrastructure failure of the check, and the
+    two are reported as what they are instead of being merged into one
+    verdict: the second says nothing about the ledger's bytes. Both add one
+    `.colosseum/ledger.md#gate-a` unsupported row carrying a bounded excerpt
+    of the gate's own output -- capped in lines and in line length, with
+    machine paths redacted, so the JSON report stays byte-identical across
+    checkouts -- and both block before any `.fv` write is proposed. Neither
+    rewrites anything: this is readiness validation, not ledger repair, and
+    the refused ledger's bytes still reach
+    `.fv/history/colosseum/ledger.md`. The remedy is in the refusal --
+    content-bind the citations, re-root one written relative to
+    `.colosseum/`, then re-run.
 
 OBLIGATIONS
     Legacy `obligations.json` carries only `{claim_id, required}`; the
@@ -238,7 +269,10 @@ APPLY
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -406,6 +440,51 @@ OBLIGATIONS_NOTE = (
     "fv-evidence-run/v3 record binds it."
 )
 
+# The migrated `.fv/ledger.md` is byte-identical to the legacy ledger, so
+# whether the migrated project can pass Gate A is already decided by bytes
+# that exist. It is decided here, against the extension's own current gate,
+# instead of being discovered afterwards by a project whose first gate run
+# fails on a ledger this migration presented as mapped.
+#
+# The gate is loaded from this path and called in-process. By path, not by
+# module name: a stale `check_ledger_references.py` earlier on `sys.path` --
+# a project's own `.fv/scripts/` copy, which is exactly what `fv_doctor`
+# exists to catch, is one -- must never be what decides readiness. In
+# process, not through a shell or an interpreter on PATH: the answer then
+# depends on no cwd, no `python3` resolution, no quoting, and the diagnostic
+# is a value rather than two streams to reassemble.
+GATE_A_SCRIPT = REPO / "scripts" / "check_ledger_references.py"
+# The gate is run exactly as CI runs it: the ledger, the project root the
+# citations resolve against, and default strictness. `--strict-kani` would
+# hold a migration to a bar the project's own CI does not, and
+# `--suggest-hashes` only adds output.
+GATE_A_ROOT_FLAG = "--root"
+GATE_A_FRAGMENT = "gate-a"
+# The gate ran and accepted the ledger / ran and refused it / could not be
+# run at all. The last is an infrastructure failure of the check, never a
+# verdict about the bytes, and says so in its row.
+GATE_A_PASSED = "passed"
+GATE_A_REJECTED = "rejected"
+GATE_A_UNAVAILABLE = "unavailable"
+# The name the gate is loaded under. Deliberately not `check_ledger_references`:
+# the readiness check binds one file, and an import elsewhere in this process
+# must neither be served this module nor shadow it.
+GATE_A_MODULE = "fv_migrate_gate_a"
+# A report row is not the gate's transcript: enough of the refusal to act
+# on, then a count of the rest. Each embedded line is capped too, since a
+# FAIL line quotes a cited source line of any length, and the whole
+# diagnostic is one line of one detail string.
+GATE_A_DIAGNOSTIC_LINES = 8
+GATE_A_DIAGNOSTIC_LINE_CHARS = 240
+GATE_A_DIAGNOSTIC_JOIN = " | "
+GATE_A_TRUNCATED = "..."
+# Lines that state a refusal, and the line that states a non-blocking gap.
+# In a row whose whole subject is the refusal the gate's counts header is
+# noise, so it is dropped whenever a refusal line is present; on a pass the
+# warnings are the only part of the output the row keeps.
+GATE_A_REFUSAL_PREFIXES = ("FAIL:", "FATAL:", "GATE FAILED")
+GATE_A_WARNING_PREFIX = "WARN:"
+
 
 class MigrationError(Exception):
     """The legacy tree cannot be inventoried: no report can be produced."""
@@ -418,6 +497,165 @@ def sha256_bytes(data: bytes) -> str:
 def canonical_json(document: object) -> bytes:
     """Deterministic pretty JSON bytes, stable across runs and platforms."""
     return (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+_gate_a: object | None = None
+
+
+def _load_gate_a() -> object:
+    """The extension's current Gate A module, executed once per process.
+
+    Registered in `sys.modules` before it runs, as an import statement would:
+    the gate declares a `@dataclass`, and `dataclasses` resolves the defining
+    class's module through `sys.modules`. Under its own name, so an
+    unqualified `check_ledger_references` import anywhere in this process is
+    neither served this module nor able to shadow it.
+
+    Executed with bytecode writing off: importing a file writes a `.pyc`
+    beside it, and when the project being migrated *is* the extension
+    repository that is a write outside `.fv/` performed by a readiness check
+    whose whole contract is that it only reads.
+    """
+    global _gate_a
+    if _gate_a is None:
+        spec = importlib.util.spec_from_file_location(GATE_A_MODULE, GATE_A_SCRIPT)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"{GATE_A_SCRIPT} is not an importable Python module")
+        module = importlib.util.module_from_spec(spec)
+        written = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        sys.modules[GATE_A_MODULE] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            # A half-executed module must not be left visible, or a retry
+            # would be served the wreckage instead of re-running the load.
+            sys.modules.pop(GATE_A_MODULE, None)
+            raise
+        finally:
+            sys.dont_write_bytecode = written
+        _gate_a = module
+    return _gate_a
+
+
+def _describe(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
+
+
+def _redact_paths(text: str, root: Path) -> str:
+    """Machine paths out of text this report embeds.
+
+    The gate names the root it resolved against and the files it could not
+    read, both absolute. An absolute machine path in a captured report is the
+    one thing the report's `project_root: "."` rule keeps out, and it is also
+    what would make two runs of one fixture in two checkouts disagree.
+    """
+    for form in sorted({str(root), str(root.resolve()), str(REPO)}, key=len, reverse=True):
+        text = text.replace(form + "/", "").replace(form, ".")
+    return text
+
+
+def gate_output_lines(output: str, root: Path) -> list[str]:
+    """One gate run's captured output as nonblank, path-redacted lines."""
+    return [
+        line
+        for line in (raw.strip() for raw in _redact_paths(output, root).splitlines())
+        if line
+    ]
+
+
+def _capped(text: str) -> str:
+    """One line of embedded diagnostic: whitespace collapsed, length bounded.
+
+    Collapsed because a detail string is one line and an exception message is
+    not always one line; bounded because nothing here -- a quoted source
+    line, a `SyntaxError` body -- has a length this script controls.
+    """
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= GATE_A_DIAGNOSTIC_LINE_CHARS:
+        return collapsed
+    return collapsed[:GATE_A_DIAGNOSTIC_LINE_CHARS] + GATE_A_TRUNCATED
+
+
+def bounded_diagnostic(lines: list[str], *, empty: str) -> str:
+    """`lines` as one capped fragment of one detail string, in the gate's order."""
+    kept = [_capped(line) for line in lines[:GATE_A_DIAGNOSTIC_LINES]]
+    dropped = len(lines) - len(kept)
+    if dropped:
+        kept.append(f"(+{dropped} more gate output line(s), not embedded here)")
+    return GATE_A_DIAGNOSTIC_JOIN.join(kept) or empty
+
+
+def _gate_output(stdout: io.StringIO, stderr: io.StringIO, root: Path) -> str:
+    """Both captured streams as one bounded diagnostic fragment."""
+    return bounded_diagnostic(
+        gate_output_lines(stdout.getvalue() + stderr.getvalue(), root), empty="none")
+
+
+def run_gate_a(ledger: Path, root: Path) -> tuple[str, str]:
+    """Run the extension's current Gate A over `ledger` with `root` as root.
+
+    Returns one of the three `GATE_A_*` outcomes and a bounded diagnostic.
+    Exit 0 is a pass. Any other exit status the gate *returns* is a rejection:
+    it read the ledger and refused it, which is a statement about the bytes.
+    Everything that stops the gate from returning a status at all -- the
+    script missing or unimportable, an unreadable or non-UTF-8 ledger, a CLI
+    that no longer accepts these two arguments, any other exception -- is
+    `unavailable`: the check failed, and reporting that as a ledger verdict
+    would be inventing one. Both non-pass outcomes block the migration; only
+    one of them is about the ledger.
+
+    `main()` is argparse-driven, so the invocation is an argv. It is built
+    here rather than tokenized from a string, and both paths are absolute, so
+    the gate's answer does not depend on this process's cwd.
+    """
+    try:
+        gate = _load_gate_a()
+    except Exception as error:  # OSError, SyntaxError, ImportError, ...
+        return GATE_A_UNAVAILABLE, _capped(_redact_paths(
+            f"{GATE_A_SCRIPT.name} could not be loaded ({_describe(error)})", root))
+    stdout, stderr = io.StringIO(), io.StringIO()
+    argv = [GATE_A_SCRIPT.name, str(ledger), GATE_A_ROOT_FLAG, str(root)]
+    saved, sys.argv = sys.argv, argv
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = gate.main()
+    except SystemExit as exit_status:
+        # `main()` returns its status; an exit raised out of it is argparse
+        # refusing this invocation, so it is the gate's CLI that moved, not
+        # the ledger that failed. Its usage text went to the captured stderr.
+        return GATE_A_UNAVAILABLE, (
+            f"{GATE_A_SCRIPT.name} exited with "
+            f"{_capped(repr(exit_status.code))} instead of returning a status: it no longer "
+            f"accepts `<ledger> {GATE_A_ROOT_FLAG} <root>` (output before the exit: "
+            f"{_gate_output(stdout, stderr, root)})"
+        )
+    except Exception as error:
+        return GATE_A_UNAVAILABLE, (
+            _capped(_redact_paths(f"{GATE_A_SCRIPT.name} raised {_describe(error)}", root))
+            + f" (output before the failure: {_gate_output(stdout, stderr, root)})"
+        )
+    finally:
+        sys.argv = saved
+    if not isinstance(status, int) or isinstance(status, bool):
+        return GATE_A_UNAVAILABLE, (
+            f"{GATE_A_SCRIPT.name} returned {_capped(repr(status))}, which is not an exit "
+            f"status (output: {_gate_output(stdout, stderr, root)})"
+        )
+    lines = gate_output_lines(stdout.getvalue() + stderr.getvalue(), root)
+    if status == 0:
+        # A pass embeds what the gate warned about and nothing else: its
+        # counts header and its verdict line say nothing the mapping row does
+        # not already say, while a warning names coverage the migrated project
+        # is missing.
+        return GATE_A_PASSED, bounded_diagnostic(
+            [line for line in lines if line.startswith(GATE_A_WARNING_PREFIX)], empty="none")
+    # A refusal embeds the refusals. The fallback keeps a gate that failed
+    # without a recognizable failure line from reporting nothing at all.
+    refusals = [line for line in lines if line.startswith(GATE_A_REFUSAL_PREFIXES)] or lines
+    return GATE_A_REJECTED, (
+        f"exit status {status}; {bounded_diagnostic(refusals, empty='no output')}"
+    )
 
 
 @dataclass(frozen=True)
@@ -795,14 +1033,45 @@ class Migration:
         data = self._read_bytes(relative)
         if data is None:
             return
+        # Readiness, before the mapping is proposed rather than after it is
+        # written: `.fv/ledger.md` is these bytes, and the gate resolves a
+        # citation against the project root from either location, so the
+        # answer for the destination is the answer for the source. A run that
+        # mapped a ledger the current gate refuses would hand over a project
+        # whose first CI run fails on a file this report called migrated.
+        outcome, diagnostic = run_gate_a(self.project / relative, self.project)
+        if outcome == GATE_A_REJECTED:
+            self._unsupported(
+                f"{relative}#{GATE_A_FRAGMENT}",
+                f"the extension's current Gate A ({GATE_A_SCRIPT.name}, default strictness, "
+                f"{GATE_A_ROOT_FLAG} the project root) refuses this ledger: {diagnostic}. The "
+                "migrated .fv/ledger.md would be these same bytes checked against the same "
+                "root, so the migrated project would fail its first gate run here. This "
+                "migration validates readiness and never rewrites a ledger: fix the citations "
+                f"in {relative} -- content-bind them, re-root one written relative to "
+                f"{LEGACY_DIRNAME}/, drop one that cites nothing -- and re-run",
+            )
+            return
+        if outcome != GATE_A_PASSED:
+            self._unsupported(
+                f"{relative}#{GATE_A_FRAGMENT}",
+                f"the extension's current Gate A could not be run against this ledger, so its "
+                f"readiness is unknown: {diagnostic}. That is an infrastructure failure of the "
+                "check, not a verdict on the ledger bytes: repair the check and re-run. The "
+                "migration blocks rather than mapping a ledger nothing confirmed, and the "
+                f"legacy {LEGACY_DIRNAME}/ tree is left exactly as it was",
+            )
+            return
         self._plan_write(".fv/ledger.md", data)
         self._mapped(
             relative,
             ".fv/ledger.md",
-            "legacy ledger, verbatim: the bytes are preserved exactly, so any citation written "
-            f"relative to {LEGACY_DIRNAME}/ still points where it did and now resolves from "
-            ".fv/ledger.md instead. Gate A reports such a citation as unresolvable rather than "
-            "reading it as prose, so re-rooting them is the first post-migration edit",
+            "legacy ledger, verbatim: the bytes are preserved exactly, and the extension's "
+            f"current Gate A ({GATE_A_SCRIPT.name}, default strictness) accepts them against "
+            f"this project root, so .fv/ledger.md starts gate-clean (gate warnings: "
+            f"{diagnostic}). A citation written relative to {LEGACY_DIRNAME}/ resolves from "
+            "neither location and would have blocked this migration instead of migrating into "
+            "a ledger that fails its first gate run",
             verbatim=True,
         )
 

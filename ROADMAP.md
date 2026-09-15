@@ -368,7 +368,10 @@ Delivered:
   `.colosseum/` byte-identical. Ledger, intent (including an external canonical
   intent reached through a legacy pointer stub), joined
   `obligations.json` + `g1-claims.json` → `system_claims`, and recorded layer
-  runs → a verification plan are mapped; everything else is preserved history;
+  runs → a verification plan are mapped. A legacy ledger is mapped only when
+  the current Gate A accepts it; a rejection or checker failure is a bounded
+  `#gate-a` unsupported row and blocks before any write. Everything else is
+  preserved history;
   anything untranslatable is `unsupported` and blocks the run before any write.
   A legacy layer named in a `system_claim.required_evidence` — `quint` included
   — migrates as a custom layer rather than being dropped. Obligation and claim
