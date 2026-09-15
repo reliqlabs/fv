@@ -396,21 +396,51 @@ def check_toolchain(report: Report, project: Path, omp_command: str = "omp") -> 
         models = {item["selector"]: item for item in json.loads(catalog.stdout)["models"]}
         registry = json.loads((REPO / "registry" / "voices.json").read_text())
         canonical = next(item for item in registry["profiles"] if item["name"] == "canonical-4")
+        voices = {item["id"]: item for item in registry["voices"]}
+        panel = json.loads((REPO / "templates" / "omp-panel.json").read_text())["profiles"]["large-project"]
+        seats = {item["declared_family"]: item for item in panel["seats"]}
         errors = []
-        for seat in canonical["voices"]:
-            voice = next(item for item in registry["voices"] if item["id"] == seat["id"])
-            live = models.get(voice["omp_model"])
-            if live is None:
-                errors.append(f"{voice['id']}: model unavailable ({voice['omp_model']})")
+        fallbacks = []
+        for route in canonical["voices"]:
+            voice = voices[route["id"]]
+            seat = seats[voice["family"]]
+            candidates = seat.get("candidates")
+            if not isinstance(candidates, list) or not candidates:
+                errors.append(f"{voice['id']}: no configured candidates")
                 continue
-            expected_ladder = voice.get("omp_thinking_ladder")
-            if expected_ladder is not None and live.get("thinking") != expected_ladder:
+            selected = next((candidate for candidate in candidates if candidate in models), None)
+            if selected is None:
+                errors.append(f"{voice['id']}: no candidate available ({candidates})")
+                continue
+            live_ladder = models[selected].get("thinking")
+            level = seat.get("thinking_level")
+            if not isinstance(live_ladder, list) or not live_ladder:
+                errors.append(f"{voice['id']}: selected candidate has no thinking ladder ({selected})")
+                continue
+            if "max" in live_ladder:
+                max_index = live_ladder.index("max")
+                expected_level = live_ladder[max_index - 1] if max_index > 0 else "max"
+            else:
+                expected_level = live_ladder[-1]
+            if level != expected_level:
                 errors.append(
-                    f"{voice['id']}: thinking ladder live={live.get('thinking')!r} expected={expected_ladder!r}"
+                    f"{voice['id']}: thinking level={level!r} expected={expected_level!r} "
+                    f"for selected candidate {selected} ladder={live_ladder!r}"
                 )
+            if selected == voice["omp_model"]:
+                recorded_ladder = voice.get("omp_thinking_ladder")
+                if recorded_ladder is not None and live_ladder != recorded_ladder:
+                    errors.append(
+                        f"{voice['id']}: thinking ladder live={live_ladder!r} expected={recorded_ladder!r}"
+                    )
+            else:
+                fallbacks.append(f"{voice['id']}->{selected}")
+        detail = "canonical panel candidates and thinking policies available"
+        if fallbacks:
+            detail += f"; fallbacks={fallbacks}"
         report.add("toolchain", "omp-model-contract", "fail" if errors else "ok",
-                   "; ".join(errors) if errors else "canonical models and thinking ladders available")
-    except (KeyError, StopIteration, json.JSONDecodeError) as error:
+                   "; ".join(errors) if errors else detail)
+    except (KeyError, StopIteration, TypeError, json.JSONDecodeError) as error:
         report.add("toolchain", "omp-model-contract", "fail", f"invalid OMP model catalog: {error}")
 
 

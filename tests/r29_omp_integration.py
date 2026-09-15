@@ -132,11 +132,18 @@ def main() -> int:
         registry = json.loads((REPO / "registry" / "voices.json").read_text())
         canonical = next(profile for profile in registry["profiles"] if profile["name"] == "canonical-4")
         voices = {voice["id"]: voice for voice in registry["voices"]}
+        # Exercise the same candidate fallback Gula uses: the canonical
+        # synthetic GLM route is absent, while the profile's second candidate
+        # is available with its provider-specific ladder.
         catalog = {"models": [
             {"selector": voices[seat["id"]]["omp_model"],
              "thinking": voices[seat["id"]].get("omp_thinking_ladder")}
-            for seat in canonical["voices"]
+            for seat in canonical["voices"] if seat["id"] != "glm-5.2"
         ]}
+        catalog["models"].append({
+            "selector": "fireworks/glm-5.2",
+            "thinking": ["low", "high", "max"],
+        })
         bom = json.loads((REPO / "bom.json").read_text())
         required_contract = bom["omp_contract"]
         contract = {
@@ -178,6 +185,10 @@ def main() -> int:
         check("doctor accepts additive bridge capabilities",
               any(item["name"] == "omp-agent-bridge-contract" and item["status"] == "ok"
                   for item in checked_report["findings"]), checked.stdout)
+        check("doctor accepts the first available canonical panel candidate",
+              any(item["name"] == "omp-model-contract" and item["status"] == "ok"
+                      and "glm-5.2->fireworks/glm-5.2" in item["detail"]
+                      for item in checked_report["findings"]), checked.stdout)
 
         missing_capability = dict(contract)
         missing_capability.pop("perCallTimeout")
