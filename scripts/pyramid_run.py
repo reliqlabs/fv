@@ -82,13 +82,25 @@ VERIFICATION PLANS (--plan, fv-verification-plan/v1)
         On the `fuzz` layer it also names the fuzz surface whose measured
         duration feeds the C8 fuzz-time floor.
       * `floors` is not plannable: it is computed from .fv/floors.json, and a
-        declared command could not enforce the C8 baseline.
-    Plan-declared layers run in the canonical pyramid order (LAYER_ORDER),
-    independent of their order in the file. Every invocation in a layer runs
-    (a layer is one evidence cohort); the layer fails when any invocation
-    exits non-zero or times out. `required: true` adds a layer to the gating
-    set; `required: false` is non-gating but never un-requires a layer the
-    profile already requires — a plan can only tighten the verdict.
+        declared command could not enforce the C8 baseline. It is the only
+        reserved layer id.
+      * any other id the pyramid does not know names a CUSTOM layer, and must
+        match PLAN_CUSTOM_ID ([A-Za-z0-9][A-Za-z0-9._:+/-]*). A custom layer
+        has no built-in default — it exists only because the plan declares it
+        (`quint`, `mutation`, `sanitizers`, ...) — and its executions get
+        exactly the same argv/cwd/timeout/env validation, execution and report
+        shape as a known layer's.
+    Known plan-declared layers run in the canonical pyramid order
+    (LAYER_ORDER), then custom layers run in lexical order, both independent
+    of their order in the file (see plan_layer_order). Every invocation in a
+    layer runs (a layer is one evidence cohort); the layer fails when any
+    invocation exits non-zero or times out. `required: true` adds a layer to
+    the gating set — a custom layer included, which is how a tool outside the
+    Rust pyramid becomes a G2 gate; `required: false` is non-gating but never
+    un-requires a layer the profile already requires: a plan can only tighten
+    the verdict. A types failure invalidates everything downstream, so every
+    required or declared layer that has not run — custom layers included — is
+    recorded not_run.
     Layers the plan does not name keep every built-in default, and without
     --plan the runner is byte-for-byte the legacy runner.
 
@@ -106,6 +118,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -116,7 +129,8 @@ PROFILES: dict[str, list[str]] = {
 }
 
 # Canonical layer order: the pyramid runs cheapest-first and a types failure
-# invalidates everything below it. Plan-declared layers execute in this order.
+# invalidates everything below it. Plan-declared known layers execute in this
+# order; plan-declared custom layers execute after them, lexically.
 LAYER_ORDER: tuple[str, ...] = (
     "types", "lints", "proptests", "fuzz", "floors", "kani", "verus", "lean",
 )
@@ -124,9 +138,17 @@ LAYER_ORDER: tuple[str, ...] = (
 PLAN_SCHEMA = "fv-verification-plan/v1"
 PLAN_RELATIVE = ".fv/verification-plan.json"
 
-# `floors` is computed from .fv/floors.json (C8), so it is not plannable.
+# `floors` is computed from .fv/floors.json (C8), so it is reserved: it can be
+# neither declared as a known layer nor reused as a custom layer id.
+PLAN_RESERVED_LAYERS: tuple[str, ...] = ("floors",)
+
+# The known (built-in) plannable layers.
 PLAN_LAYERS: tuple[str, ...] = tuple(
-    name for name in LAYER_ORDER if name != "floors")
+    name for name in LAYER_ORDER if name not in PLAN_RESERVED_LAYERS)
+
+# Any other layer id is a custom layer: a project-declared tool the pyramid
+# has no default for. Ids stay filesystem-, JSON- and report-key-safe.
+PLAN_CUSTOM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]*")
 
 _PLAN_TOP_KEYS = ("schema", "layers")
 _PLAN_LAYER_KEYS = ("required", "executions")
@@ -339,6 +361,17 @@ class PlanError(ValueError):
     """Any rejection of a verification plan's schema, layers, or executions."""
 
 
+def plan_layer_order(names: Iterable[str]) -> list[str]:
+    """Execution/report order for a set of layer ids: the known pyramid layers
+    in LAYER_ORDER (cheapest-first, types gating everything below it), then the
+    custom layers lexically. Lexical is the only total order available for ids
+    the pyramid knows nothing about, and it keeps runs and reports
+    deterministic regardless of the plan file's key order."""
+    unique = set(names)
+    return [*(name for name in LAYER_ORDER if name in unique),
+            *sorted(name for name in unique if name not in LAYER_ORDER)]
+
+
 def _plan_cwd(root: Path, raw: object, where: str) -> str:
     """Validate a declared repo-relative cwd; return its normalized form.
 
@@ -415,7 +448,8 @@ def parse_plan(document: object, root: Path, source: str = "<plan>") -> dict:
     """Validate a fv-verification-plan/v1 document against the crate `root`.
 
     Returns {"schema", "source", "layers"} where `layers` is ordered by
-    LAYER_ORDER regardless of the document's key order. Pure apart from the
+    plan_layer_order — known layers in LAYER_ORDER, then custom layers
+    lexically — regardless of the document's key order. Pure apart from the
     directory-existence checks on each declared cwd."""
     root = Path(root).resolve()
     if not isinstance(document, dict):
@@ -434,14 +468,18 @@ def parse_plan(document: object, root: Path, source: str = "<plan>") -> dict:
     for name in declared:
         if name in PLAN_LAYERS:
             continue
-        reason = (" (floors is computed from .fv/floors.json, not declared)"
-                  if name == "floors" else "")
-        raise PlanError(f"{source}: layer {name!r} is not plannable{reason}; "
-                        f"allowed {list(PLAN_LAYERS)}")
+        if name in PLAN_RESERVED_LAYERS:
+            raise PlanError(
+                f"{source}: layer {name!r} is not plannable (it is computed "
+                f"from .fv/floors.json, not declared); known layers "
+                f"{list(PLAN_LAYERS)}")
+        if not isinstance(name, str) or not PLAN_CUSTOM_ID.fullmatch(name):
+            raise PlanError(
+                f"{source}: custom layer id {name!r} is malformed; expected "
+                f"{PLAN_CUSTOM_ID.pattern} or a known layer "
+                f"{list(PLAN_LAYERS)}")
     layers: dict[str, dict] = {}
-    for name in LAYER_ORDER:
-        if name not in declared:
-            continue
+    for name in plan_layer_order(declared):
         spec = declared[name]
         where = f"{source}: layers.{name}"
         if not isinstance(spec, dict):
@@ -502,8 +540,9 @@ def main() -> int:
     ap.add_argument("--plan", type=Path, default=None,
                     help=f"{PLAN_SCHEMA} document (conventionally "
                          f"{PLAN_RELATIVE}) declaring per-layer argv/cwd/"
-                         "timeout_seconds/env; layers it does not name keep "
-                         "their built-in defaults")
+                         "timeout_seconds/env, for known pyramid layers and "
+                         "for custom layers the plan names itself; layers it "
+                         "does not name keep their built-in defaults")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -534,12 +573,12 @@ def main() -> int:
     has_fuzz = (crate / "fuzz").is_dir()
     if has_fuzz and "fuzz" not in required:
         required.insert(3, "fuzz")  # fuzz is required exactly when harnesses exist
-    # A plan may only widen the gating set: `required: true` adds a layer,
-    # `required: false` never un-requires a layer the profile already requires.
+    # A plan may only widen the gating set: `required: true` adds a layer —
+    # custom layers included — and `required: false` never un-requires a layer
+    # the profile already requires.
     planned = [name for name, spec in plan_layers.items() if spec["required"]]
     if planned:
-        gating = set(required) | set(planned)
-        required = [layer for layer in LAYER_ORDER if layer in gating]
+        required = plan_layer_order(set(required) | set(planned))
 
     layers: dict[str, dict] = {}
     statuses: dict[str, str] = {}
@@ -586,7 +625,7 @@ def main() -> int:
     cargo_layer("types", ["cargo", "check", "--quiet"])
     if statuses.get("types") == "failed":
         # Compilation failure invalidates everything downstream.
-        for layer in [*required, *plan_layers]:
+        for layer in plan_layer_order([*required, *plan_layers]):
             if layer not in statuses:
                 record(layer, "not_run", "types layer failed")
     else:
@@ -662,6 +701,13 @@ def main() -> int:
             record("lean", "not_run",
                    "Aeneas extraction + lean_axiom_gate.py are agent-flow layers; "
                    "the headless runner cannot supply them")
+
+        # Custom layers have no built-in default — the plan is their only
+        # definition — so they run exactly as declared, after every known
+        # pyramid layer, in lexical order (plan_layers is already ordered).
+        for layer in plan_layers:
+            if layer not in LAYER_ORDER:
+                plan_layer(layer)
 
     verdict, code = aggregate_verdict(args.profile, required, statuses)
 

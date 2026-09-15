@@ -32,6 +32,13 @@ canonical layer order, exact argv/cwd/env delivery, multi-invocation layer
 failure, required-layer aggregation, and that a plan file sitting on disk stays
 inert without --plan.
 
+The custom-layer half covers plan-declared layers the pyramid has no default
+for (`quint`, `mutation`): id acceptance/rejection, execution after every known
+layer in lexical order, exact argv/cwd/env delivery and report shape,
+required:true joining the G2 gating set (and required:false never gating),
+--skip, and a types failure marking every required or declared custom layer
+not_run without running an invocation.
+
 Requires cargo. Exit 0 pass, 1 fail, 2 toolchain unavailable.
 """
 from __future__ import annotations
@@ -251,26 +258,57 @@ def test_plan_pure(mod) -> None:
             execution.update(kwargs)
             return {"types": {"required": True, "executions": [execution]}}
 
-        # The shipped example is a valid plan, ordered canonically on load.
+        # The shipped example is a valid plan, ordered canonically on load:
+        # known pyramid layers first, then its custom layers lexically
+        # (the file declares `quint` before `mutation`).
         example = mod.load_plan(PLAN_EXAMPLE, REPO)
         check("example plan: validates against the shipped schema",
               example["schema"] == PLAN_SCHEMA
               and list(example["layers"]) == ["types", "lints", "proptests",
-                                              "fuzz", "kani"],
+                                              "fuzz", "kani", "mutation",
+                                              "quint"],
               str(list(example["layers"])))
         check("example plan: multi-invocation layer keeps its declared order",
               [e["argv"][1] for e in example["layers"]["lints"]["executions"]]
               == ["clippy", "fmt"],
               str(example["layers"]["lints"]["executions"]))
+        check("example plan: custom quint layer is required and keeps its "
+              "declared invocation order",
+              example["layers"]["quint"]["required"] is True
+              and [e["argv"][1] for e in example["layers"]["quint"]["executions"]]
+              == ["typecheck", "verify"],
+              str(example["layers"]["quint"]))
 
-        # Deterministic layer order, independent of the document's key order.
-        plan = mod.parse_plan({"layers": {"lean": {"required": False,
+        # Deterministic layer order, independent of the document's key order:
+        # known layers by LAYER_ORDER, custom layers lexically after them.
+        plan = mod.parse_plan({"layers": {"quint": {"required": True,
+                                                    "executions": [
+                                                        {"argv": ["true"], "cwd": ".",
+                                                         "timeout_seconds": 5}]},
+                                          "lean": {"required": False,
                                                    "executions": [
                                                        {"argv": ["true"], "cwd": ".",
                                                         "timeout_seconds": 5}]},
+                                          "mutation": {"required": False,
+                                                       "executions": [
+                                                           {"argv": ["true"],
+                                                            "cwd": ".",
+                                                            "timeout_seconds": 5}]},
                                           **one()}}, root)
-        check("plan: layers ordered by the canonical pyramid order",
-              list(plan["layers"]) == ["types", "lean"], str(list(plan["layers"])))
+        check("plan: known layers ordered by the canonical pyramid order, "
+              "custom layers lexically after them",
+              list(plan["layers"]) == ["types", "lean", "mutation", "quint"],
+              str(list(plan["layers"])))
+        check("plan_layer_order: known layers canonical, custom lexical",
+              mod.plan_layer_order(["quint", "lean", "mutation", "types",
+                                    "quint"])
+              == ["types", "lean", "mutation", "quint"],
+              str(mod.plan_layer_order(["quint", "lean", "mutation", "types"])))
+        check("plan: custom layer executions validate like known ones",
+              plan["layers"]["quint"]["executions"][0]
+              == {"argv": ["true"], "cwd": ".", "timeout_seconds": 5,
+                  "env": {}, "evidence_tool": None},
+              str(plan["layers"]["quint"]["executions"][0]))
         check("plan: absent schema defaults to the current version",
               plan["schema"] == PLAN_SCHEMA, plan["schema"])
 
@@ -296,10 +334,24 @@ def test_plan_pure(mod) -> None:
                 {"layers": {"floors": {"required": True, "executions": [
                     {"argv": ["true"], "cwd": ".", "timeout_seconds": 5}]}}}, root,
                 "not plannable")
-        rejects("plan: unknown layer name rejected",
-                {"layers": {"miri": {"required": True, "executions": [
-                    {"argv": ["true"], "cwd": ".", "timeout_seconds": 5}]}}}, root,
-                "'miri' is not plannable")
+        # A layer id the pyramid does not know names a custom layer: accepted
+        # when it matches PLAN_CUSTOM_ID, rejected otherwise. `floors` stays
+        # reserved (asserted above) and can never be reused as a custom id.
+        for custom in ("quint", "mutation", "tla+", "spec:core", "a.b-c/d", "Q7"):
+            accepted = mod.parse_plan(
+                {"layers": {custom: {"required": True, "executions": [
+                    {"argv": ["true"], "cwd": ".", "timeout_seconds": 5}]}}}, root)
+            check(f"plan: custom layer id {custom!r} accepted",
+                  list(accepted["layers"]) == [custom]
+                  and accepted["layers"][custom]["required"] is True,
+                  str(accepted["layers"]))
+        for malformed in ("", "-lead", ".lead", "has space", "quint\n", "q$x",
+                          "sp\0ec"):
+            rejects(f"plan: malformed custom layer id {malformed!r} rejected",
+                    {"layers": {malformed: {"required": True, "executions": [
+                        {"argv": ["true"], "cwd": ".",
+                         "timeout_seconds": 5}]}}}, root,
+                    f"custom layer id {malformed!r} is malformed")
         rejects("plan: non-boolean required rejected",
                 {"layers": {"types": {"required": "yes", "executions": [
                     {"argv": ["true"], "cwd": ".", "timeout_seconds": 5}]}}}, root,
@@ -596,6 +648,173 @@ def test_runner() -> None:
               f"{st} {subs}")
 
 
+def test_custom_plan_layers() -> None:
+    print("custom plan layers (ids the pyramid has no built-in default for)")
+    with tempfile.TemporaryDirectory(prefix="r28-custom-") as td:
+        tmp = Path(td)
+
+        def fixture(name: str) -> tuple[Path, Path]:
+            crate = tmp / name
+            shutil.copytree(MINICRATE, crate)
+            (crate / "probe.py").write_text(PROBE)
+            return crate, tmp / f"{name}.log"
+
+        def records(log: Path) -> list[dict]:
+            if not log.is_file():
+                return []
+            return [json.loads(line) for line in log.read_text().splitlines()]
+
+        def labels(log: Path) -> list[str]:
+            return [r["label"] for r in records(log)]
+
+        def known(crate: Path, log: Path, types_code: int = 0) -> dict:
+            return {
+                "types": {"required": True,
+                          "executions": [probe(crate, log, "types",
+                                               code=types_code)]},
+                "lints": {"required": True,
+                          "executions": [probe(crate, log, "lints")]},
+                "proptests": {"required": True,
+                              "executions": [probe(crate, log, "proptests")]},
+            }
+
+        # Exact execution + ordering + report shape. Declared custom-first and
+        # quint-before-mutation on purpose: execution order is known layers in
+        # pyramid order, then custom layers lexically.
+        crate, log = fixture("custom")
+        plan, document = write_plan(crate, {
+            "quint": {"required": True, "executions": [
+                probe(crate, log, "quint-a",
+                      env={"FV_PLAN_DECLARED": "quint-value"},
+                      tool="quint-verify"),
+                probe(crate, log, "quint-b", cwd="src")]},
+            "mutation": {"required": False,
+                         "executions": [probe(crate, log, "mutation", code=2)]},
+            **known(crate, log),
+        })
+        code, out = run(crate, "tested", "--plan", str(plan))
+        report = latest_report(crate)
+        recs = records(log)
+        check("custom run: known layers run first, then custom layers lexically",
+              [r["label"] for r in recs] == ["types", "lints", "proptests",
+                                             "mutation", "quint-a", "quint-b"],
+              str([r["label"] for r in recs]))
+        declared = document["layers"]["quint"]["executions"]
+        first = next(r for r in recs if r["label"] == "quint-a")
+        second = next(r for r in recs if r["label"] == "quint-b")
+        check("custom run: custom child receives exactly the declared argv",
+              first["argv"] == declared[0]["argv"][1:], str(first["argv"]))
+        check("custom run: declared env reaches the custom child, merged over "
+              "the ambient environment",
+              first["declared"] == "quint-value"
+              and first["inherited_path"] is True, str(first))
+        check("custom run: custom invocation honours its declared cwd",
+              second["cwd"] == str((crate / "src").resolve()), second["cwd"])
+        check("custom run: declared env does not leak into the sibling "
+              "custom invocation",
+              second["declared"] is None, str(second["declared"]))
+        quint = report["layers"]["quint"]
+        executions = quint["detail"]["executions"]
+        check("custom run: custom layer uses the known plan report shape",
+              quint["status"] == "passed"
+              and quint["detail"]["plan"] is True
+              and quint["detail"]["required"] is True
+              and [e["command"] for e in executions]
+              == [e["argv"] for e in declared]
+              and executions[0]["env"] == {"FV_PLAN_DECLARED": "quint-value"}
+              and executions[0]["evidence_tool"] == "quint-verify"
+              and executions[0]["timeout_seconds"] == 120
+              and executions[1]["cwd"] == "src"
+              and quint["detail"]["durations"].keys() == {"quint-verify"},
+              str(quint))
+        check("custom run: report carries the custom layers in the plan "
+              "provenance",
+              list(report["plan"]["layers"]) == ["types", "lints", "proptests",
+                                                 "mutation", "quint"],
+              str(list(report["plan"]["layers"])))
+        check("custom run: required:true custom layer joins required_layers "
+              "after every known layer",
+              report["required_layers"] == ["types", "lints", "proptests",
+                                            "floors", "quint"],
+              str(report["required_layers"]))
+        check("custom run: required:false custom layer runs but never gates",
+              code == 0 and "VERIFIED[tested]" in out
+              and report["layers"]["mutation"]["status"] == "failed"
+              and "mutation" not in report["required_layers"],
+              f"exit={code} required={report['required_layers']}")
+
+        # A required custom layer is a real G2 gate, and every invocation in it
+        # runs (one evidence cohort) even after one fails.
+        crate, log = fixture("customfail")
+        plan, _ = write_plan(crate, {
+            **known(crate, log),
+            "quint": {"required": True, "executions": [
+                probe(crate, log, "quint-a", tool="quint-typecheck"),
+                probe(crate, log, "quint-b", code=1, tool="quint-verify")]},
+            "mutation": {"required": False,
+                         "executions": [probe(crate, log, "mutation")]},
+        })
+        code, out = run(crate, "tested", "--plan", str(plan))
+        report = latest_report(crate)
+        codes = [e["returncode"]
+                 for e in report["layers"]["quint"]["detail"]["executions"]]
+        check("custom run: failing required custom layer gates FAILED, exit 1",
+              code == 1 and "FAILED" in out
+              and report["layers"]["quint"]["status"] == "failed"
+              and "quint" in report["required_layers"],
+              f"exit={code} required={report['required_layers']}")
+        check("custom run: every invocation of a custom layer runs; any "
+              "non-zero fails the layer",
+              codes == [0, 1]
+              and labels(log) == ["types", "lints", "proptests", "mutation",
+                                  "quint-a", "quint-b"],
+              f"{codes} {labels(log)}")
+
+        # --skip on a required custom layer is a visible gating gap.
+        crate, log = fixture("customskip")
+        plan, _ = write_plan(crate, {
+            **known(crate, log),
+            "quint": {"required": True,
+                      "executions": [probe(crate, log, "quint-a")]},
+            "mutation": {"required": False,
+                         "executions": [probe(crate, log, "mutation")]},
+        })
+        code, out = run(crate, "tested", "--plan", str(plan), "--skip", "quint")
+        report = latest_report(crate)
+        check("custom run: --skip on a required custom layer is INCOMPLETE, "
+              "exit 3",
+              code == 3 and "INCOMPLETE" in out
+              and report["layers"]["quint"]["status"] == "skipped",
+              f"exit={code} {report['layers']['quint']['status']}")
+        check("custom run: a skipped custom layer runs no invocation, siblings "
+              "still run",
+              labels(log) == ["types", "lints", "proptests", "mutation"],
+              str(labels(log)))
+
+        # A types failure invalidates everything downstream, custom layers
+        # included: required and declared alike are not_run, never skipped-past.
+        crate, log = fixture("customtypes")
+        plan, _ = write_plan(crate, {
+            **known(crate, log, types_code=1),
+            "quint": {"required": True,
+                      "executions": [probe(crate, log, "quint-a")]},
+            "mutation": {"required": False,
+                         "executions": [probe(crate, log, "mutation")]},
+        })
+        code, out = run(crate, "tested", "--plan", str(plan))
+        report = latest_report(crate)
+        check("custom run: types failure marks required and declared custom "
+              "layers not_run",
+              code == 1 and "FAILED" in out
+              and report["layers"]["quint"]["status"] == "not_run"
+              and report["layers"]["quint"]["detail"] == "types layer failed"
+              and report["layers"]["mutation"]["status"] == "not_run",
+              f"exit={code} "
+              f"{ {k: v['status'] for k, v in report['layers'].items()} }")
+        check("custom run: no custom invocation runs after a types failure",
+              labels(log) == ["types"], str(labels(log)))
+
+
 def main() -> int:
     mod = load_runner()
     test_pure(mod)
@@ -607,6 +826,7 @@ def main() -> int:
         return 2
     test_runner()
     test_plan_runner()
+    test_custom_plan_layers()
 
     print()
     if FAILURES:

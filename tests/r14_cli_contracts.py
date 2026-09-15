@@ -10,8 +10,11 @@ advertises the flags `bom.json` records and still reports its pinned version.
 The local half asserts the CLI contracts this repo's own scripts owe their
 callers — currently `pyramid_run.py --plan`, whose fv-verification-plan/v1
 input is validated fail-closed before any layer runs (a bad plan is ERROR,
-exit 2, never a silently-legacy run). Local scripts are not BOM-pinned tools,
-so their contracts are asserted here directly.
+exit 2, never a silently-legacy run). That includes custom layer ids: a plan
+may name a layer the pyramid has no default for (`quint`), but the id must
+match the documented pattern and may not be a reserved id (`floors`). Local
+scripts are not BOM-pinned tools, so their contracts are asserted here
+directly.
 """
 from __future__ import annotations
 
@@ -68,6 +71,8 @@ def check_pyramid_plan_cli() -> None:
     check("`pyramid_run.py` supports --plan", "--plan" in help_text)
     check("`pyramid_run.py --plan` names its schema in --help",
           PLAN_SCHEMA in help_text)
+    check("`pyramid_run.py --plan` advertises custom layers in --help",
+          "custom layers" in help_text)
 
     with tempfile.TemporaryDirectory(prefix="r14-plan-") as td:
         root = Path(td)
@@ -108,6 +113,14 @@ def check_pyramid_plan_cli() -> None:
                      "executions": [{"argv": ["true"], "cwd": ".",
                                      "timeout_seconds": 5}]}}},
                  "not plannable")
+        for malformed in ("-quint", "qu int", "quint$"):
+            rejected(f"`--plan`: malformed custom layer id {malformed!r} "
+                     "rejected as ERROR",
+                     {"schema": PLAN_SCHEMA, "layers": {malformed: {
+                         "required": True,
+                         "executions": [{"argv": ["true"], "cwd": ".",
+                                         "timeout_seconds": 5}]}}},
+                     f"custom layer id {malformed!r} is malformed")
 
         plan.write_text("{not json")
         code, output = run_runner(crate, "--plan", str(plan))

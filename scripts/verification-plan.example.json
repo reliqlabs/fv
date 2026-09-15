@@ -63,6 +63,34 @@
           "evidence_tool": "cargo-kani"
         }
       ]
+    },
+    "quint": {
+      "required": true,
+      "executions": [
+        {
+          "argv": ["quint", "typecheck", "spec/protocol.qnt"],
+          "cwd": ".",
+          "timeout_seconds": 300,
+          "evidence_tool": "quint-typecheck"
+        },
+        {
+          "argv": ["quint", "verify", "spec/protocol.qnt", "--invariant", "agreement"],
+          "cwd": ".",
+          "timeout_seconds": 3600,
+          "evidence_tool": "quint-verify"
+        }
+      ]
+    },
+    "mutation": {
+      "required": false,
+      "executions": [
+        {
+          "argv": ["cargo", "mutants", "--no-shuffle"],
+          "cwd": ".",
+          "timeout_seconds": 5400,
+          "evidence_tool": "cargo-mutants"
+        }
+      ]
     }
   }
 }
