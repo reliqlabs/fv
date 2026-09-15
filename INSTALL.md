@@ -140,10 +140,16 @@ The doctor fails for missing extension configuration, package MCP wiring, packag
 ## CI
 
 ```bash
-python3 scripts/ci.py
+# Required only when `omp` is not on PATH and CI validates a source checkout.
+export OMP_SOURCE=/absolute/path/to/oh-my-pi
+uv run --script scripts/ci.py
 ```
 
-CI is strict by default. `INCOMPLETE` fails. Use `--tolerate-incomplete` only on runners intentionally missing proof toolchains.
+R32 imports OMP's real panel resolver from `OMP_SOURCE`, or derives the same
+checkout from the `omp` executable on `PATH`. If neither is available, that
+suite reports `INCOMPLETE` rather than testing against a stand-in. CI is strict
+by default, so `INCOMPLETE` fails. Use `--tolerate-incomplete` only on runners
+intentionally missing proof toolchains.
 
 Historical files under `calibration/` retain their original transport provenance. Do not use archived commands as current installation instructions.
 
