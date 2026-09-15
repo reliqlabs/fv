@@ -1,0 +1,68 @@
+{
+  "schema": "fv-verification-plan/v1",
+  "layers": {
+    "types": {
+      "required": true,
+      "executions": [
+        {
+          "argv": ["cargo", "check", "--quiet", "--all-targets"],
+          "cwd": ".",
+          "timeout_seconds": 900,
+          "env": { "CARGO_TERM_COLOR": "never" },
+          "evidence_tool": "cargo-check"
+        }
+      ]
+    },
+    "lints": {
+      "required": true,
+      "executions": [
+        {
+          "argv": ["cargo", "clippy", "--quiet", "--all-targets", "--", "-D", "warnings"],
+          "cwd": ".",
+          "timeout_seconds": 900,
+          "evidence_tool": "cargo-clippy"
+        },
+        {
+          "argv": ["cargo", "fmt", "--check"],
+          "cwd": ".",
+          "timeout_seconds": 120,
+          "evidence_tool": "cargo-fmt"
+        }
+      ]
+    },
+    "proptests": {
+      "required": true,
+      "executions": [
+        {
+          "argv": ["cargo", "test", "--quiet", "--all-features"],
+          "cwd": ".",
+          "timeout_seconds": 1800,
+          "env": { "PROPTEST_CASES": "1024" },
+          "evidence_tool": "cargo-test"
+        }
+      ]
+    },
+    "fuzz": {
+      "required": true,
+      "executions": [
+        {
+          "argv": ["cargo", "fuzz", "run", "parse_input", "--", "-max_total_time=60"],
+          "cwd": ".",
+          "timeout_seconds": 600,
+          "evidence_tool": "parse_input"
+        }
+      ]
+    },
+    "kani": {
+      "required": false,
+      "executions": [
+        {
+          "argv": ["cargo", "kani", "--harness", "proof_roundtrip"],
+          "cwd": ".",
+          "timeout_seconds": 3600,
+          "evidence_tool": "cargo-kani"
+        }
+      ]
+    }
+  }
+}

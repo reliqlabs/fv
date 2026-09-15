@@ -18,6 +18,13 @@ regex, not just trivially green on already-clean fixtures), and checks
 the M5 versioned-envelope input shape is accepted identically to a bare
 list.
 
+It also exercises the system_claim obligation kind: a system claim is
+always part of the manifest-derived required set, is covered only when
+every required_evidence tool ID PASSed in its record's execution cohort,
+and reports an evidence gap or a dependency gap rather than a bare PASS
+when it is not. Those cases are built in a temporary directory, so this
+suite owns them without editing the shared m1 fixture set.
+
 No external toolchain required. Exit 0 pass, 1 fail.
 """
 from __future__ import annotations
@@ -26,6 +33,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -72,6 +80,86 @@ def row(dashboard: dict, claim_id: str) -> dict:
         if r["claim_id"] == claim_id:
             return r
     raise KeyError(claim_id)
+
+
+# ── system-claim fixture builders ───────────────────────────────────────
+# Built here rather than in tests/fixtures/m1 so this suite can vary one
+# dimension per case (which cohort tool PASSed, which dependency held)
+# without multiplying shared fixture files.
+
+SYSTEM_MANIFEST = {
+    "version": 1,
+    "invariants": [{"id": "B1", "name": "inv_b1"}],
+    "witnesses": [{"id": "W1", "name": "witness_w1"}],
+    "system_claims": [{
+        "id": "SC1",
+        "name": "claim_end_to_end",
+        "depends_on": ["B1", "W1"],
+        "required_evidence": ["quint", "kani"],
+    }],
+}
+
+
+def execution(tool: str, result: str) -> dict:
+    """One v3 cohort entry, shaped as the evidence producer writes it."""
+    return {
+        "tool": tool,
+        "evidence_class": "bounded-checked",
+        "command": [tool, "verify"],
+        "cwd": ".",
+        "toolchain_digests": {"executable": f"/usr/bin/{tool}",
+                              "sha256": "4" * 64, "version": "1.0.0",
+                              "version_exit_code": 0},
+        "raw_output_path": f".fv/evidence/{tool}.txt",
+        "raw_output_hash": "5" * 64,
+        "result": result,
+        "run_id": f"m1-system-{tool}",
+    }
+
+
+def record(claim_id: str, *, result: str = "PASS",
+           evidence_class: str = "bounded-checked",
+           executions: list[dict] | None = None) -> dict:
+    bindings = {
+        "source_snapshot": "aaaaaaa1+worktree-clean",
+        "intent_hash": "1" * 64,
+        "obligation_manifest_hash": "2" * 64,
+        "profile": "bounded",
+        "required_targets": ["B1", "W1", "SC1"],
+        "environment_policy": "z2-worktree",
+        "toolchain_digests": {"quint": "0.32.0"},
+        "command": f"verify {claim_id}",
+        "configuration": {"max_steps": 10},
+        "seeds": None,
+        "raw_output_hash": "3" * 64,
+        "parser_schema_version": "quint-cli-0.32",
+        "run_id": f"m1-system-{claim_id}",
+    }
+    if executions is not None:
+        bindings["executions"] = executions
+    return {"claim_id": claim_id, "required": True,
+            "evidence_class": evidence_class, "result": result,
+            "scope": f"scope for {claim_id}", "bindings": bindings,
+            "waiver": None}
+
+
+def write_json(path: Path, payload: object) -> Path:
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def system_records(tmp: Path, name: str, *,
+                   b1: str = "PASS", w1: str = "PASS",
+                   cohort: list[dict] | None = None,
+                   claim_result: str = "PASS",
+                   include_claim: bool = True) -> Path:
+    """A records file for the SYSTEM_MANIFEST obligations, varying the
+    dependency results and the system claim's execution cohort."""
+    records = [record("B1", result=b1),
+               record("W1", result=w1, evidence_class="test-witnessed")]
+    if include_claim:
+        records.append(record("SC1", result=claim_result, executions=cohort))
+    return write_json(tmp / f"{name}.json", records)
 
 
 def main() -> int:
@@ -241,6 +329,200 @@ def main() -> int:
         check(f"no drift vs semantic gate ({label})",
               dj.get("verdict") == gv,
               f"dashboard={dj.get('verdict')} gate={gv}")
+
+    # ── (h) system claims are reported, and only pass on a full cohort ──
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        sys_manifest = write_json(tmp / "obligations-system.json", SYSTEM_MANIFEST)
+        full_cohort = [execution("quint", "PASS"), execution("kani", "PASS")]
+
+        # fully covered: every required_evidence tool PASSed, both
+        # dependencies hold.
+        covered = system_records(tmp, "covered", cohort=full_cohort)
+        code, d_sc, err_sc = run_json(covered, "--manifest", str(sys_manifest))
+        check("system claim joins the manifest-derived required set",
+              d_sc.get("required_claims") == ["B1", "W1", "SC1"],
+              f"required={d_sc.get('required_claims')}")
+        check("system claim carries obligation_kind 'system_claim'",
+              d_sc.get("obligation_kinds", {}).get("SC1") == "system_claim")
+        sc1 = row(d_sc, "SC1")
+        check("fully-covered system claim -> status PASS", sc1["status"] == "PASS",
+              f"status={sc1['status']}")
+        check("fully-covered system claim: per-tool coverage all PASS",
+              sc1["evidence_coverage"] == {"quint": "PASS", "kani": "PASS"})
+        check("fully-covered system claim: no evidence gaps",
+              sc1["evidence_gaps"] == [] and sc1["non_passing_executions"] == [])
+        check("fully-covered system claim: dependencies covered, none unevaluated",
+              sc1["dependency_gaps"] == []
+              and sc1["dependencies_not_evaluated"] == [])
+        check("fully-covered system claim -> exit 0, scoped VERIFIED[...]",
+              code == 0 and d_sc.get("verdict", "").startswith("VERIFIED["),
+              f"rc={code} verdict={d_sc.get('verdict')}")
+        check("fully-covered system claim counted in summary.system_claims",
+              d_sc["summary"]["system_claims"]["total"] == 1
+              and d_sc["summary"]["system_claims"]["covered"] == ["SC1"])
+        check("system claim appears in summary.by_obligation_kind",
+              d_sc["summary"]["by_obligation_kind"].get("system_claim")
+              == {"pass": 1, "fail": 0, "gap": 0})
+
+        # coverage gap: a required tool never ran.
+        partial = system_records(tmp, "partial-cohort",
+                                 cohort=[execution("quint", "PASS")])
+        code, d_gap, err_gap = run_json(partial, "--manifest", str(sys_manifest))
+        gap_row = row(d_gap, "SC1")
+        check("required tool with no execution -> status evidence-gap, not PASS",
+              gap_row["status"] == "evidence-gap", f"status={gap_row['status']}")
+        check("missing tool named in evidence_gaps",
+              gap_row["evidence_gaps"] == ["kani"])
+        check("missing tool's observed result is 'no-execution'",
+              gap_row["evidence_coverage"] == {"quint": "PASS",
+                                               "kani": "no-execution"})
+        check("evidence gap -> exit 3 INCOMPLETE (a gap is never a pass)",
+              code == 3 and d_gap.get("verdict") == "INCOMPLETE",
+              f"rc={code} verdict={d_gap.get('verdict')}")
+        check("evidence gap counted in summary.evidence_gap",
+              d_gap["summary"]["evidence_gap"] == 1)
+        check("evidence gap listed in summary.system_claims.evidence_gaps",
+              d_gap["summary"]["system_claims"]["evidence_gaps"]
+              == {"SC1": ["kani"]}
+              and d_gap["summary"]["system_claims"]["covered"] == [])
+
+        # coverage gap: a required tool ran and did not PASS.
+        failed_tool = system_records(
+            tmp, "failed-tool",
+            cohort=[execution("quint", "PASS"), execution("kani", "FAIL")])
+        code, d_ft, _ = run_json(failed_tool, "--manifest", str(sys_manifest))
+        ft_row = row(d_ft, "SC1")
+        check("required tool FAIL inside a PASS record -> evidence-gap",
+              ft_row["status"] == "evidence-gap")
+        check("failed required tool's observed result is surfaced, not hidden",
+              ft_row["evidence_coverage"]["kani"] == "FAIL"
+              and ft_row["evidence_gaps"] == ["kani"]
+              and ft_row["non_passing_executions"] == ["kani"])
+        check("failed cohort member -> INCOMPLETE bucket, never FAILED",
+              code == 3 and d_ft.get("verdict") == "INCOMPLETE",
+              f"rc={code} verdict={d_ft.get('verdict')}")
+
+        # coverage gap: cohort is atomic, so a non-required execution that
+        # did not PASS is still a gap even though both required tools did.
+        extra_bad = system_records(
+            tmp, "extra-nonpass",
+            cohort=[*full_cohort, execution("verus", "INCOMPLETE")])
+        code, d_xb, _ = run_json(extra_bad, "--manifest", str(sys_manifest))
+        xb_row = row(d_xb, "SC1")
+        check("non-required cohort execution that did not PASS -> evidence-gap",
+              xb_row["status"] == "evidence-gap" and code == 3,
+              f"status={xb_row['status']} rc={code}")
+        check("non-passing extra execution is named",
+              xb_row["evidence_gaps"] == []
+              and xb_row["non_passing_executions"] == ["verus"])
+
+        # v2-shaped record: no cohort at all cannot demonstrate coverage.
+        no_cohort = system_records(tmp, "no-cohort", cohort=None)
+        code, d_nc, _ = run_json(no_cohort, "--manifest", str(sys_manifest))
+        nc_row = row(d_nc, "SC1")
+        check("system claim record with no executions -> evidence-gap",
+              nc_row["status"] == "evidence-gap" and code == 3,
+              f"status={nc_row['status']} rc={code}")
+        check("cohort-less record reports every required tool as a gap",
+              nc_row["evidence_gaps"] == ["quint", "kani"]
+              and nc_row["executions"] is None)
+
+        # dependency gap: the cohort is complete but a dependency is not
+        # covered in this run.
+        dep_incomplete = system_records(tmp, "dep-incomplete", w1="INCOMPLETE",
+                                        cohort=full_cohort)
+        code, d_dep, _ = run_json(dep_incomplete, "--manifest", str(sys_manifest))
+        dep_row = row(d_dep, "SC1")
+        check("uncovered dependency -> status dependency-gap despite full cohort",
+              dep_row["status"] == "dependency-gap"
+              and dep_row["evidence_gaps"] == [],
+              f"status={dep_row['status']}")
+        check("uncovered dependency is named", dep_row["dependency_gaps"] == ["W1"])
+        check("dependency gap -> exit 3 INCOMPLETE",
+              code == 3 and d_dep.get("verdict") == "INCOMPLETE")
+        check("dependency gap listed in summary.system_claims.dependency_gaps",
+              d_dep["summary"]["dependency_gap"] == 1
+              and d_dep["summary"]["system_claims"]["dependency_gaps"]
+              == {"SC1": ["W1"]})
+
+        # a FAILing dependency still yields the run-level FAILED verdict on
+        # its own row; the claim row shows why it is not covered.
+        dep_failed = system_records(tmp, "dep-failed", b1="FAIL",
+                                    cohort=full_cohort)
+        code, d_df, _ = run_json(dep_failed, "--manifest", str(sys_manifest))
+        check("FAILing dependency -> run verdict FAILED (exit 1)",
+              code == 1 and d_df.get("verdict") == "FAILED",
+              f"rc={code} verdict={d_df.get('verdict')}")
+        check("FAILing dependency named on the system claim row",
+              row(d_df, "SC1")["dependency_gaps"] == ["B1"])
+
+        # --require subset: dependencies outside the required set are
+        # reported as not evaluated, never counted as covered or as gaps.
+        code, d_sub, _ = run_json(dep_incomplete, "--manifest", str(sys_manifest),
+                                  "--require", "SC1")
+        sub_row = row(d_sub, "SC1")
+        check("--require subset keeps the manifest's cohort requirement",
+              sub_row["required_evidence"] == ["quint", "kani"]
+              and sub_row["evidence_gaps"] == [])
+        check("dependency outside the required set is reported unevaluated",
+              sub_row["dependencies_not_evaluated"] == ["B1", "W1"]
+              and sub_row["dependency_gaps"] == [])
+        check("--require subset of a covered system claim -> exit 0",
+              code == 0 and d_sub.get("verdict", "").startswith("VERIFIED["),
+              f"rc={code} verdict={d_sub.get('verdict')}")
+
+        # a system claim with no record is a missing-record gap, not an
+        # omitted row.
+        absent = system_records(tmp, "claim-absent", include_claim=False)
+        code, d_abs, _ = run_json(absent, "--manifest", str(sys_manifest))
+        check("system claim without a record -> missing-record row, exit 3",
+              row(d_abs, "SC1")["status"] == "missing-record"
+              and d_abs["summary"]["missing"] == 1 and code == 3)
+
+        # --require naming an ID the manifest does not declare is an error,
+        # not a silently unkinded row.
+        code, _, err_unknown = run(covered, "--manifest", str(sys_manifest),
+                                   "--require", "SC9")
+        check("--require ID absent from manifest -> exit 2 ERROR",
+              code == 2 and "VERDICT: ERROR" in err_unknown)
+
+        # an unreadable system_claims collection stops the run instead of
+        # rendering a required set with the system claims dropped.
+        for label, payload in (
+            ("system_claims not an array",
+             {**SYSTEM_MANIFEST, "system_claims": {"id": "SC1"}}),
+            ("system claim missing required_evidence",
+             {**SYSTEM_MANIFEST,
+              "system_claims": [{"id": "SC1", "depends_on": ["B1"]}]}),
+            ("system claim with no id",
+             {**SYSTEM_MANIFEST,
+              "system_claims": [{"depends_on": ["B1"],
+                                 "required_evidence": ["quint"]}]}),
+            ("system claim id colliding with an invariant",
+             {**SYSTEM_MANIFEST,
+              "system_claims": [{"id": "B1", "depends_on": ["W1"],
+                                 "required_evidence": ["quint"]}]}),
+        ):
+            bad = write_json(tmp / "obligations-bad.json", payload)
+            code, out_bad, err_bad = run(covered, "--manifest", str(bad))
+            check(f"unusable manifest ({label}) -> exit 2 ERROR, nothing rendered",
+                  code == 2 and "VERDICT: ERROR" in err_bad and out_bad == "",
+                  f"rc={code}")
+
+        # text rendering shows the kind and the cohort detail
+        _, text_sc, _ = run(partial, "--manifest", str(sys_manifest))
+        for needle in ("system_claim", "system claims:", "SC1 [evidence-gap]",
+                       "quint=PASS", "kani=no-execution",
+                       "missing PASS evidence: kani"):
+            check(f"text render shows {needle!r}", needle in text_sc)
+
+        for label, path in (("covered", covered), ("evidence gap", partial),
+                            ("dependency gap", dep_incomplete),
+                            ("no cohort", no_cohort)):
+            code, _, err_chk = run(path, "--manifest", str(sys_manifest), "--check")
+            check(f"--check clean on system-claim fixture ({label})",
+                  code == 0 and "CHECK: clean" in err_chk)
 
     print()
     if FAILURES:

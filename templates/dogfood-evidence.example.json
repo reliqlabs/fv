@@ -10,15 +10,17 @@
       "repo": "verified-rcv",
       "commit": null,
       "dirty_tree_hash": null,
-      "note": "Contract deployed to testnet and enclave exercised as uncommitted spike work; no commit was pinned at evidence time."
+      "verified_input_snapshot": null,
+      "note": "Contract deployed to testnet and enclave exercised as uncommitted spike work; no commit was pinned at evidence time. fv-evidence-run/v3 records bind source as a verified-input content snapshot (sha256:<hex>, suffixed +dirty when a non-excluded path is modified), not as a commit id; no snapshot was computed for these runs."
     }
   ],
   "intent": {
     "path": ".fv/intent.md",
+    "dispatch_target_spec": null,
     "version": "0.3.15",
     "version_prior_for_ledger": "0.3.5",
     "sha256": null,
-    "note": "Current intent is v0.3.15; the integration ledger was generated at v0.3.5 and is stale (README). Intent hash was never captured."
+    "note": "Current intent is v0.3.15; the integration ledger was generated at v0.3.5 and is stale (README). Intent hash was never captured. path is the repo-relative canonical target a v3 record carries as bindings.intent_path; it is resolved from .fv/dispatch.json omp_native.target_spec, which verified-rcv never declared, so the default .fv/intent.md applied."
   },
   "specs": [
     {
@@ -98,6 +100,19 @@
     { "stage": "fv-code-adversarial", "ran": false, "evidence": "NOT run; 8 of 13 high-severity audit findings would have been caught by the six-lens code-adversarial stage." },
     { "stage": "compose ledger (integration)", "ran": true, "evidence": "Ledger generated at intent v0.3.5; stale vs current v0.3.15, regeneration pending in the verified-rcv repo." }
   ],
+  "evidence_records": {
+    "path": ".fv/evidence/records/",
+    "parser_schema_version": null,
+    "invariants_recorded": [],
+    "witnesses_recorded": [],
+    "system_claims_recorded": [],
+    "note": "verified-rcv predates fv-evidence-run/v3: no hash-bound per-claim record was ever produced, so there is nothing to point at. A manifested project lists one record per required obligation here - invariants and witnesses with the tool that discharged them, system claims with the required_evidence tool IDs their execution cohort covers - and every listed record must validate under scripts/check_evidence_records.py at the snapshot above. Record shape: docs/dogfood-evidence.md."
+  },
+  "verification_plan": {
+    "path": null,
+    "schema": "fv-verification-plan/v1",
+    "note": "No declarative plan was authored; the pyramid ran on built-in defaults. A manifested project names its .fv/verification-plan.json here so the exact argv, cwd, timeout, and env of every layer execution is reconstructible. Example: scripts/verification-plan.example.json."
+  },
   "waivers": [],
   "notes": "This is a dogfood OBSERVATION, not a manifested evidence base. Per the rule in docs/dogfood-evidence.md, verified-rcv may be described only as a dogfood observation until a status=manifested manifest (real commit, hashes, seeds, raw-report hashes, bounds) exists. Regenerating the verified-rcv integration ledger against the current intent is pending work in that project's own repo and is out of scope for the fv repo."
 }

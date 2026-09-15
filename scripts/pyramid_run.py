@@ -55,14 +55,52 @@ A skipped required layer is a gating gap, not a footnote: there is no
 kani/verus with zero harnesses/annotations under a profile that requires
 them is INCOMPLETE (no bounded evidence is not evidence).
 
+VERIFICATION PLANS (--plan, fv-verification-plan/v1)
+    `--plan PATH` reads a declarative plan (conventionally
+    <crate>/.fv/verification-plan.json) whose `layers` map names the layers
+    whose commands the project declares instead of inheriting the built-in
+    defaults:
+        {"schema": "fv-verification-plan/v1",
+         "layers": {"types": {"required": true, "executions": [
+            {"argv": ["cargo", "check", "--quiet"], "cwd": ".",
+             "timeout_seconds": 600, "env": {"RUSTFLAGS": "-Dwarnings"},
+             "evidence_tool": "cargo-check"}]}}}
+    Contract, fail-closed — a malformed plan is ERROR (exit 2), never a
+    silently-legacy run:
+      * argv is a non-empty array of non-empty strings. There are no shell
+        strings: argv is executed directly, with no shell, no word splitting
+        and no glob expansion.
+      * cwd is repo-relative and must resolve to an existing directory inside
+        the crate root. Absolute paths, `..` segments and symlink escapes are
+        rejected.
+      * timeout_seconds is a positive integer (per invocation).
+      * env, when present, maps string to string. It is merged over the
+        runner's own environment for that child process only; the runner never
+        mutates its own environment, and declared names never leak into
+        sibling invocations.
+      * evidence_tool, when present, names the tool the invocation witnesses.
+        On the `fuzz` layer it also names the fuzz surface whose measured
+        duration feeds the C8 fuzz-time floor.
+      * `floors` is not plannable: it is computed from .fv/floors.json, and a
+        declared command could not enforce the C8 baseline.
+    Plan-declared layers run in the canonical pyramid order (LAYER_ORDER),
+    independent of their order in the file. Every invocation in a layer runs
+    (a layer is one evidence cohort); the layer fails when any invocation
+    exits non-zero or times out. `required: true` adds a layer to the gating
+    set; `required: false` is non-gating but never un-requires a layer the
+    profile already requires — a plan can only tighten the verdict.
+    Layers the plan does not name keep every built-in default, and without
+    --plan the runner is byte-for-byte the legacy runner.
+
 USAGE
     pyramid_run.py --crate <path> --profile tested|bounded|proved
-        [--skip <layer>]... [--fuzz-seconds 30] [--json]
+        [--skip <layer>]... [--fuzz-seconds 30] [--plan <path>] [--json]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -76,6 +114,23 @@ PROFILES: dict[str, list[str]] = {
     "bounded": ["types", "lints", "proptests", "floors", "kani"],
     "proved":  ["types", "lints", "proptests", "floors", "kani", "verus", "lean"],
 }
+
+# Canonical layer order: the pyramid runs cheapest-first and a types failure
+# invalidates everything below it. Plan-declared layers execute in this order.
+LAYER_ORDER: tuple[str, ...] = (
+    "types", "lints", "proptests", "fuzz", "floors", "kani", "verus", "lean",
+)
+
+PLAN_SCHEMA = "fv-verification-plan/v1"
+PLAN_RELATIVE = ".fv/verification-plan.json"
+
+# `floors` is computed from .fv/floors.json (C8), so it is not plannable.
+PLAN_LAYERS: tuple[str, ...] = tuple(
+    name for name in LAYER_ORDER if name != "floors")
+
+_PLAN_TOP_KEYS = ("schema", "layers")
+_PLAN_LAYER_KEYS = ("required", "executions")
+_PLAN_EXEC_KEYS = ("argv", "cwd", "timeout_seconds", "env", "evidence_tool")
 
 TERMINAL_OK = "passed"
 
@@ -262,11 +317,15 @@ def aggregate_verdict(profile: str, required: list[str],
     return f"VERIFIED[{profile}]", 0
 
 
-def run_cmd(cmd: list[str], cwd: Path, timeout: int = 1800) -> dict:
+def run_cmd(cmd: list[str], cwd: Path, timeout: int = 1800,
+            env: dict[str, str] | None = None) -> dict:
+    """Run argv directly — never a shell string. `env` is merged over the
+    runner's own environment for this child only; os.environ is untouched."""
+    child_env = {**os.environ, **env} if env else None
     t0 = time.monotonic()
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, env=child_env)
         return {"command": cmd, "returncode": proc.returncode,
                 "duration_s": round(time.monotonic() - t0, 1),
                 "stdout_preview": proc.stdout[-500:],
@@ -274,6 +333,162 @@ def run_cmd(cmd: list[str], cwd: Path, timeout: int = 1800) -> dict:
     except subprocess.TimeoutExpired:
         return {"command": cmd, "returncode": -1, "timeout": True,
                 "duration_s": round(time.monotonic() - t0, 1)}
+
+
+class PlanError(ValueError):
+    """Any rejection of a verification plan's schema, layers, or executions."""
+
+
+def _plan_cwd(root: Path, raw: object, where: str) -> str:
+    """Validate a declared repo-relative cwd; return its normalized form.
+
+    A plan may only name directories inside the crate root: absolute paths,
+    `..` segments, symlink escapes and non-directories are all rejected.
+    `root` must already be resolved."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise PlanError(f"{where}: cwd must be a non-empty repo-relative string, "
+                        f"got {raw!r}")
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise PlanError(f"{where}: cwd must be repo-relative, got absolute {raw!r}")
+    if ".." in candidate.parts:
+        raise PlanError(f"{where}: cwd escapes the crate root: {raw!r}")
+    resolved = (root / candidate).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise PlanError(f"{where}: cwd escapes the crate root: {raw!r} -> {resolved}")
+    if not resolved.is_dir():
+        raise PlanError(f"{where}: cwd is not a directory: {raw!r}")
+    return resolved.relative_to(root).as_posix() or "."
+
+
+def _plan_env(raw: object, where: str) -> dict[str, str]:
+    """Validate an optional env mapping of string to string."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise PlanError(f"{where}: env must be an object mapping string to string, "
+                        f"got {type(raw).__name__}")
+    env: dict[str, str] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name or "=" in name or "\0" in name:
+            raise PlanError(f"{where}: env name must be a non-empty string without "
+                            f"'=' or NUL, got {name!r}")
+        if not isinstance(value, str) or "\0" in value:
+            raise PlanError(f"{where}: env[{name!r}] must be a string without NUL, "
+                            f"got {value!r}")
+        env[name] = value
+    return env
+
+
+def _plan_execution(root: Path, raw: object, where: str) -> dict:
+    """Validate one declared invocation. No shell strings, no ambient escapes."""
+    if not isinstance(raw, dict):
+        raise PlanError(f"{where}: execution must be an object")
+    unknown = sorted(set(raw) - set(_PLAN_EXEC_KEYS))
+    if unknown:
+        raise PlanError(f"{where}: unknown key(s) {unknown}; "
+                        f"allowed {list(_PLAN_EXEC_KEYS)}")
+    argv = raw.get("argv")
+    if not isinstance(argv, list) or not argv:
+        raise PlanError(f"{where}: argv must be a non-empty array of strings "
+                        f"(a shell string is not a command), got {argv!r}")
+    for index, word in enumerate(argv):
+        if not isinstance(word, str) or not word or "\0" in word:
+            raise PlanError(f"{where}: argv[{index}] must be a non-empty string "
+                            f"without NUL, got {word!r}")
+    timeout = raw.get("timeout_seconds")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise PlanError(f"{where}: timeout_seconds must be a positive integer, "
+                        f"got {timeout!r}")
+    tool = raw.get("evidence_tool")
+    if tool is not None and (not isinstance(tool, str) or not tool.strip()):
+        raise PlanError(f"{where}: evidence_tool must be a non-empty string when "
+                        f"present, got {tool!r}")
+    return {"argv": list(argv),
+            "cwd": _plan_cwd(root, raw.get("cwd"), where),
+            "timeout_seconds": timeout,
+            "env": _plan_env(raw.get("env"), where),
+            "evidence_tool": tool}
+
+
+def parse_plan(document: object, root: Path, source: str = "<plan>") -> dict:
+    """Validate a fv-verification-plan/v1 document against the crate `root`.
+
+    Returns {"schema", "source", "layers"} where `layers` is ordered by
+    LAYER_ORDER regardless of the document's key order. Pure apart from the
+    directory-existence checks on each declared cwd."""
+    root = Path(root).resolve()
+    if not isinstance(document, dict):
+        raise PlanError(f"{source}: plan must be a JSON object")
+    unknown = sorted(set(document) - set(_PLAN_TOP_KEYS))
+    if unknown:
+        raise PlanError(f"{source}: unknown top-level key(s) {unknown}; "
+                        f"allowed {list(_PLAN_TOP_KEYS)}")
+    schema = document.get("schema", PLAN_SCHEMA)
+    if schema != PLAN_SCHEMA:
+        raise PlanError(f"{source}: unsupported schema {schema!r}; "
+                        f"expected {PLAN_SCHEMA!r}")
+    declared = document.get("layers")
+    if not isinstance(declared, dict) or not declared:
+        raise PlanError(f"{source}: layers must be a non-empty object")
+    for name in declared:
+        if name in PLAN_LAYERS:
+            continue
+        reason = (" (floors is computed from .fv/floors.json, not declared)"
+                  if name == "floors" else "")
+        raise PlanError(f"{source}: layer {name!r} is not plannable{reason}; "
+                        f"allowed {list(PLAN_LAYERS)}")
+    layers: dict[str, dict] = {}
+    for name in LAYER_ORDER:
+        if name not in declared:
+            continue
+        spec = declared[name]
+        where = f"{source}: layers.{name}"
+        if not isinstance(spec, dict):
+            raise PlanError(f"{where}: layer must be an object")
+        unknown = sorted(set(spec) - set(_PLAN_LAYER_KEYS))
+        if unknown:
+            raise PlanError(f"{where}: unknown key(s) {unknown}; "
+                            f"allowed {list(_PLAN_LAYER_KEYS)}")
+        required = spec.get("required")
+        if not isinstance(required, bool):
+            raise PlanError(f"{where}: required must be a boolean, got {required!r}")
+        executions = spec.get("executions")
+        if not isinstance(executions, list) or not executions:
+            raise PlanError(f"{where}: executions must be a non-empty array")
+        layers[name] = {
+            "required": required,
+            "executions": [
+                _plan_execution(root, execution, f"{where}.executions[{index}]")
+                for index, execution in enumerate(executions)
+            ],
+        }
+    return {"schema": PLAN_SCHEMA, "source": source, "layers": layers}
+
+
+def load_plan(path: str | Path, root: Path) -> dict:
+    """Read and validate a plan file; every rejection is a PlanError."""
+    path = Path(path)
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as error:
+        raise PlanError(f"cannot read plan {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise PlanError(f"{path}: malformed JSON: {error}") from error
+    return parse_plan(document, root, source=str(path))
+
+
+def run_plan_execution(execution: dict, root: Path) -> dict:
+    """Execute one declared invocation with its declared cwd, timeout and env."""
+    result = run_cmd(execution["argv"], root / execution["cwd"],
+                     timeout=execution["timeout_seconds"],
+                     env=execution["env"] or None)
+    record = {**result, "cwd": execution["cwd"],
+              "timeout_seconds": execution["timeout_seconds"],
+              "env": dict(sorted(execution["env"].items()))}
+    if execution["evidence_tool"]:
+        record["evidence_tool"] = execution["evidence_tool"]
+    return record
 
 
 def main() -> int:
@@ -284,6 +499,11 @@ def main() -> int:
                     help="skip a layer (a skipped REQUIRED layer gates the "
                          "run to INCOMPLETE — visible, not forgiven)")
     ap.add_argument("--fuzz-seconds", type=int, default=30)
+    ap.add_argument("--plan", type=Path, default=None,
+                    help=f"{PLAN_SCHEMA} document (conventionally "
+                         f"{PLAN_RELATIVE}) declaring per-layer argv/cwd/"
+                         "timeout_seconds/env; layers it does not name keep "
+                         "their built-in defaults")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -292,6 +512,19 @@ def main() -> int:
         print(f"ERROR: no Cargo.toml at {crate}", file=sys.stderr)
         print("\nVERDICT: ERROR", file=sys.stderr)
         return 2
+
+    plan_layers: dict[str, dict] = {}
+    plan_report: dict | None = None
+    if args.plan is not None:
+        try:
+            plan = load_plan(args.plan, crate)
+        except PlanError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            print("\nVERDICT: ERROR", file=sys.stderr)
+            return 2
+        plan_layers = plan["layers"]
+        plan_report = {"schema": plan["schema"], "source": plan["source"],
+                       "layers": plan_layers}
     if shutil.which("cargo") is None:
         print("ERROR: cargo not on PATH", file=sys.stderr)
         print("\nVERDICT: ERROR", file=sys.stderr)
@@ -301,6 +534,12 @@ def main() -> int:
     has_fuzz = (crate / "fuzz").is_dir()
     if has_fuzz and "fuzz" not in required:
         required.insert(3, "fuzz")  # fuzz is required exactly when harnesses exist
+    # A plan may only widen the gating set: `required: true` adds a layer,
+    # `required: false` never un-requires a layer the profile already requires.
+    planned = [name for name, spec in plan_layers.items() if spec["required"]]
+    if planned:
+        gating = set(required) | set(planned)
+        required = [layer for layer in LAYER_ORDER if layer in gating]
 
     layers: dict[str, dict] = {}
     statuses: dict[str, str] = {}
@@ -310,7 +549,34 @@ def main() -> int:
         layers[layer] = {"status": status, "detail": detail}
         print(f"  [{status:>14}] {layer}", file=sys.stderr)
 
+    def plan_layer(layer: str) -> bool:
+        """Run a plan-declared layer; True when the plan owns this layer.
+
+        Every declared invocation runs (the layer is one evidence cohort) and
+        the layer fails when any of them exits non-zero or times out."""
+        spec = plan_layers.get(layer)
+        if spec is None:
+            return False
+        if layer in args.skip:
+            record(layer, "skipped", "skipped by flag")
+            return True
+        results: list[dict] = []
+        durations: dict[str, float] = {}
+        status = TERMINAL_OK
+        for execution in spec["executions"]:
+            result = run_plan_execution(execution, crate)
+            results.append(result)
+            if result["returncode"] != 0:
+                status = "failed"
+            if execution["evidence_tool"]:
+                durations[execution["evidence_tool"]] = result.get("duration_s", 0)
+        record(layer, status, {"plan": True, "required": spec["required"],
+                               "executions": results, "durations": durations})
+        return True
+
     def cargo_layer(layer: str, cmd: list[str]) -> None:
+        if plan_layer(layer):
+            return
         if layer in args.skip:
             record(layer, "skipped", "skipped by flag")
             return
@@ -320,14 +586,16 @@ def main() -> int:
     cargo_layer("types", ["cargo", "check", "--quiet"])
     if statuses.get("types") == "failed":
         # Compilation failure invalidates everything downstream.
-        for layer in required:
+        for layer in [*required, *plan_layers]:
             if layer not in statuses:
                 record(layer, "not_run", "types layer failed")
     else:
         cargo_layer("lints", ["cargo", "clippy", "--quiet", "--", "-D", "warnings"])
         cargo_layer("proptests", ["cargo", "test", "--quiet"])
 
-        if "fuzz" in required or has_fuzz:
+        if plan_layer("fuzz"):
+            pass
+        elif "fuzz" in required or has_fuzz:
             if "fuzz" in args.skip:
                 record("fuzz", "skipped", "skipped by flag")
             elif not has_fuzz:
@@ -361,7 +629,9 @@ def main() -> int:
                         crate, cfg, is_workspace(crate), layers.get("fuzz"))
                     record("floors", status, detail)
 
-        if "kani" in required:
+        if plan_layer("kani"):
+            pass
+        elif "kani" in required:
             if "kani" in args.skip:
                 record("kani", "skipped", "skipped by flag")
             elif shutil.which("cargo-kani") is None:
@@ -375,7 +645,9 @@ def main() -> int:
                     r = run_cmd(["cargo", "kani"], crate)
                     record("kani", TERMINAL_OK if r["returncode"] == 0 else "failed", r)
 
-        if "verus" in required:
+        if plan_layer("verus"):
+            pass
+        elif "verus" in required:
             if "verus" in args.skip:
                 record("verus", "skipped", "skipped by flag")
             elif shutil.which("cargo-verus") is None and shutil.which("verus") is None:
@@ -384,7 +656,9 @@ def main() -> int:
                 r = run_cmd(["cargo", "verus", "verify"], crate)
                 record("verus", TERMINAL_OK if r["returncode"] == 0 else "failed", r)
 
-        if "lean" in required:
+        if plan_layer("lean"):
+            pass
+        elif "lean" in required:
             record("lean", "not_run",
                    "Aeneas extraction + lean_axiom_gate.py are agent-flow layers; "
                    "the headless runner cannot supply them")
@@ -396,6 +670,7 @@ def main() -> int:
         "crate": str(crate),
         "profile": args.profile,
         "required_layers": required,
+        **({"plan": plan_report} if plan_report is not None else {}),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "layers": layers,
         "floors": layers.get("floors", {}).get("detail", {}),

@@ -88,6 +88,50 @@ const namedTool = await tool.execute("named", {
   claim_id: "N1", command: ["sh", "-c", "echo 'test result: ok.'"],
   evidence_class: "test-witnessed", scope: "named evidence tool probe", tool: "quint",
 }, undefined, {}, undefined);
+const cohort = await tool.execute("cohort", {
+  claim_id: "S1", evidence_class: "bounded-checked", scope: "atomic evidence cohort probe",
+  executions: [
+    { tool: "kani", command: ["sh", "-c", "echo 'No violation found'"] },
+    { tool: "verus", command: ["sh", "-c", "echo 'VERIFICATION:- SUCCESSFUL'"],
+      evidence_class: "proof-discharged" },
+  ],
+}, undefined, {}, undefined);
+const cohortFailure = await tool.execute("cohort-fail", {
+  claim_id: "S2", evidence_class: "bounded-checked", scope: "failing cohort member probe",
+  executions: [
+    { tool: "kani", command: ["sh", "-c", "echo 'No violation found'"] },
+    { tool: "verus", command: ["sh", "-c", "echo broken >&2; exit 3"],
+      evidence_class: "proof-discharged" },
+  ],
+}, undefined, {}, undefined);
+async function rejected(params: any) {
+  try {
+    await tool.execute("reject", params, undefined, {}, undefined);
+    return "";
+  } catch (error) { return String(error); }
+}
+const base = { evidence_class: "test-witnessed", scope: "argument rejection probe" };
+const rejections = {
+  neither: await rejected({ claim_id: "X1", ...base }),
+  both: await rejected({ claim_id: "X2", ...base, command: ["sh", "-c", "true"],
+                         executions: [{ tool: "kani", command: ["sh", "-c", "true"] }] }),
+  emptyCohort: await rejected({ claim_id: "X3", ...base, executions: [] }),
+  duplicateTool: await rejected({ claim_id: "X4", ...base, executions: [
+    { tool: "kani", command: ["sh", "-c", "true"] },
+    { tool: "kani", command: ["sh", "-c", "true"] }] }),
+  malformedArgv: await rejected({ claim_id: "X5", ...base,
+                                  executions: [{ tool: "kani", command: [] }] }),
+  blankArgvElement: await rejected({ claim_id: "X6", ...base,
+                                     executions: [{ tool: "kani", command: ["sh", ""] }] }),
+  malformedTool: await rejected({ claim_id: "X7", ...base,
+                                  executions: [{ tool: "cargo kani", command: ["sh", "-c", "true"] }] }),
+  topLevelCwd: await rejected({ claim_id: "X8", ...base, cwd: "sub",
+                                executions: [{ tool: "kani", command: ["sh", "-c", "true"] }] }),
+  cohortEscape: await rejected({ claim_id: "X9", ...base, executions: [
+    { tool: "kani", command: ["sh", "-c", "true"], cwd: "escape" }] }),
+  unknownClass: await rejected({ claim_id: "XA", ...base, executions: [
+    { tool: "kani", command: ["sh", "-c", "true"], evidence_class: "made-up" }] }),
+};
 const intentDrift = await tool.execute("intent-drift", {
   claim_id: "I1",
   command: ["sh", "-c", "printf '# Changed Intent\\n' > .fv/intent.md; echo 'test result: ok.'"],
@@ -104,6 +148,7 @@ console.log(JSON.stringify({
   passing: passing.details, failing: failing.details, dirty: dirtyResult.details,
   customMarker: customMarker.details, relativeExecutable: relativeExecutable.details,
   namedTool: namedTool.details, intentDrift: intentDrift.details, escapeError,
+  cohort: cohort.details, cohortFailure: cohortFailure.details, rejections,
 }));
 """
 
@@ -206,7 +251,7 @@ def gate(record: Path, root: Path, required: str, manifest: Path | None = None) 
                "--allow-unbound", "--json"]
     if manifest:
         command += ["--manifest", str(manifest)]
-    else:
+    if required:
         command += ["--require", required]
     return subprocess.run(command, capture_output=True, text=True)
 
@@ -350,6 +395,9 @@ def main() -> int:
             "version": 1,
             "invariants": [{"id": "B1", "name": "inv_b1"}],
             "witnesses": [{"id": "W1", "name": "witness_w1"}],
+            "system_claims": [{"id": "S1", "statement": "the cohort composes",
+                               "depends_on": ["B1", "W1"],
+                               "required_evidence": ["kani", "verus"]}],
         }))
         outside = Path(temporary) / "outside"
         outside.mkdir()
@@ -417,50 +465,50 @@ def main() -> int:
         failed = gate(failing_path, root, "B1")
         check("Gate B reports produced failing probe", failed.returncode == 1 and "FAILED" in failed.stdout, failed.stdout)
 
-        missing = json.loads(passing_path.read_text())
-        missing["bindings"]["raw_output_path"] = ".fv/evidence/raw/does-not-exist.log"
-        missing_path = root / "missing.json"
-        missing_path.write_text(json.dumps(missing))
-        checked = gate(missing_path, root, "W1")
-        check("missing raw artifact rejected", checked.returncode == 3 and "unresolvable raw artifact" in checked.stdout, checked.stdout)
+        # Every mutation rebinds the legacy fields and the sole execution together, so
+        # each probe isolates one property instead of tripping the derivation check.
+        raw_relative = passing["bindings"]["raw_output_path"]
 
-        wrong = json.loads(passing_path.read_text())
-        wrong["bindings"]["raw_output_hash"] = "0" * 64
-        wrong_path = root / "wrong-hash.json"
-        wrong_path.write_text(json.dumps(wrong))
-        checked = gate(wrong_path, root, "W1")
-        check("wrong raw hash rejected", checked.returncode == 3 and "raw output hash mismatch" in checked.stdout, checked.stdout)
+        def mutation(name: str, relative: str, digest: str, marker: str = "") -> Path:
+            record = json.loads(passing_path.read_text())
+            binding = record["bindings"]
+            execution = binding["executions"][0]
+            binding["raw_output_path"] = execution["raw_output_path"] = relative
+            binding["raw_output_hash"] = execution["raw_output_hash"] = digest
+            if marker:
+                binding["configuration"]["pass_marker"] = execution["pass_marker"] = marker
+            path = root / f"{name}.json"
+            path.write_text(json.dumps(record))
+            return path
+
+        checked = gate(mutation("missing", ".fv/evidence/raw/does-not-exist.log", "0" * 64), root, "W1")
+        check("missing raw artifact rejected",
+              checked.returncode == 3 and "unresolvable raw artifact" in checked.stdout, checked.stdout)
+
+        checked = gate(mutation("wrong-hash", raw_relative, "0" * 64), root, "W1")
+        check("wrong raw hash rejected",
+              checked.returncode == 3 and "raw output hash mismatch" in checked.stdout, checked.stdout)
 
         marker_raw = state / "evidence" / "raw" / "marker-absent.log"
         marker_raw.write_text("command completed\n--- fv-evidence: exit=0 ---\n")
-        absent = json.loads(passing_path.read_text())
-        absent["bindings"]["raw_output_path"] = str(marker_raw.relative_to(root))
-        absent["bindings"]["raw_output_hash"] = hashlib.sha256(marker_raw.read_bytes()).hexdigest()
-        absent_path = root / "marker-absent.json"
-        absent_path.write_text(json.dumps(absent))
-        checked = gate(absent_path, root, "W1")
-        check("missing class marker rejected", checked.returncode == 3 and "PASS marker absent" in checked.stdout, checked.stdout)
+        checked = gate(mutation("marker-absent", str(marker_raw.relative_to(root)),
+                                hashlib.sha256(marker_raw.read_bytes()).hexdigest()), root, "W1")
+        check("missing class marker rejected",
+              checked.returncode == 3 and "PASS marker absent" in checked.stdout, checked.stdout)
 
         exit_raw = state / "evidence" / "raw" / "forged-exit.log"
         exit_raw.write_text("test result: ok.\n--- fv-evidence: exit=7 ---\n")
-        forged = json.loads(passing_path.read_text())
-        forged["bindings"]["raw_output_path"] = str(exit_raw.relative_to(root))
-        forged["bindings"]["raw_output_hash"] = hashlib.sha256(exit_raw.read_bytes()).hexdigest()
-        forged["bindings"]["configuration"] = {"pass_marker": ".*"}
-        forged_path = root / "forged-exit.json"
-        forged_path.write_text(json.dumps(forged))
-        checked = gate(forged_path, root, "W1")
+        checked = gate(mutation("forged-exit", str(exit_raw.relative_to(root)),
+                                hashlib.sha256(exit_raw.read_bytes()).hexdigest(), marker=".*"),
+                       root, "W1")
         check("record-controlled regex cannot mask nonzero exit",
               checked.returncode == 3 and "canonical exit=0 trailer" in checked.stdout,
               checked.stdout)
+
         conflicting_raw = state / "evidence" / "raw" / "conflicting-exit.log"
         conflicting_raw.write_text("test result: ok.\n--- fv-evidence: exit=7 ---\n--- fv-evidence: exit=0 ---\n")
-        conflicting = json.loads(passing_path.read_text())
-        conflicting["bindings"]["raw_output_path"] = str(conflicting_raw.relative_to(root))
-        conflicting["bindings"]["raw_output_hash"] = hashlib.sha256(conflicting_raw.read_bytes()).hexdigest()
-        conflicting_path = root / "conflicting-exit.json"
-        conflicting_path.write_text(json.dumps(conflicting))
-        checked = gate(conflicting_path, root, "W1")
+        checked = gate(mutation("conflicting-exit", str(conflicting_raw.relative_to(root)),
+                                hashlib.sha256(conflicting_raw.read_bytes()).hexdigest()), root, "W1")
         check("conflicting exit trailers rejected",
               checked.returncode == 3 and "one unique canonical exit=0 trailer" in checked.stdout,
               checked.stdout)
@@ -471,6 +519,110 @@ def main() -> int:
         incompatible_path.write_text(json.dumps(incompatible))
         checked = gate(incompatible_path, root, "", manifest)
         check("incompatible obligation class rejected", "incompatible evidence class" in checked.stdout, checked.stdout)
+
+        check("legacy single-command record still carries exactly one execution",
+              len(passing["bindings"]["executions"]) == 1
+              and json.loads(passing["bindings"]["command"])
+              == passing["bindings"]["executions"][0]["command"]
+              and passing["bindings"]["executions"][0]["run_id"] == passing["bindings"]["run_id"],
+              passing["bindings"])
+
+        cohort_path = state / "evidence" / "records" / "S1.json"
+        cohort_record = json.loads(cohort_path.read_text())
+        cohort_bindings = cohort_record["bindings"]
+        executions = cohort_bindings["executions"]
+        check("cohort run records one execution per requested command",
+              cohort_record["result"] == "PASS"
+              and [execution["tool"] for execution in executions] == ["kani", "verus"]
+              and [execution["result"] for execution in executions] == ["PASS", "PASS"]
+              and [execution["evidence_class"] for execution in executions]
+              == ["bounded-checked", "proof-discharged"], executions)
+        check("each cohort execution persists its own hash-bound raw artifact",
+              len({execution["raw_output_path"] for execution in executions}) == 2
+              and len({execution["run_id"] for execution in executions}) == 2
+              and all((root / execution["raw_output_path"]).is_file() for execution in executions)
+              and all(hashlib.sha256((root / execution["raw_output_path"]).read_bytes()).hexdigest()
+                      == execution["raw_output_hash"] for execution in executions),
+              [execution["raw_output_path"] for execution in executions])
+        check("cohort legacy bindings are derived from the first execution",
+              json.loads(cohort_bindings["command"]) == executions[0]["command"]
+              and cohort_bindings["raw_output_path"] == executions[0]["raw_output_path"]
+              and cohort_bindings["raw_output_hash"] == executions[0]["raw_output_hash"]
+              and cohort_bindings["toolchain_digests"] == executions[0]["toolchain_digests"]
+              and cohort_bindings["configuration"]["cwd"] == executions[0]["cwd"], cohort_bindings)
+        cohort_checked = gate(cohort_path, root, "S1", manifest)
+        check("Gate B accepts a cohort covering every required_evidence tool",
+              cohort_checked.returncode == 0, cohort_checked.stdout + cohort_checked.stderr)
+
+        failure_record = json.loads((state / "evidence" / "records" / "S2.json").read_text())
+        check("one failing execution fails the whole cohort record",
+              failure_record["result"] == "FAIL"
+              and [execution["result"] for execution
+                   in failure_record["bindings"]["executions"]] == ["PASS", "FAIL"],
+              failure_record)
+
+        def cohort_mutation(name: str, mutate) -> subprocess.CompletedProcess:
+            record = json.loads(cohort_path.read_text())
+            mutate(record)
+            path = root / f"cohort-{name}.json"
+            path.write_text(json.dumps(record))
+            return gate(path, root, "S1", manifest)
+
+        checked = cohort_mutation("missing-tool", lambda record: record["bindings"]["executions"].pop(1))
+        check("cohort missing a required tool cannot discharge the system claim",
+              checked.returncode == 3
+              and "missing PASS evidence from required tools ['verus']" in checked.stdout,
+              checked.stdout)
+        checked = cohort_mutation("duplicate-tool",
+                                  lambda record: record["bindings"]["executions"][1].update(tool="kani"))
+        check("duplicate cohort tool ids rejected as ambiguous coverage",
+              checked.returncode == 3 and "duplicate evidence tool 'kani'" in checked.stdout,
+              checked.stdout)
+        checked = cohort_mutation("cwd-escape",
+                                  lambda record: record["bindings"]["executions"][1].update(cwd="../outside"))
+        check("cohort execution cwd outside the repository rejected",
+              checked.returncode == 3 and "executions[1] cwd escapes repository root" in checked.stdout,
+              checked.stdout)
+        checked = cohort_mutation(
+            "malformed-argv",
+            lambda record: record["bindings"]["executions"][1].update(command="sh -c true"))
+        check("cohort execution with a shell string instead of argv rejected",
+              checked.returncode == 3
+              and "executions[1] command is not a nonempty argv array" in checked.stdout,
+              checked.stdout)
+        checked = cohort_mutation(
+            "forged-pass",
+            lambda record: record["bindings"]["executions"][1].update(result="FAIL"))
+        check("a FAIL execution cannot hide beneath a PASS cohort record",
+              checked.returncode == 3
+              and "cannot appear beneath a PASS record" in checked.stdout, checked.stdout)
+
+        second_raw = root / executions[1]["raw_output_path"]
+        original_raw = second_raw.read_bytes()
+        second_raw.write_text(
+            "forged verus proof\nVERIFICATION:- SUCCESSFUL\n--- fv-evidence: exit=0 ---\n")
+        checked = gate(cohort_path, root, "S1", manifest)
+        check("tampering with a later cohort artifact is caught",
+              checked.returncode == 3
+              and "executions[1] raw output hash mismatch" in checked.stdout, checked.stdout)
+        second_raw.write_bytes(original_raw)
+
+        rejections = result.get("rejections", {})
+        for label, key, fragment in (
+            ("neither command nor executions", "neither", "exactly one of command or executions"),
+            ("both command and executions", "both", "exactly one of command or executions"),
+            ("an empty executions array", "emptyCohort", "executions must be a non-empty array"),
+            ("a duplicate cohort tool", "duplicateTool", "duplicates 'kani'"),
+            ("an empty cohort argv", "malformedArgv", "command must contain non-empty argv elements"),
+            ("a blank cohort argv element", "blankArgvElement",
+             "command must contain non-empty argv elements"),
+            ("a malformed cohort tool id", "malformedTool", "must be an evidence tool identifier"),
+            ("top-level cwd beside executions", "topLevelCwd", "per-execution when executions is used"),
+            ("a cohort cwd escaping the project root", "cohortEscape", "inside the project root"),
+            ("an unknown per-execution evidence class", "unknownClass", "evidence_class is unknown"),
+        ):
+            check(f"producer rejects {label}", fragment in rejections.get(key, ""),
+                  rejections.get(key))
 
         check_external_target(Path(temporary))
 

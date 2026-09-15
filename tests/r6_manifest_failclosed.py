@@ -24,6 +24,13 @@ project root (or are missing, a directory, or a symlink) are rejected; evidence,
 verify, panel, and declared exclusion outputs never enter the snapshot; and v2
 records still validate under explicit --expect-snapshot/--allow-unbound.
 
+System-claim half: obligations.json may declare system_claims, which Gate B
+aggregates into the required-claim set with kind system_claim; a claim whose
+depends_on or required_evidence list is empty, duplicated, unknown, or
+malformed makes the whole manifest an ERROR, dependencies name invariants and
+witnesses only (so no dependency cycle between claims is representable), and
+manifests with no system_claims gate exactly as before.
+
 Exit 0 pass, 1 fail.
 """
 from __future__ import annotations
@@ -108,40 +115,94 @@ def build_project(root: Path) -> Path:
     return project
 
 
+# Evidence class and raw-log marker each fixture tool's execution produces.
+TOOL_EVIDENCE = {
+    "kani": ("bounded-checked", "No violation found"),
+    "verus": ("proof-discharged", "VERIFICATION:- SUCCESSFUL"),
+}
+
+
+def cohort_for(tools: list[str]) -> list[dict]:
+    """One execution spec per tool, each carrying the marker its class demands."""
+    specs = []
+    for tool in tools:
+        evidence_class, marker = TOOL_EVIDENCE.get(tool, ("code-enforced", ""))
+        specs.append({"tool": tool, "evidence_class": evidence_class, "marker": marker,
+                      "command": [tool, "--check"]})
+    return specs
+
+
 def write_record(project: Path, snapshot: str, intent_hash: str,
-                 schema: str = "fv-evidence-run/v3") -> Path:
-    """Write a single PASS record for A1 under .fv/evidence; returns its directory."""
-    raw = project / ".fv" / "evidence" / "raw" / "A1.log"
-    raw.parent.mkdir(parents=True, exist_ok=True)
-    raw.write_text("fixture check\n--- fv-evidence: exit=0 ---\n")
+                 schema: str = "fv-evidence-run/v3", claim_id: str = "A1",
+                 evidence_class: str = "code-enforced", marker: str = "",
+                 cohort: list[dict] | None = None) -> Path:
+    """Write a single PASS record under .fv/evidence; returns the records directory.
+
+    A cohort spec is {tool, evidence_class?, marker?, command?, cwd?, result?}. Each
+    execution gets its own raw artifact, and the record's legacy bindings are derived
+    from the first execution exactly as the producer derives them.
+    """
+    raw_dir = project / ".fv" / "evidence" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    specs = cohort if cohort else [{"tool": "true", "marker": marker, "command": ["true"]}]
+    executions: list[dict] = []
+    for index, spec in enumerate(specs):
+        name = f"{claim_id}.log" if len(specs) == 1 else f"{claim_id}-{spec['tool']}.log"
+        raw = raw_dir / name
+        result = spec.get("result", "PASS")
+        line = spec.get("marker", marker)
+        raw.write_text("fixture check\n"
+                       + (f"{line}\n" if line else "")
+                       + f"--- fv-evidence: exit={0 if result == 'PASS' else 7} ---\n")
+        executions.append({
+            "tool": spec["tool"],
+            "evidence_class": spec.get("evidence_class", evidence_class),
+            "command": list(spec.get("command", ["true"])),
+            "cwd": spec.get("cwd", "."),
+            "toolchain_digests": {
+                "executable": f"/usr/bin/{spec['tool']}",
+                "sha256": hashlib.sha256(spec["tool"].encode()).hexdigest(),
+                "version": "r6-fixture",
+                "version_exit_code": 0,
+            },
+            "raw_output_path": f".fv/evidence/raw/{name}",
+            "raw_output_hash": sha256_file(raw),
+            "result": result,
+            "run_id": f"r6-{claim_id}-{index}",
+        })
     records = project / ".fv" / "evidence" / "records"
     records.mkdir(parents=True, exist_ok=True)
+    primary = executions[0]
+    bindings = {
+        "source_snapshot": snapshot,
+        "intent_hash": intent_hash,
+        "intent_path": "docs/intent.md",
+        "obligation_manifest_hash": sha256_file(project / ".fv" / "obligations.json"),
+        "profile": "r6-fixture",
+        "required_targets": [claim_id],
+        "environment_policy": "r6-fixture-local",
+        "toolchain_digests": primary["toolchain_digests"],
+        "command": json.dumps(primary["command"]),
+        "configuration": {"cwd": primary["cwd"]},
+        "seeds": None,
+        "raw_output_hash": primary["raw_output_hash"],
+        "raw_output_path": primary["raw_output_path"],
+        "parser_schema_version": schema,
+        "run_id": f"r6-{claim_id}",
+    }
+    # Only v3 carries the execution cohort; a v2 record is exactly what it always was.
+    if schema == "fv-evidence-run/v3":
+        bindings["executions"] = executions
     record = {
-        "claim_id": "A1",
+        "claim_id": claim_id,
         "required": True,
-        "evidence_class": "code-enforced",
+        "evidence_class": evidence_class,
         "result": "PASS",
-        "scope": "r6 fixture invariant",
-        "bindings": {
-            "source_snapshot": snapshot,
-            "intent_hash": intent_hash,
-            "intent_path": "docs/intent.md",
-            "obligation_manifest_hash": sha256_file(project / ".fv" / "obligations.json"),
-            "profile": "r6-fixture",
-            "required_targets": ["A1"],
-            "environment_policy": "r6-fixture-local",
-            "toolchain_digests": {"python": sys.version.split()[0]},
-            "command": json.dumps(["true"]),
-            "configuration": {"cwd": "."},
-            "seeds": None,
-            "raw_output_hash": sha256_file(raw),
-            "raw_output_path": ".fv/evidence/raw/A1.log",
-            "parser_schema_version": schema,
-            "run_id": "r6-1",
-        },
+        "scope": f"r6 fixture obligation {claim_id}",
+        "bindings": bindings,
         "waiver": None,
     }
-    (records / "A1.json").write_text(json.dumps(record, indent=2) + "\n")
+    (records / f"{claim_id}.json").write_text(json.dumps(record, indent=2) + "\n")
     return records
 
 
@@ -324,6 +385,243 @@ def gate_checks(project: Path, snapshot: str) -> None:
           f"exit={result.returncode}")
 
 
+def write_manifest(project: Path, payload: dict) -> Path:
+    manifest = project / ".fv" / "obligations.json"
+    manifest.write_text(json.dumps(payload, indent=2) + "\n")
+    return manifest
+
+
+def system_claim(claim_id: str = "S1", depends_on: object = ("A1", "W1"),
+                 required_evidence: object = ("kani", "verus")) -> dict:
+    return {
+        "id": claim_id,
+        "statement": f"{claim_id} composes its dependencies",
+        "depends_on": list(depends_on) if isinstance(depends_on, tuple) else depends_on,
+        "required_evidence": (list(required_evidence) if isinstance(required_evidence, tuple)
+                              else required_evidence),
+    }
+
+
+def claim_manifest(system_claims: object, **overrides: object) -> dict:
+    payload: dict = {
+        "version": 1,
+        "invariants": [{"id": "A1", "statement": "ok() holds"}],
+        "witnesses": [{"id": "W1", "name": "witness_w1"}],
+        "system_claims": system_claims,
+    }
+    payload.update(overrides)
+    return payload
+
+
+# Per-claim evidence class and the raw-log marker its class demands.
+CLAIM_EVIDENCE = {
+    "A1": ("code-enforced", ""),
+    "W1": ("test-witnessed", "test result: ok."),
+    "S1": ("proof-discharged", ""),
+    "S2": ("bounded-checked", "No violation found"),
+}
+
+
+def system_claim_checks() -> None:
+    """System claims are aggregated as required obligations and validated structurally."""
+    with tempfile.TemporaryDirectory(prefix="r6-claims-") as td:
+        project = build_project(Path(td).resolve())
+        manifest = project / ".fv" / "obligations.json"
+        intent = fv_project.target_hash(project)
+        records = project / ".fv" / "evidence" / "records"
+
+        def run_gate(*extra: str) -> subprocess.CompletedProcess:
+            return gate_b("--records", str(records), "--manifest", str(manifest),
+                          "--root", str(project), *extra)
+
+        def stage(payload: dict, claims: tuple[str, ...],
+                  cohorts: dict[str, list[dict]] | None = None) -> None:
+            """Freeze a manifest, then bind one fresh record per named claim.
+
+            A system claim's record defaults to a cohort covering exactly the tool IDs
+            its declared required_evidence names, which is what Gate B demands of a
+            PASS system claim.
+            """
+            write_manifest(project, payload)
+            snapshot = fv_project.content_snapshot(project)
+            declared: dict[str, list[str]] = {}
+            if isinstance(payload.get("system_claims"), list):
+                for item in payload["system_claims"]:
+                    if isinstance(item, dict) and isinstance(item.get("required_evidence"), list):
+                        declared[item.get("id")] = item["required_evidence"]
+            if records.is_dir():
+                for stale in records.glob("*.json"):
+                    stale.unlink()
+            for claim in claims:
+                evidence_class, marker = CLAIM_EVIDENCE[claim]
+                cohort = (cohorts or {}).get(claim)
+                if cohort is None and claim in declared:
+                    cohort = cohort_for(declared[claim])
+                write_record(project, snapshot, intent, claim_id=claim,
+                             evidence_class=evidence_class, marker=marker, cohort=cohort)
+
+        def mutate_s1(label: str, mutate, fragment: str) -> None:
+            """Re-stage a covering cohort, corrupt one property of it, expect INCOMPLETE."""
+            stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"))
+            record_path = records / "S1.json"
+            record = json.loads(record_path.read_text())
+            mutate(record)
+            record_path.write_text(json.dumps(record, indent=2) + "\n")
+            result = run_gate()
+            check(f"Gate B rejects cohort: {label}",
+                  result.returncode == 3 and fragment in result.stdout,
+                  f"exit={result.returncode} {result.stdout[-300:]}")
+
+        def drop_verus(record: dict) -> None:
+            executions = record["bindings"]["executions"]
+            record["bindings"]["executions"] = [e for e in executions if e["tool"] != "verus"]
+
+        def tamper_second_artifact(record: dict) -> None:
+            second = record["bindings"]["executions"][1]
+            (project / second["raw_output_path"]).write_text(
+                "forged verus run\nVERIFICATION:- SUCCESSFUL\n--- fv-evidence: exit=0 ---\n")
+
+        stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"))
+        result = run_gate("--json")
+        report = json.loads(result.stdout) if result.stdout.strip().startswith("{") else {}
+        check("Gate B: system claim is required and verifies alongside its dependencies",
+              result.returncode == 0 and "VERIFIED" in result.stderr,
+              f"exit={result.returncode} {result.stdout[-300:]}{result.stderr[-200:]}")
+        check("Gate B: system claim enters required claims with kind system_claim",
+              report.get("required_claims") == ["A1", "S1", "W1"]
+              and report.get("obligation_kinds", {}).get("S1") == "system_claim"
+              and report.get("obligation_kinds", {}).get("A1") == "invariant",
+              f"{report.get('required_claims')} {report.get('obligation_kinds')}")
+        check("Gate B: report names each system claim's required evidence tools",
+              report.get("required_evidence", {}).get("S1") == ["kani", "verus"],
+              str(report.get("required_evidence")))
+
+        stage(claim_manifest([system_claim()]), ("A1", "W1"))
+        result = run_gate()
+        check("Gate B: declared system claim without a record is INCOMPLETE",
+              result.returncode == 3 and "S1: no record" in result.stdout,
+              f"exit={result.returncode} {result.stdout[-200:]}")
+
+        stage(claim_manifest([system_claim(required_evidence=("kani",))]), ("A1", "W1", "S1"),
+              {"S1": cohort_for(["kani", "verus"])})
+        result = run_gate()
+        check("Gate B: executions beyond required_evidence do not block a PASS",
+              result.returncode == 0, f"exit={result.returncode} {result.stdout[-300:]}")
+
+        stage(claim_manifest([system_claim()]), ("A1", "W1", "S1"),
+              {"A1": cohort_for(["cargo-check", "clippy"])})
+        result = run_gate()
+        check("Gate B: a non-system claim may carry several valid executions",
+              result.returncode == 0, f"exit={result.returncode} {result.stdout[-300:]}")
+
+        # The record class is the claim's; each artifact is a tool's. A cohort whose
+        # kani log never says "test result: ok." still discharges a test-witnessed claim.
+        stage(claim_manifest([system_claim(required_evidence=("kani",))]), ("A1", "W1"))
+        write_record(project, fv_project.content_snapshot(project), intent, claim_id="S1",
+                     evidence_class="test-witnessed", cohort=cohort_for(["kani"]))
+        result = run_gate()
+        check("Gate B: each cohort artifact is judged by the class that produced it",
+              result.returncode == 0, f"exit={result.returncode} {result.stdout[-300:]}")
+
+        mutate_s1("required tool has no execution", drop_verus,
+                  "missing PASS evidence from required tools ['verus']")
+        mutate_s1("v2-shaped system claim record covers no tool",
+                  lambda record: (record["bindings"].pop("executions"),
+                                  record["bindings"].update(parser_schema_version="fv-evidence-run/v2")),
+                  "missing PASS evidence from required tools")
+        mutate_s1("v3 record without an execution cohort",
+                  lambda record: record["bindings"].pop("executions"),
+                  "missing binding field 'executions'")
+        mutate_s1("failed execution beneath a PASS record",
+                  lambda record: record["bindings"]["executions"][1].update(result="FAIL"),
+                  "executions[1] result 'FAIL' cannot appear beneath a PASS record")
+        mutate_s1("duplicate evidence tool",
+                  lambda record: record["bindings"]["executions"][1].update(tool="kani"),
+                  "executions[1] duplicate evidence tool 'kani'")
+        mutate_s1("tampered second artifact", tamper_second_artifact,
+                  "executions[1] raw output hash mismatch")
+        mutate_s1("execution cwd escapes the repository",
+                  lambda record: record["bindings"]["executions"][1].update(cwd="../outside"),
+                  "executions[1] cwd escapes repository root")
+        mutate_s1("malformed execution argv",
+                  lambda record: record["bindings"]["executions"][1].update(command="verus src/lib.rs"),
+                  "executions[1] command is not a nonempty argv array")
+        mutate_s1("legacy command binding not derived from the first execution",
+                  lambda record: record["bindings"].update(command=json.dumps(["unrelated"])),
+                  "legacy command binding is not derived from executions[0]")
+
+        legacy = {"version": 1,
+                  "invariants": [{"id": "A1", "name": "inv_a1"}],
+                  "witnesses": [{"id": "W1", "name": "witness_w1"}]}
+        stage(legacy, ("A1", "W1"))
+        result = run_gate("--json")
+        report = json.loads(result.stdout) if result.stdout.strip().startswith("{") else {}
+        check("Gate B: manifest without system_claims still verifies unchanged",
+              result.returncode == 0 and report.get("required_claims") == ["A1", "W1"],
+              f"exit={result.returncode} {report.get('required_claims')}")
+
+        def rejects_manifest(label: str, payload: dict, fragment: str) -> None:
+            write_manifest(project, payload)
+            result = run_gate()
+            check(f"Gate B rejects manifest: {label}",
+                  result.returncode == 2 and fragment in result.stdout,
+                  f"exit={result.returncode} {result.stdout[-200:]}")
+
+        nested = [system_claim(depends_on=("A1", "S2")), system_claim("S2", depends_on=("W1",))]
+        mutual = [system_claim(depends_on=("S2",)), system_claim("S2", depends_on=("S1",))]
+        for label, payload, fragment in (
+            ("id duplicated across collections",
+             claim_manifest([system_claim("A1", depends_on=("W1",))]),
+             "duplicate obligation id 'A1'"),
+            ("system_claims is not an array",
+             claim_manifest({"S1": system_claim()}), "system_claims is not an array"),
+            ("invariants entry is not an object",
+             claim_manifest([system_claim()], invariants=["A1"]), "invariants[0] is not an object"),
+            ("system claim entry is not an object",
+             claim_manifest(["S1"]), "system_claims[0] is not an object"),
+            ("system claim without an id",
+             claim_manifest([{"depends_on": ["A1"], "required_evidence": ["kani"]}]),
+             "has malformed id None"),
+            ("blank system claim id",
+             claim_manifest([system_claim("  ")]), "has malformed id '  '"),
+            ("missing depends_on",
+             claim_manifest([system_claim(depends_on=None)]),
+             "depends_on is not a nonempty array"),
+            ("empty depends_on",
+             claim_manifest([system_claim(depends_on=[])]),
+             "depends_on is not a nonempty array"),
+            ("depends_on is a bare string",
+             claim_manifest([system_claim(depends_on="A1")]),
+             "depends_on is not a nonempty array"),
+            ("duplicate dependency",
+             claim_manifest([system_claim(depends_on=("A1", "A1"))]),
+             "depends_on repeats 'A1'"),
+            ("unknown dependency",
+             claim_manifest([system_claim(depends_on=("A1", "Z9"))]),
+             "depends on undeclared obligation 'Z9'"),
+            ("dependency on another system claim", claim_manifest(nested),
+             "depends_on names invariants and witnesses only"),
+            ("mutually dependent system claims", claim_manifest(mutual),
+             "depends_on names invariants and witnesses only"),
+            ("self-dependent system claim",
+             claim_manifest([system_claim(depends_on=("S1",))]),
+             "depends_on names invariants and witnesses only"),
+            ("empty required_evidence",
+             claim_manifest([system_claim(required_evidence=[])]),
+             "required_evidence is not a nonempty array"),
+            ("duplicate required_evidence",
+             claim_manifest([system_claim(required_evidence=("kani", "kani"))]),
+             "required_evidence repeats 'kani'"),
+            ("malformed evidence id",
+             claim_manifest([system_claim(required_evidence=("cargo kani",))]),
+             "required_evidence[0] is malformed: 'cargo kani'"),
+            ("non-string evidence id",
+             claim_manifest([system_claim(required_evidence=[7])]),
+             "required_evidence[0] is malformed: 7"),
+        ):
+            rejects_manifest(label, payload, fragment)
+
+
 def project_binding_checks() -> None:
     with tempfile.TemporaryDirectory(prefix="r6-project-") as td:
         root = Path(td).resolve()
@@ -410,6 +708,7 @@ def main() -> int:
               r.returncode == 0, f"exit={r.returncode}")
 
     project_binding_checks()
+    system_claim_checks()
 
     print()
     if FAILURES:
