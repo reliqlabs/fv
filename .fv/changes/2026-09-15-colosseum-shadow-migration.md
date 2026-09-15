@@ -169,7 +169,12 @@ The second: the migration first carried legacy `required_targets` into obligatio
 - Axioms added/removed: none
 - Coverage shift: evidence bindings move from commit-plus-dirty-flag to a verified-input content snapshot; a claim's evidence may now be a tool cohort rather than a single command, with one raw artifact per execution and no artifact shared between claims; a Gate B verdict now discloses its freshness discipline as `binding=recomputed|pinned|unbound`; verification layers become project-configurable, custom layers included; `.fv/history/` and the migrator's staging prefix `.fv/.migrate-staging/` become structural snapshot exclusions rather than a migrated-project convention; legacy `.colosseum` artifacts become either mapped FV artifacts or quarantined history under `.fv/history/colosseum/`; a migrated obligation's id is producer-usable by construction, with `legacy_id` carrying the legacy string and colliding ids blocking rather than being silently disambiguated
 
+## Deployment verification
+
+- Gula real-project dry run against `/Users/mvid/Development/burnt/dossier-integration`: exit 0, `status: ok`, 5 mapped, 173 preserved-history, 0 unsupported, 0 conflicts, target `docs/intent.md`; the complete `.colosseum` digest was identical before and after. No shadow state was applied.
+- Gula fresh-project doctor: PASS with the deployed OMP source and six verified-input exclusion prefixes.
+- Gula full `scripts/ci.py`: all six checks PASS. Local full CI passed the same six checks before deployment.
+
 ## Outstanding follow-ups
 
-- A real legacy-project dry run: read an actual `.colosseum` tree, review its `mapped` / `preserved-history` / `unsupported` classification, and only then consider `--apply`. Until that happens, the migrator is rehearsed, not exercised.
 - Re-earning evidence for a migrated project: `preserved-history` records are not live evidence, so a migrated project has no v3 records until its plan is run.
