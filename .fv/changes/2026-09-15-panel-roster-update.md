@@ -14,7 +14,7 @@ The OMP-owned `panel.roles.fv-canonical` seed now resolves:
 3. `fireworks/glm-5.3:high`, with `ollama-cloud/glm-5.3` as the availability fallback
 4. `synthetic/hf:moonshotai/Kimi-K3:high`, with `fireworks/kimi-k3` as the availability fallback
 
-The recorded effort remains one rung below `max` for each selected provider ladder. All four seats have distinct families, so the four-family floor remains satisfiable.
+OMP's live lineup resolver returned the distinct families `openai`, `anthropic`, `glm`, and `kimi`, satisfying `minFamilies: 4`, with lineup hash `sha256:b9ef78fd0563443db4c7c0b8d66d6427ef1ea74645d87a80f489786dc392e3cc`.
 
 ## Calibration boundary
 
@@ -26,7 +26,7 @@ Kimi K3 retains its exact-route attested calibration. Fable 5.1, GPT-6 Astra, an
 - `registry/voices.json`
 - generated roster blocks and `scripts/dispatch.config.example.json`
 - manual roster guidance in `skills/fv-adversarial/SKILL.md`, `skills/fv-panel/SKILL.md`, and `ROADMAP.md`
-- integration fixtures for GLM fallback and customized panel preservation
+- integration fixtures for GLM fallback, customized panel preservation, native dispatch, and scoped calibration suppression
 
 ## Verification
 
@@ -35,7 +35,11 @@ Kimi K3 retains its exact-route attested calibration. Fable 5.1, GPT-6 Astra, an
 - `tests/r29_omp_integration.py`: PASS
 - `tests/r31_omp_panel.py`: PASS
 - `tests/r32_resolver_contract.py`: PASS
+- `tests/r30_omp_native_dispatch.py`: PASS
+- `tests/r33_omp_calibration_session.py`: PASS
 - Fresh-project `omp config get panel`: exact requested roster and effort levels
 - Fresh-project `fv_doctor.py`: PASS, including effective model availability and thinking-level checks
+- Live OMP `resolvePanelLineup`: four distinct resolved families and persisted lineup hash
+- Full `scripts/ci.py`: PASS, 6 checks
 
 No route-calibration run was performed. The three pending routes must remain labeled pending until measured and attested.
