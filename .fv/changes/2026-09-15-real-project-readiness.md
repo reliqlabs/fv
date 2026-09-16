@@ -5,7 +5,7 @@
   change is recorded here. This record states what the committed migrator and
   the committed Gate A say about ten real legacy `.colosseum` projects, and what
   an operator must do before each can cross into `.fv/`. The remediation
-  sequence R1 prescribes uses an uncommitted working-tree capability whose own
+  sequence R1 prescribes is committed capability as of `4ca303c`, whose own
   record is `.fv/changes/2026-09-15-colosseum-shadow-migration.md`; no project
   verdict here depends on it, because no project has used it.
 - Intent revision: none. This repository declares no `.fv/intent.md`; the
@@ -14,18 +14,22 @@
   `.fv/changes/2026-09-15-colosseum-shadow-migration.md`.
 - Commits under observation: `f2d0556`, `9eb3709`, `b1003a3`, `8508604`,
   `5dc765e`, `d5ce1c2`, `dec002d`, plus `0fa4e22` (legacy migration input
-  contracts) and `368cae0` (legacy ledgers gated before migration). `368cae0` is
-  what flips the three dossier verdicts from `ok` to `blocked` and adds a row to
-  quartz's and verified-rcv's already-blocked runs; the remaining five verdicts
-  (clanked, colosseum, dens, travel, zkdcap) are unaffected by it.
-  Also observed, and kept separate because it is not committed: the
-  ledger-remediation staging surface in the working tree
+  contracts), `368cae0` (legacy ledgers gated before migration) and `4ca303c`
+  (writable ledger migration remediation). `368cae0` is what flips the three
+  dossier verdicts from `ok` to `blocked` and adds a row to quartz's and
+  verified-rcv's already-blocked runs — it wires a ledger check into the
+  migrator's preflight, and the gate it wires in was already refusing those
+  same ledgers before this commit series started (see "Three gate vintages on
+  the same bytes"). The remaining five verdicts (clanked, colosseum, dens,
+  travel, zkdcap) are unaffected by it.
+  Also observed, and kept separate because it is validated but unused: the
+  ledger-remediation staging surface committed as `4ca303c`
   (`--stage-ledger-remediation`, plus a live `.fv/ledger.md` outranking the
   legacy ledger, described in
   `.fv/changes/2026-09-15-colosseum-shadow-migration.md`). It changes no row of
-  the table below, because no project has been staged: every verdict here is
-  the committed migrator at `368cae0` reading a project that carries no live
-  `.fv/ledger.md`.
+  the table below, because no project has been staged: every verdict here is a
+  migrator reading a project that carries no live `.fv/ledger.md`, and on such
+  a project `368cae0` and `4ca303c` decide readiness from the same file.
 - Compatibility posture: established. Nothing here alters an accepted record
   format or CLI surface.
 
@@ -40,15 +44,16 @@ re-running the tool: every remaining blocker is remediated by an operator, not
 by the migrator, which validates readiness and never rewrites a ledger and
 never writes into `.colosseum/` at all. Two of the three classes are fixed in
 the legacy tree; the ledger class is fixed in a copy the tool can stage outside
-it. Nothing was staged either: `--stage-ledger-remediation` exists in the
-working tree and has been run against no real project.
+it. Nothing was staged either: `--stage-ledger-remediation` is committed at
+`4ca303c` and has been run against no real project.
 
-The remediation path itself is now toolkit capability rather than an
+The remediation path itself is committed toolkit capability rather than an
 instruction, which changes what R1 below asks an operator to do and changes
 nothing about this inventory. Staging gives the operator a writable
-`.fv/ledger.md` to edit and a re-run that judges it, and the count of projects
-whose own bytes let them cross into `.fv/` stays 1 of 10 until a project
-actually uses it.
+`.fv/ledger.md` to edit and a re-run that judges it; it is validated on the
+deployment host (see "Toolkit readiness") and unused, and the count of
+projects whose own bytes let them cross into `.fv/` stays 1 of 10 until a
+project actually uses it.
 
 Two readiness facts must not be conflated, and this record keeps them apart:
 
@@ -66,10 +71,12 @@ Dry run, `scripts/fv_migrate.py PROJECT` with no `--apply`. `exit 0` +
 `status ok` is apply-ready; `exit 1` + `status blocked` means at least one
 `unsupported` or `conflict` row, and the tool refuses before proposing any
 write. Every row below is the **current** preflight — the migrator at
-`368cae0`, with the legacy-ledger readiness check wired in. The earlier
-inventory, taken before that commit, is reported separately under "Old Gate A
-versus current Gate A" and disagrees with this table on the three dossier rows
-by exactly that check.
+`368cae0`, with the legacy-ledger readiness check wired in, and unchanged by
+`4ca303c` on these ten because none of them carries a live `.fv/ledger.md`.
+The earlier inventory, taken before that commit, is reported separately under
+"Three gate vintages on the same bytes" and disagrees with this table on the
+three dossier rows by exactly that check being absent, not by the gate having
+changed its mind.
 
 | Project | Path (host-relative) | exit | status | mapped | preserved-history | unsupported rows | conflicts | elected `target_spec` |
 |---|---|---|---|---|---|---|---|---|
@@ -123,13 +130,13 @@ the gate *returns* is a rejection of the ledger's bytes; anything that stops the
 gate from returning a status at all is an infrastructure failure of the check
 and says so. All five rows here are the first kind — the gate ran and refused.
 
-Under the uncommitted staging surface the row key follows whichever ledger was
-checked, `.fv/ledger.md#gate-a` for a project carrying a live ledger and
-`.colosseum/ledger.md#gate-a` otherwise, and the legacy-keyed refusal points at
-`--stage-ledger-remediation` for a writable copy. Every row observed here is
-legacy-keyed for a reason that has nothing to do with those projects' contents:
-they were produced by the committed migrator, which checks the legacy ledger
-and only the legacy ledger.
+Under the staging surface committed at `4ca303c` the row key follows whichever
+ledger was checked, `.fv/ledger.md#gate-a` for a project carrying a live
+ledger and `.colosseum/ledger.md#gate-a` otherwise, and the legacy-keyed
+refusal points at `--stage-ledger-remediation` for a writable copy. Every row
+observed here is legacy-keyed for a reason that has nothing to do with those
+projects' contents: none of the ten carries a live `.fv/ledger.md`, so the
+legacy ledger is the only candidate either commit can check.
 
 The four refusal classes observed across the refused ledgers, verbatim from the
 gate's own output:
@@ -139,15 +146,21 @@ gate's own output:
 - `cited line is empty or comment-only` — the citation resolves to a doc-comment
   or a section comment rather than to content.
 - `unparseable 'code:' citation 'code:'` — a `code:` annotation with no value,
-  which the current grammar fails loudly instead of skipping.
+  which the gate fails loudly instead of skipping. Loud failure here is not new
+  in this commit series: the gate at `9c78dde` already refused an unparseable
+  `code:` value rather than silently skipping it.
 - `malformed content binding in citation '@sha256:'` — a binding suffix with no
   hex digits behind it, read as drift rather than as prose.
 
 Failure totals on the three dossier ledgers: **39**, **39**, and **36**
-failures, ending `GATE FAILED`. Per-ledger full text is not reproduced here
-beyond those exemplars; the complete bounded diagnostic is in each run's
-`#gate-a` row, so **re-run `fv_migrate.py PROJECT --json`** to read a project's
-full refusal before remediating it.
+failures, ending `GATE FAILED`. Those are the current totals; the pre-series
+gate at `9c78dde` refused the same three ledgers with **83**, **92**, and
+**80** failures, so the current grammar refuses these bytes with strictly
+fewer findings than the gate that preceded it (table in "Three gate vintages
+on the same bytes"). Per-ledger full text is not reproduced here beyond those
+exemplars; the complete bounded diagnostic is in each run's `#gate-a` row, so
+**re-run `fv_migrate.py PROJECT --json`** to read a project's full refusal
+before remediating it.
 
 ### 2. `.colosseum#intent` — no dispatch target can be elected
 
@@ -199,49 +212,71 @@ The boundary held on all ten projects, and this record claims nothing beyond it:
   projects never reached a write plan at all.
 - zkdcap is apply-ready, **not applied**. Its `--apply` remains an unexercised
   path against a real project.
-- The staging path is toolkit capability, not a project state: it is exercised
-  only by test fixtures, and R1 below is what an operator would run, not a
-  record of a run.
+- The staging path is committed toolkit capability, not a project state: it is
+  exercised by test fixtures and by the deployment-host validation runs below,
+  and R1 below is what an operator would run, not a record of a run.
 
-## Old Gate A versus current Gate A
+## Three gate vintages on the same bytes
 
 This is why the three dossier trees read `status ok` in the first inventory and
-`status blocked` now, and why quartz and verified-rcv each grew a row. It is a
-contract upgrade, not a regression and not a parser crash.
+`status blocked` now, and why quartz and verified-rcv each grew a row. Three
+vintages of Gate A exist on these ledgers, and reading only two of them invites
+the wrong conclusion:
 
-| Ledger | Project's own copied Gate A | Extension's current Gate A |
-|---|---|---|
-| dossier | exit 0 — `OK: 138 citation(s), 41 dependency link(s), 8 axiom annotation(s)` | exit 1 — `GATE FAILED: 39 failure(s)` |
-| dossier-integration | exit 0 — `OK: 147 citation(s), 41 dependency link(s), 8 axiom annotation(s)` | exit 1 — `GATE FAILED: 39 failure(s)` |
-| dossier-organization | exit 0 — `OK: 139 citation(s), 41 dependency link(s), 8 axiom annotation(s)` | exit 1 — `GATE FAILED: 36 failure(s)` |
-| quartz | no copied gate in the project | exit 1 |
-| verified-rcv | no copied gate in the project | exit 1 |
+| Ledger | Project's own copied Gate A (pre-`9c78dde` vintage) | Extension Gate A at `9c78dde` (pre-series baseline) | Extension Gate A at `4ca303c` (current) |
+|---|---|---|---|
+| dossier | exit 0 — `OK: 138 citation(s), 41 dependency link(s), 8 axiom annotation(s)` | exit 1 — `GATE FAILED: 83 failure(s)` | exit 1 — `GATE FAILED: 39 failure(s)` |
+| dossier-integration | exit 0 — `OK: 147 citation(s), 41 dependency link(s), 8 axiom annotation(s)` | exit 1 — `GATE FAILED: 92 failure(s)` | exit 1 — `GATE FAILED: 39 failure(s)` |
+| dossier-organization | exit 0 — `OK: 139 citation(s), 41 dependency link(s), 8 axiom annotation(s)` | exit 1 — `GATE FAILED: 80 failure(s)` | exit 1 — `GATE FAILED: 36 failure(s)` |
+| quartz | no copied gate in the project | not run | exit 1 |
+| verified-rcv | no copied gate in the project | not run | exit 1 |
 
-Three things this comparison establishes:
+The `9c78dde` column was produced by checking out that commit's
+`scripts/check_ledger_references.py` — the last revision before this commit
+series touched the gate (`f2d0556`, `5dc765e`, `0fa4e22`) — and running it on
+the deployment host against the same real ledgers, same `--root PROJECT`,
+same default strictness.
 
-1. **Same bytes, two verdicts.** The older copied gate accepts these ledgers;
-   the current one refuses them. The refusals are the citation-grammar and
-   content-binding rules the current gate added — mandatory `@sha256:<12hex>`
-   bindings, loud failure on an unparseable `code:` value, drift on a malformed
-   binding, and content sanity on the cited line. A ledger that passed an older
-   contract is not thereby ready for the current one.
-2. **The copied gates are of an older CLI vintage too.** Invoking a project's
-   copy with the current CLI shape (`<ledger> --root <root>`) exits 2 with
-   `unrecognized arguments`: the copies want `--ledger LEDGER`. That is exactly
-   the hazard `368cae0` closes by loading the gate from its own path and calling
-   it in-process — a project's stale copy must never be what decides readiness,
-   and the answer must not depend on cwd, on an interpreter on PATH, or on
-   quoting.
-3. **The status change is the gate, not the migrator.** The first inventory ran
-   the migrator *before* `368cae0` wired the ledger-readiness check, and the
-   three dossier trees read `exit 0`, `status ok`, `unsupported 0`,
-   `conflicts 0`, target `docs/intent.md`. The current preflight reports the
-   same three trees blocked by exactly one row each,
-   `.colosseum/ledger.md#gate-a`, with their mapped/preserved counts unchanged
-   in shape (5 mapped; 166 / 173 / 169 preserved). Nothing about the migrator's
-   classification of those trees changed; one new blocking check was applied to
-   bytes that were always this way. The earlier `status ok` for
-   dossier-integration recorded in
+Four things this comparison establishes, the first of them a correction:
+
+1. **The new grammar did not turn a pass into a fail.** The gate refused all
+   three dossier ledgers *before* this series began, at `9c78dde`, and refuses
+   them now with strictly fewer findings: 83 → 39, 92 → 39, 80 → 36. The
+   verdict is identical (exit 1, refused) across both extension vintages; only
+   the finding count moved, and it moved down. Any framing in which the current
+   citation grammar is what broke these ledgers is wrong.
+   [INFERENCE] The drop is consistent with the ambiguity the new parser was
+   written to remove — the legacy alternation read a fully backticked
+   `code: path:line@sha256:…` annotation as a path literally named
+   `code: path`, which then failed as a missing file on top of the
+   malformed-annotation report for the same span — but this record did not
+   diff the per-finding sets, so the mechanism is not claimed as observed.
+2. **Mandatory content binding is older than this series.** `@sha256:<12hex>`
+   on every citation, content sanity on the cited line, loud failure on an
+   unparseable `code:` value, and the no-vacuous-pass rule are all present in
+   the gate's documented checks at `9c78dde`. They are not what `368cae0`
+   added.
+3. **The copied gates pass because they are a looser, older contract.** The
+   project copies accept these same bytes, and they predate `9c78dde`: invoked
+   with the CLI shape both extension vintages accept (`<ledger> --root <root>`)
+   they exit 2 with `unrecognized arguments`, because they want
+   `--ledger LEDGER`. Their exit 0 is the verdict of a contract vintage that no
+   longer exists in this repository, not a second opinion on the current one.
+   That is exactly the hazard `368cae0` closes by loading the gate from its own
+   path and calling it in-process — a project's stale copy must never be what
+   decides readiness, and the answer must not depend on cwd, on an interpreter
+   on PATH, or on quoting.
+4. **The status change is the migrator wiring, not the gate's opinion.** The
+   first inventory ran the migrator *before* `368cae0` wired the
+   ledger-readiness check, so no ledger was checked at all and the three
+   dossier trees read `exit 0`, `status ok`, `unsupported 0`, `conflicts 0`,
+   target `docs/intent.md`. The current preflight reports the same three trees
+   blocked by exactly one row each, `.colosseum/ledger.md#gate-a`, with their
+   mapped/preserved counts unchanged in shape (5 mapped; 166 / 173 / 169
+   preserved). Nothing about the migrator's classification of those trees
+   changed, and nothing about the gate's verdict on those bytes changed either;
+   an already-refusing check was newly made blocking. The earlier `status ok`
+   for dossier-integration recorded in
    `.fv/changes/2026-09-15-colosseum-shadow-migration.md` under "Deployment
    verification" is therefore superseded as a *readiness* claim while remaining
    accurate as a record of that run.
@@ -297,10 +332,10 @@ instead. Nothing is lost by fixing the staged copy: the legacy original survives
 byte for byte in both `.colosseum/` and history.
 
 Two cautions. A staged but unedited ledger still blocks, now at
-`.fv/ledger.md#gate-a` — staging is not remediation. And this path is
-uncommitted worktree state in this repository (see
-`.fv/changes/2026-09-15-colosseum-shadow-migration.md`), exercised against test
-fixtures only; no project in the table above has been staged.
+`.fv/ledger.md#gate-a` — staging is not remediation. And this path, though
+committed at `4ca303c` and validated on the deployment host (see
+`.fv/changes/2026-09-15-colosseum-shadow-migration.md`), has been exercised
+against test fixtures only; no project in the table above has been staged.
 
 ### R2. Declare a canonical intent
 
@@ -331,39 +366,38 @@ every unsupported row it finds, so a single re-run confirms both at once.
 
 ## Toolkit readiness
 
-Executed on the deployment host, not inferred, and distinct from the project
-readiness above:
+Executed on the deployment host at `4ca303c`, not inferred, and distinct from
+the project readiness above:
 
-- `tests/run_all.py`: **all 32 suites PASS.** The runner enumerates
-  `tests/r*.py` + `tests/m*.py` minus itself, and refuses a zero-suite run, so
-  "32" is the whole suite set rather than a filtered subset.
+- `tests/run_all.py`: **all 32 suites PASS,** exit 0, 106s. The runner
+  enumerates `tests/r*.py` + `tests/m*.py` minus itself, and refuses a
+  zero-suite run, so "32" is the whole suite set rather than a filtered subset.
 - `scripts/ci.py`: **6 of 6 checks PASS** — `frontmatter`, `roster-drift`,
   `doc-links`, `dispatch-config`, `fixture-tracking`, `regression` — run
   **without** `--tolerate-incomplete`, so the regression check had to pass
   outright rather than being allowed to degrade to the toolchain-incomplete
   exit 3 a bare runner is permitted.
 
-Those two runs cover the committed migrator. The ledger-remediation staging
-surface R1 now uses is uncommitted worktree state, and its evidence is narrower
-and local:
+Because `4ca303c` is the commit that lands the ledger-remediation staging
+surface, those two runs cover it: the path R1 prescribes is **validated and
+unused**. Its targeted evidence, from local runs of two of the suites the
+32/32 also enumerates:
 
-- `python3 tests/r35_colosseum_migration.py`: **exit 0, 534 assertions pass,**
-  59 of them in the two new phases `check_stage_ledger_remediation` (30) and
+- `tests/r35_colosseum_migration.py`: **exit 0, 534 assertions pass,** 59 of
+  them in the two staging phases `check_stage_ledger_remediation` (30) and
   `check_live_ledger_remediation` (29).
-- `python3 tests/r36_dossier_rehearsal.py`: **exit 0, 214 assertions pass,** 41
-  of them under `check_ledger_remediation`, which drives the whole stage / edit
-  / re-run / apply sequence against the dossier-shaped fixture and asserts that
+- `tests/r36_dossier_rehearsal.py`: **exit 0, 214 assertions pass,** 41 of them
+  under `check_ledger_remediation`, which drives the whole stage / edit /
+  re-run / apply sequence against the dossier-shaped fixture and asserts that
   `.colosseum/` stays byte-identical throughout, the operator's edited bytes are
   what remain on disk, the superseded legacy ledger is history byte for byte,
   and a re-apply changes not a byte. The two totals are separate suites with
   different per-check vocabularies, not one summed number.
-- **Pending:** a full local `scripts/ci.py` run, a full `tests/run_all.py` run,
-  and Gula re-validation of both over this worktree. The 32/32 and 6/6 results
-  above predate the staging surface and do not cover it.
 
 What this does and does not license: the migrator, the gates, the producer, and
-the doctor behave as specified on a host with the toolchain. It says nothing
-about any legacy tree's readiness, and it does not make a refused ledger ready.
+the doctor behave as specified on a host with the toolchain, staging included.
+It says nothing about any legacy tree's readiness, it does not make a refused
+ledger ready, and a green staging suite is not a staged project.
 
 ## Affected verification surface
 
@@ -390,9 +424,14 @@ carries its own adversarial pass and closure reviews, recorded in
   real legacy projects can currently cross into `.fv/`, and that 9 are blocked
   on operator-owned input defects in three named classes.
 - Capability shift, no readiness shift: the ledger blocker class now has a
-  toolkit path (stage the ledger, edit the staged copy, re-run), which is what
-  R1 prescribes. The apply-ready count stays 1 of 10 because no project has
-  used it.
+  committed toolkit path (stage the ledger, edit the staged copy, re-run),
+  which is what R1 prescribes. The apply-ready count stays 1 of 10 because no
+  project has used it.
+- Gate A's verdict on the refused ledgers is not a shift at all. The
+  pre-series gate at `9c78dde` refused the same three dossier ledgers (83 / 92
+  / 80 failures) that the current one refuses (39 / 39 / 36). What changed in
+  this series is which gate the migrator consults and when, not whether these
+  bytes pass.
 
 ## Outstanding follow-ups
 
@@ -406,14 +445,13 @@ carries its own adversarial pass and closure reviews, recorded in
   unexercised. The five R1 projects are the candidates, and staging one writes
   exactly one file, `.fv/ledger.md`, leaving that project blocked until its
   citations are fixed there.
-- The staging surface itself is uncommitted worktree state whose validation is
-  partial: r35 (534 assertions) and r36 (214 assertions) pass locally, and a
-  full `scripts/ci.py`, a full `tests/run_all.py`, and Gula re-validation are
-  pending.
+- The staging surface is committed at `4ca303c` and covered by the 32/32 and
+  6/6 deployment-host runs above; what remains unexercised is its use, not its
+  validation.
 - A migrated project has no `fv-evidence-run/v3` evidence until its verification
   plan is run: `preserved-history` is not live evidence. zkdcap would migrate
   with no obligations manifest and no plan at all, so it starts with nothing to
   discharge and nothing discharged.
 - Nine projects wait on R1, R2, and R3. None of them is waiting on this
-  repository for a code change; R1 now waits on an operator running a tool this
-  repository already carries in its working tree.
+  repository for a code change; R1 waits on an operator running a tool this
+  repository already carries, committed and validated.
