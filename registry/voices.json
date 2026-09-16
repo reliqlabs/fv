@@ -40,10 +40,10 @@
   "voices": [
     {
       "id": "claude-agent",
-      "model": "anthropic/claude-fable-5",
-      "omp_model": "anthropic/claude-fable-5",
+      "model": "anthropic/claude-fable-5-1",
+      "omp_model": "anthropic/claude-fable-5-1",
       "omp_calibration": "pending",
-      "omp_route_grade": "unattested",
+      "omp_route_grade": "not-run",
       "omp_thinking_level": "xhigh",
       "family": "Anthropic",
       "harness": "omp",
@@ -55,7 +55,7 @@
       "endpoint": null,
       "added": "2026-07-11",
       "retired": null,
-      "notes": "OMP Anthropic route for Fable 5. If unavailable, resolve the strongest compatible Opus candidate. Historical calibration ran at maximum reasoning; routine OMP dispatch uses the recorded one-below-max rung.",
+      "notes": "OMP Anthropic route for Fable 5.1. Historical Fable 5 fitness evidence is retained as lineage context; this exact route is not yet calibrated or attested. Routine dispatch uses the recorded one-below-max rung.",
       "omp_thinking_ladder": [
         "low",
         "medium",
@@ -63,7 +63,7 @@
         "xhigh",
         "max"
       ],
-      "omp_calibration_note": "2026-07-28-r3: scored 7/7 on the leasedb corpus over the OMP-native transport (D1 excluded for all voices as mis-specified), clearing the pre-registered floor. NOT calibrated, because the route-attestation gate could not confirm which provider served it: its first configured fallback hop (openai-codex/gpt-5.6-sol) was already active, so a partial degrade onto it leaves no new usage-ledger counter. Instrument limitation, not a fitness failure. Fix for the next run: clear retry.fallbackChains for the routes under test so a degrade is impossible rather than merely detectable."
+      "omp_calibration_note": "Fable 5.1 route selected by operator on 2026-09-15. No route-specific OMP calibration or attestation has run yet."
     },
     {
       "id": "kimi-k2.6",
@@ -85,23 +85,23 @@
       "notes": "OMP Burnt gateway route for Kimi K2.6. Superseded in canonical-4 by Kimi K3 after the 2026-07-26 calibration; retained as a candidate because the route remains usable."
     },
     {
-      "id": "gpt-5.6-sol",
-      "model": "openai-codex/gpt-5.6-sol",
-      "omp_model": "openai-codex/gpt-5.6-sol",
+      "id": "gpt-6-astra",
+      "model": "openai-codex/gpt-6-astra",
+      "omp_model": "openai-codex/gpt-6-astra",
       "omp_calibration": "pending",
-      "omp_route_grade": "unattested",
+      "omp_route_grade": "not-run",
       "omp_thinking_level": "xhigh",
       "family": "OpenAI",
       "harness": "omp",
       "provider": "openai-codex",
       "default_variant": "high",
       "status": "canonical-panel",
-      "calibration": "Seeded-defect recall 8/8 with correct categories, blinded single-pass code review, 2 marginal unmatched extras (calibration/2026-07-13-r1). Sibling variant gpt-5.6-sol-pro scored 8/8 in the same run before the operator standardized on sol.",
+      "calibration": "Historical OpenAI-seat fitness evidence: GPT-5.6 Sol scored seeded-defect recall 8/8 with correct categories in a blinded single-pass review (calibration/2026-07-13-r1). GPT-6 Astra is the operator-selected successor; exact-model fitness remains uncalibrated.",
       "requires_env": [],
       "endpoint": null,
-      "added": "2026-07-11",
+      "added": "2026-09-15",
       "retired": null,
-      "notes": "OMP openai-codex route for GPT-5.6 Sol. Historical fitness evidence was collected at maximum reasoning; routine dispatch uses the recorded xhigh rung.",
+      "notes": "OMP openai-codex route for GPT-6 Astra. Historical GPT-5.6 Sol evidence is lineage context only; this exact route is not yet calibrated or attested.",
       "omp_thinking_ladder": [
         "low",
         "medium",
@@ -109,7 +109,7 @@
         "xhigh",
         "max"
       ],
-      "omp_calibration_note": "2026-07-28-r3: scored 7/7 on the leasedb corpus over the OMP-native transport (D1 excluded for all voices as mis-specified). NOT calibrated, unattested for the same reason as claude-agent: its first configured fallback hop (synthetic/hf:moonshotai/Kimi-K3) was active during the run, so a partial degrade there is undetectable. Instrument limitation, not a fitness failure."
+      "omp_calibration_note": "GPT-6 Astra route selected by operator on 2026-09-15. No route-specific OMP calibration or attestation has run yet."
     },
     {
       "id": "deepseek-v4-flash",
@@ -174,31 +174,29 @@
       "notes": "NVIDIA Nemotron 3 120B-A12B MoE via the Burnt gateway; reasoning on (variants.max -> reasoningEffort high). Rostered candidate, no fitness run documented yet."
     },
     {
-      "id": "glm-5.2",
-      "model": "synthetic/hf:zai-org/GLM-5.2",
-      "omp_model": "synthetic/hf:zai-org/GLM-5.2",
+      "id": "glm-5.3",
+      "model": "fireworks/glm-5.3",
+      "omp_model": "fireworks/glm-5.3",
       "omp_calibration": "pending",
-      "omp_route_grade": "degraded",
+      "omp_route_grade": "not-run",
       "omp_thinking_level": "high",
       "family": "Zhipu",
       "harness": "omp",
-      "provider": "synthetic",
+      "provider": "fireworks",
       "default_variant": "high",
       "status": "canonical-panel",
-      "calibration": "Seeded-defect recall 8/8 with correct categories via the Fireworks route, blinded single-pass code review (calibration/2026-07-13-r1).",
+      "calibration": "Historical Zhipu-seat fitness evidence: GLM 5.2 scored seeded-defect recall 8/8 with correct categories via Fireworks (calibration/2026-07-13-r1). GLM 5.3 is the operator-selected successor; exact-model fitness remains uncalibrated.",
       "requires_env": [],
       "endpoint": null,
-      "added": "2026-07-11",
+      "added": "2026-09-15",
       "retired": null,
-      "notes": "OMP synthetic route for GLM 5.2. Historical Fireworks calibration and OMP route evidence are distinct; omp_route_grade records the current transport limitation.",
+      "notes": "OMP Fireworks route for GLM 5.3 with Ollama Cloud as the panel fallback. Historical GLM 5.2 evidence is lineage context only; this exact route is not yet calibrated or attested.",
       "omp_thinking_ladder": [
-        "minimal",
         "low",
-        "medium",
         "high",
         "max"
       ],
-      "omp_calibration_note": "2026-07-28-r3: scored 6/7 on the leasedb corpus (missed D6, the zero-ttl coercion in acquire; it filed the equivalent coercion in renew instead). Score EXCLUDED as evidence: the route degraded mid-run. fireworks/glm-5.2 went from absent to 22 requests while the synthetic route took 10, with the fireworks traffic in the hour bucket its 1827s dispatch crossed into. The configured chain pins fireworks/glm-5.2:high, so the degrade moved BOTH provider and rung off the xhigh under test. served_by_fallback stayed empty throughout: the OMP bridge cannot see this, which is why attestation comes from the usage ledger."
+      "omp_calibration_note": "GLM 5.3 Fireworks route selected by operator on 2026-09-15. No route-specific OMP calibration or attestation has run yet."
     },
     {
       "id": "kimi-k3",
@@ -273,18 +271,18 @@
   "profiles": [
     {
       "name": "canonical-4",
-      "description": "The default milestone panel. Set by operator decision 2026-07-13 as claude-agent (in-harness, Fable 5 or strongest available Opus), gpt-5.6-sol (direct openai provider), glm-5.2 (Fireworks), and kimi-k2.6 (Burnt gateway), all at --variant max. The Moonshot seat changed on 2026-07-26: kimi-k3 (Fireworks) replaced kimi-k2.6 after clearing the pre-registered entry floor and relative bar on a fresh held-out corpus (calibration/2026-07-26-r2). Every member holds cited seeded-recall calibration; the first three at 8/8 on calibration/2026-07-13-r1, kimi-k3 at 7/8 on the harder 2026-07-26-r2 corpus where the incumbent re-baselined at 6/8. Supersedes canonical-5 (memberships pinnable at canonical-5@sha256:19595e6530eb6331 and canonical-5@sha256:63b7c9db3c128174) and the pre-swap canonical-4@sha256:08831d0ce9f2086b. Pin a run as 'panel canonical-4@<content_hash>'. Effort: every seat dispatches one step below its model's maximum thinking level (xhigh for claude-fable-5 and gpt-5.6-sol, high for glm-5.2 and kimi-k3), set 2026-07-26. All cited calibration evidence predates that change and was collected at max, so the panel's recorded fitness describes the max operating point, not the current one.",
+      "description": "The default milestone panel. Operator-selected roster as of 2026-09-15: Claude Fable 5.1, GPT-6 Astra, GLM 5.3, and Kimi K3. The Kimi K3 OMP route retains its attested calibration; the three successor routes are pending exact-route calibration and must not inherit predecessor attestation.",
       "voices": [
         {
           "id": "claude-agent",
           "variant": "high"
         },
         {
-          "id": "gpt-5.6-sol",
+          "id": "gpt-6-astra",
           "variant": "high"
         },
         {
-          "id": "glm-5.2",
+          "id": "glm-5.3",
           "variant": "high"
         },
         {
@@ -292,7 +290,7 @@
           "variant": "high"
         }
       ],
-      "content_hash": "sha256:0f73580ef4e3fdf2"
+      "content_hash": "sha256:86f6ed8ab45476ee"
     }
   ]
 }

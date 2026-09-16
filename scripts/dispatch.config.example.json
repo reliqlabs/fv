@@ -2,37 +2,37 @@
   "omp_native": {
     "project_root": ".",
     "target_spec": ".fv/intent.md",
-    "profile": "canonical-4@sha256:0f73580ef4e3fdf2",
+    "profile": "canonical-4@sha256:86f6ed8ab45476ee",
     "agent": "fv-spec-adversary",
     "thinking_policy": "one-below-max",
     "calibration": "pending",
     "voices": [
       {
         "id": "claude-agent",
-        "model": "anthropic/claude-fable-5",
+        "model": "anthropic/claude-fable-5-1",
         "family": "Anthropic",
         "thinking_level": "xhigh",
-        "dispatch_selector": "anthropic/claude-fable-5:xhigh",
+        "dispatch_selector": "anthropic/claude-fable-5-1:xhigh",
         "calibration": "pending",
-        "route_grade": "unattested"
+        "route_grade": "not-run"
       },
       {
-        "id": "gpt-5.6-sol",
-        "model": "openai-codex/gpt-5.6-sol",
+        "id": "gpt-6-astra",
+        "model": "openai-codex/gpt-6-astra",
         "family": "OpenAI",
         "thinking_level": "xhigh",
-        "dispatch_selector": "openai-codex/gpt-5.6-sol:xhigh",
+        "dispatch_selector": "openai-codex/gpt-6-astra:xhigh",
         "calibration": "pending",
-        "route_grade": "unattested"
+        "route_grade": "not-run"
       },
       {
-        "id": "glm-5.2",
-        "model": "synthetic/hf:zai-org/GLM-5.2",
+        "id": "glm-5.3",
+        "model": "fireworks/glm-5.3",
         "family": "Zhipu",
         "thinking_level": "high",
-        "dispatch_selector": "synthetic/hf:zai-org/GLM-5.2:high",
+        "dispatch_selector": "fireworks/glm-5.3:high",
         "calibration": "pending",
-        "route_grade": "degraded"
+        "route_grade": "not-run"
       },
       {
         "id": "kimi-k3",
@@ -44,6 +44,6 @@
         "route_grade": "attested"
       }
     ],
-    "route_hash": "sha256:3fa50afeb36c2113"
+    "route_hash": "sha256:a5a53c34cab9538f"
   }
 }

@@ -99,13 +99,13 @@ def main() -> int:
 
         evidence = root / "evidence"
         evidence.mkdir()
-        launched = invoke(project, evidence, fake, "claude-agent", "gpt-5.6-sol", env=env)
+        launched = invoke(project, evidence, fake, "claude-agent", "gpt-6-astra", env=env)
         check("scoped calibration launcher exits with OMP's result", launched.returncode == 0,
               launched.stderr[-300:])
         overlay = json.loads((evidence / "omp-fallback-suppression.json").read_text())
         expected = {
-            "anthropic/claude-fable-5": [],
-            "openai-codex/gpt-5.6-sol": [],
+            "anthropic/claude-fable-5-1": [],
+            "openai-codex/gpt-6-astra": [],
         }
         check("overlay disables only the exact selected route chains",
               overlay == {"retry": {"fallbackChains": expected}}, overlay)

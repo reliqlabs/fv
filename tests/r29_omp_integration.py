@@ -301,10 +301,10 @@ def main() -> int:
         catalog = {"models": [
             {"selector": voices[seat["id"]]["omp_model"],
              "thinking": voices[seat["id"]].get("omp_thinking_ladder")}
-            for seat in canonical["voices"] if seat["id"] != "glm-5.2"
+            for seat in canonical["voices"] if seat["id"] != "glm-5.3"
         ]}
         catalog["models"].append({
-            "selector": "fireworks/glm-5.2",
+            "selector": "ollama-cloud/glm-5.3",
             "thinking": ["low", "high", "max"],
         })
         bom = json.loads((REPO / "bom.json").read_text())
@@ -353,7 +353,7 @@ def main() -> int:
                   for item in checked_report["findings"]), checked.stdout)
         check("doctor accepts the first available canonical panel candidate",
               any(item["name"] == "omp-model-contract" and item["status"] == "ok"
-                      and "member-3->fireworks/glm-5.2" in item["detail"]
+                      and "member-3->ollama-cloud/glm-5.3" in item["detail"]
                       for item in checked_report["findings"]), checked.stdout)
         check("doctor resolves the canonical target through the shared helper",
               any(item["name"] == "target-spec" and item["status"] == "ok"
@@ -490,7 +490,7 @@ def main() -> int:
               and preserved_config["task"]["isolation"]["mode"] == "rcopy",
               config_path.read_text())
         customized = config_path.read_text().replace(
-            "model: openai-codex/gpt-5.6-sol", "model: custom/provider-model", 1)
+            "model: openai-codex/gpt-6-astra", "model: custom/provider-model", 1)
         config_path.write_text(customized)
         customized_run = subprocess.run(command, capture_output=True, text=True)
         check("initializer accepts a structurally valid customized OMP panel role",

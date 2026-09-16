@@ -292,9 +292,9 @@ invariant and a worked multi-execution system claim, is in
 <!-- BEGIN GENERATED: voice-roster (source: registry/voices.json via scripts/gen_roster_docs.py - do not edit by hand) -->
 | Voice id | OMP selector | Family | Status | OMP calibration | Route grade |
 |---|---|---|---|---|---|
-| `claude-agent` | `anthropic/claude-fable-5:xhigh` | Anthropic | canonical-panel | pending | unattested |
+| `claude-agent` | `anthropic/claude-fable-5-1:xhigh` | Anthropic | canonical-panel | pending | not-run |
 | `kimi-k2.6` | `burnt/cloudflare-100/@cf/moonshotai/kimi-k2.6` | Moonshot | candidate | pending | not-run |
-| `gpt-5.6-sol` | `openai-codex/gpt-5.6-sol:xhigh` | OpenAI | canonical-panel | pending | unattested |
-| `glm-5.2` | `synthetic/hf:zai-org/GLM-5.2:high` | Zhipu | canonical-panel | pending | degraded |
+| `gpt-6-astra` | `openai-codex/gpt-6-astra:xhigh` | OpenAI | canonical-panel | pending | not-run |
+| `glm-5.3` | `fireworks/glm-5.3:high` | Zhipu | canonical-panel | pending | not-run |
 | `kimi-k3` | `synthetic/hf:moonshotai/Kimi-K3:high` | Moonshot | canonical-panel | Seeded-defect recall 6/7 on the held-out leasedb corpus over the OMP-NATIVE transport at synthetic/hf:moonshotai/Kimi-K3:high, blinded single pass under the deny-first fv-spec-adversary profile (calibration/2026-07-28-r3; D1 excluded for all voices as mis-specified). Cleared the pre-registered floor. The ONLY voice in that run whose served route was positively attested: its sole configured fallback target (fireworks/kimi-k3) had no usage-ledger counter, so a degrade would have created a visible entry and none appeared. Missed D8, anchoring the waiter leak at register_waiter rather than at the release site a fix would change. Transcript audited clean. Scope: one voice, one pass, one corpus, this rung only. | attested |
 <!-- END GENERATED: voice-roster -->

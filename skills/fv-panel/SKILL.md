@@ -78,46 +78,29 @@ not a validated oracle.
   to organize evidence-based scrutiny; do not treat a `PASS` as a certified gate
   until it is calibrated against a real evidence pipeline.
 
-Current roster (2026-07-27, operator-set): four families at
-`min_families=4` — `openai-codex/gpt-5.6-sol` (OpenAI),
-`anthropic/claude-fable-5` (Anthropic), GLM-5.2 (Zhipu), and Kimi-K3
-(Moonshot). Every seat carries `calibration: pending`: the routes are
-dispatchable but no fitness run cites them.
+Current roster (2026-09-15, operator-set): four families at
+`min_families=4` — `openai-codex/gpt-6-astra` (OpenAI),
+`anthropic/claude-fable-5-1` (Anthropic), GLM-5.3 (Zhipu), and Kimi-K3
+(Moonshot).
 
-GLM and Kimi rank the `synthetic` provider first and `fireworks` second.
+The Kimi-K3 OMP route remains transport-attested. GPT-6 Astra, Fable 5.1, and
+GLM-5.3 are newly selected exact routes with `omp_calibration: pending` and
+`omp_route_grade: not-run`; predecessor fitness evidence is lineage context,
+not calibration or attestation for these routes.
 
 Effort rule: **step down one rung from `max`, or take the TOP rung when the
-ladder has no `max` to step down from.** That gives `xhigh` for Fable and Sol,
-and `high` for Kimi-K3 and GLM-5.2. The live synthetic GLM ladder is
-`minimal/low/medium/high/max`.
+ladder has no `max` to step down from.** That gives `xhigh` for Fable 5.1 and
+GPT-6 Astra, and `high` for Kimi-K3 and GLM-5.3.
 
-The seat level applies to the seat's first candidate. Both the synthetic
-GLM-5.2 primary and `fireworks/glm-5.2` fallback use `high`, so provider
-failover preserves the requested effort.
+GLM ranks `fireworks/glm-5.3` first and `ollama-cloud/glm-5.3` second. Kimi
+ranks `synthetic/hf:moonshotai/Kimi-K3` first and `fireworks/kimi-k3` second.
+These candidate arrays are resolved once at roster freeze and express provider
+preference/availability. They do not prove which provider served a request;
+the persisted route and served-model evidence remain authoritative.
 
-Chain keys are bare selectors while the panel dispatches with a `:level`
-suffix. That still matches: OMP compares base selectors with the level
-stripped from both sides (`selectorMatchesCurrent` in
-`session/retry-fallback-chains.ts`), so the failover fires for panel dispatch.
-
-Failover comes in two layers and they are not the same thing. The candidate
-list is resolved ONCE at roster freeze and only checks catalog availability,
-so it is a provider preference. Automatic quota and rate-limit failover is
-OMP's, via the `retry.fallbackChains` setting, which pairs
-`synthetic/hf:zai-org/GLM-5.2` with `fireworks/glm-5.2:high` and
-`synthetic/hf:moonshotai/Kimi-K3` with `fireworks/kimi-k3:high`. A synthetic
-quota error is therefore retried on the fireworks pair rather than failing the
-voice. The consequence for evidence: a frozen roster records the REQUESTED
-route, and OMP may have served the request from a fallback, so a seat's
-recorded model is not proof of which provider answered.
-
-One diversity caveat. `modelFamilyToken` reads synthetic's `hf:vendor/Model`
-ids unevenly: `hf:moonshotai/Kimi-K3` yields `kimi`, but `hf:zai-org/GLM-5.2`
-yields nothing and falls back to the provider name `synthetic`. All four
-runtime tokens are still pairwise distinct, so the resolver accepts the panel,
-but the Zhipu seat's diversity token is provider-derived rather than
-lineage-derived. `kimi-k2.6` is the same `kimi` lineage as Kimi-K3 and cannot
-hold a separate seat.
+All four requested lineages resolve to distinct OMP families, so the
+`min_families=4` floor remains satisfiable. Kimi-K2.6 is the same `kimi`
+lineage as Kimi-K3 and cannot hold a separate seat.
 
 ## The brief and criterion source
 

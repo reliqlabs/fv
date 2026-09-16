@@ -43,7 +43,7 @@ Use one OMP-native shape:
 Select an independent OMP route from the generated roster:
 
 <!-- BEGIN GENERATED: voice-roster (source: registry/voices.json via scripts/gen_roster_docs.py - do not edit by hand) -->
-`anthropic/claude-fable-5:xhigh` (Anthropic), `openai-codex/gpt-5.6-sol:xhigh` (OpenAI), `synthetic/hf:zai-org/GLM-5.2:high` (Zhipu), `synthetic/hf:moonshotai/Kimi-K3:high` (Moonshot)
+`anthropic/claude-fable-5-1:xhigh` (Anthropic), `openai-codex/gpt-6-astra:xhigh` (OpenAI), `fireworks/glm-5.3:high` (Zhipu), `synthetic/hf:moonshotai/Kimi-K3:high` (Moonshot)
 <!-- END GENERATED: voice-roster -->
 
 Same-agent self-review is invalid unless the user explicitly accepts the drift cost.

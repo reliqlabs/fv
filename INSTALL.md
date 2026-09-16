@@ -318,11 +318,11 @@ intentionally missing proof toolchains.
 Historical files under `calibration/` retain their original transport provenance. Do not use archived commands as current installation instructions.
 
 <!-- BEGIN GENERATED: voice-roster (source: registry/voices.json via scripts/gen_roster_docs.py - do not edit by hand) -->
-**Canonical OMP panel (`canonical-4@sha256:0f73580ef4e3fdf2`).**
+**Canonical OMP panel (`canonical-4@sha256:86f6ed8ab45476ee`).**
 
-- `anthropic/claude-fable-5:xhigh` - Anthropic; route grade `unattested`.
-- `openai-codex/gpt-5.6-sol:xhigh` - OpenAI; route grade `unattested`.
-- `synthetic/hf:zai-org/GLM-5.2:high` - Zhipu; route grade `degraded`.
+- `anthropic/claude-fable-5-1:xhigh` - Anthropic; route grade `not-run`.
+- `openai-codex/gpt-6-astra:xhigh` - OpenAI; route grade `not-run`.
+- `fireworks/glm-5.3:high` - Zhipu; route grade `not-run`.
 - `synthetic/hf:moonshotai/Kimi-K3:high` - Moonshot; route grade `attested`.
 
 Confirm every selector in OMP's `/model` picker before a milestone run.

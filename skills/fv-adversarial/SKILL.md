@@ -25,9 +25,9 @@ This skill supports two review sizes through OMP-native repository-aware agents:
 The user selects explicit voice IDs. Calibration applies only to the exact OMP selector cited by the route.
 
 <!-- BEGIN GENERATED: voice-roster (source: registry/voices.json via scripts/gen_roster_docs.py - do not edit by hand) -->
-- `anthropic/claude-fable-5:xhigh` - Anthropic; route grade `unattested`.
-- `openai-codex/gpt-5.6-sol:xhigh` - OpenAI; route grade `unattested`.
-- `synthetic/hf:zai-org/GLM-5.2:high` - Zhipu; route grade `degraded`.
+- `anthropic/claude-fable-5-1:xhigh` - Anthropic; route grade `not-run`.
+- `openai-codex/gpt-6-astra:xhigh` - OpenAI; route grade `not-run`.
+- `fireworks/glm-5.3:high` - Zhipu; route grade `not-run`.
 - `synthetic/hf:moonshotai/Kimi-K3:high` - Moonshot; route grade `attested`.
 <!-- END GENERATED: voice-roster -->
 
@@ -47,8 +47,8 @@ Ask the user for, or determine from context:
   raw model strings. `registry/voices.json` is authoritative. The canonical
   `canonical-4` profile is:
   1. `claude-agent`
-  2. `gpt-5.6-sol`
-  3. `glm-5.2`
+  2. `gpt-6-astra`
+  3. `glm-5.3`
   4. `kimi-k3`
 
   The profile records a transport-specific route for each voice. In OMP, resolve
@@ -176,7 +176,7 @@ omp_fanout_ns = {}
 exec(read("skill://fv-adversarial/omp_fanout.py"), omp_fanout_ns)
 omp_route = omp_fanout_ns["load_omp_native_config"](
     ".fv/dispatch.json",
-    selected_ids=["claude-agent", "gpt-5.6-sol", "glm-5.2", "kimi-k3"],
+    selected_ids=["claude-agent", "gpt-6-astra", "glm-5.3", "kimi-k3"],
 )
 omp_suppression = omp_fanout_ns["load_fallback_suppression"](
     omp_route["voices"],
@@ -491,7 +491,7 @@ phase.
 
 After persisting, report:
 
-- One-line per-voice verdict summary using explicit registry IDs: `claude-agent: BREAKS (3 critical, 5 serious) | gpt-5.6-sol: BREAKS (2 critical) | kimi-k3: SURVIVES | glm-5.2: BREAKS (1 critical)`
+- One-line per-voice verdict summary using explicit registry IDs: `claude-agent: BREAKS (3 critical, 5 serious) | gpt-6-astra: BREAKS (2 critical) | kimi-k3: SURVIVES | glm-5.3: BREAKS (1 critical)`
 - **Shared-finding count** — bugs surfaced by ≥2 models (high signal)
 - **Unique-finding count** per model — blind-spot escapes
 - The absolute path to the saved report directory (or single file)

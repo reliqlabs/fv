@@ -75,7 +75,7 @@ def main() -> int:
     route = mod.load_omp_native_config(CONFIG)
     check("canonical OMP route resolves all four voices",
           [voice["id"] for voice in route["voices"]]
-          == ["claude-agent", "gpt-5.6-sol", "glm-5.2", "kimi-k3"])
+          == ["claude-agent", "gpt-6-astra", "glm-5.3", "kimi-k3"])
     check("canonical OMP route is explicitly uncalibrated",
           route["calibration"] == "pending")
 
@@ -138,11 +138,11 @@ def main() -> int:
     # model is positive evidence a retry chain answered. Equality is NOT clean:
     # the bridge reports `resolvedModel ?? modelOverride`.
     fired = mod.classify_served_route(
-        "synthetic/hf:zai-org/GLM-5.2:xhigh",
-        {"text": "r", "details": {"model": "fireworks/glm-5.2:high"}})
+        "fireworks/glm-5.3:high",
+        {"text": "r", "details": {"model": "ollama-cloud/glm-5.3:high"}})
     check("a differing served model is recorded as a fallback",
           fired["served_is_fallback"] is True
-          and fired["served_model"] == "fireworks/glm-5.2:high"
+          and fired["served_model"] == "ollama-cloud/glm-5.3:high"
           and fired["fallback_basis"].startswith("inferred:"))
     same = mod.classify_served_route(
         "fireworks/kimi-k3:high",
@@ -182,10 +182,10 @@ def main() -> int:
           and suppressed_same["fallback_basis"].startswith("configured-suppression:")
           and mod._route_established(suppressed_same))
     selected = mod.load_omp_native_config(
-        CONFIG, selected_ids=["glm-5.2", "claude-agent"])
+        CONFIG, selected_ids=["glm-5.3", "claude-agent"])
     check("explicit OMP voice order is preserved",
           [voice["id"] for voice in selected["voices"]]
-          == ["glm-5.2", "claude-agent"])
+          == ["glm-5.3", "claude-agent"])
     check("unknown OMP voice fails closed",
           raises(lambda: mod.load_omp_native_config(
               CONFIG, selected_ids=["not-registered"]), "not registered"))
@@ -290,13 +290,13 @@ def main() -> int:
         check("every requested OMP voice was invoked", len(calls) == 2, calls)
         statuses = {voice["id"]: voice["status"] for voice in summary["voices"]}
         check("failed provider is recorded as error",
-              statuses == {"glm-5.2": "error", "claude-agent": "ok"}, statuses)
+              statuses == {"glm-5.3": "error", "claude-agent": "ok"}, statuses)
         check("successful report persists verbatim",
               (run_dir / "raw" / "omp-claude-agent.md").read_text()
               == f"report from {selected['voices'][1]['dispatch_selector']}")
         check("provider error persists independently",
               "provider unavailable" in
-              (run_dir / "raw" / "omp-glm-5.2.error.txt").read_text())
+              (run_dir / "raw" / "omp-glm-5.3.error.txt").read_text())
         check("native bridge never invents finish reasons",
               all(voice["finish_reason"] is None for voice in summary["voices"]))
         # The fake echoes the requested selector. Without a bridge provenance
@@ -308,7 +308,7 @@ def main() -> int:
               {"fallback": summary["served_by_fallback"],
                "unverified": summary["route_unverified"]})
         check("an errored voice is not counted as an unverified route",
-              "glm-5.2" not in summary["route_unverified"])
+              "glm-5.3" not in summary["route_unverified"])
         check("requested selector is recorded per voice",
               all(voice["requested_selector"] == voice["dispatch_selector"]
                   for voice in summary["voices"]))
@@ -346,7 +346,7 @@ def main() -> int:
             project_root=root,
             target_spec=target,
             prompt_by_voice={
-                "glm-5.2": "critique A",
+                "glm-5.3": "critique A",
                 "claude-agent": "critique B",
             },
             run_dir=root / ".fv" / "attacks" / "all-fail",
@@ -356,7 +356,7 @@ def main() -> int:
               failed["verdict"] == "INCOMPLETE" and failed["voices_ok"] == 0)
         check("per-voice critique prompts persist verbatim",
               (root / ".fv" / "attacks" / "all-fail"
-               / "prompts" / "glm-5.2.md").read_text()
+               / "prompts" / "glm-5.3.md").read_text()
               == "critique A")
 
         def mutate_target(_prompt: str, **_options):

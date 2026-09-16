@@ -30,26 +30,17 @@ regression suite. OMP-native dispatch uses structured `agent()` calls and
 extension custom tools; retired subprocess-runner behavior remains only in
 historical calibration artifacts.
 
-The default adversarial panel is pinned as
-`canonical-4@sha256:0f73580ef4e3fdf2`: `claude-agent` (Fable 5, or the
-strongest available Opus when Fable is absent), `gpt-5.6-sol`, `glm-5.2`, and
-`kimi-k3`. Each seat has its own cited reference-transport calibration.
-`registry/voices.json` is the source of truth; roster docs are generated from it
-by `scripts/gen_roster_docs.py`.
+The default adversarial panel is
+`canonical-4@sha256:86f6ed8ab45476ee`: `claude-agent` (Fable 5.1),
+`gpt-6-astra`, `glm-5.3`, and `kimi-k3`. `registry/voices.json` is the source
+of truth; roster docs are generated from it by `scripts/gen_roster_docs.py`.
 
-OMP has a native multi-voice transport through its eval `agent()` bridge. The
-exact ModelRegistry routes and their content hash are generated into
-`.fv/dispatch.json`; the `fv-adversarial` skill preflights the
-live tree, binds the target hash, runs bounded adversary agents, and preserves
-partial evidence. Native dispatch validates the OMP session root and records
-filesystem isolation as unverified because subagent filesystems are not confined.
 
-The four-voice native run at `calibration/2026-07-28-r3/` produced usable
-outputs, but it did not validate the whole native route. Its registry grades are
-machine-readable: `kimi-k3` is `attested` and carries its native citation;
-`claude-agent` and `gpt-5.6-sol` are `unattested`; `glm-5.2` is `degraded`.
-The generated profile therefore remains `calibration: "pending"`. Native
-calibration never inherits the reference OMP or Claude Code claim.
+The exact-route calibration status is machine-readable: `kimi-k3` remains
+`attested`; Fable 5.1, GPT-6 Astra, and GLM-5.3 are `not-run` with
+`omp_calibration: "pending"`. Historical predecessor evidence is recorded as
+lineage context only and never inherits attestation. The generated profile
+therefore remains calibration-pending until the three new routes are measured.
 
 Future calibration runs must use `scripts/omp_calibration_session.py`. It
 appends a process-local `retry.fallbackChains` suppression overlay to any caller
