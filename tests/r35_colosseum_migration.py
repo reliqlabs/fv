@@ -37,6 +37,20 @@ only record of past verification is that it cannot lose or rewrite anything:
     the run with one bounded `.colosseum/ledger.md#gate-a` row, write
     nothing, and leave the legacy bytes alone -- the readiness of the
     ledger is reported, never repaired here;
+  * a refused ledger is a dead end unless the operator gets something they
+    may edit, so the refusal names `--stage-ledger-remediation` and that
+    mode copies `.colosseum/ledger.md` to `.fv/ledger.md` and nothing else:
+    one write, no obligations, no plan, no history, no claim that a
+    migration happened, never overwriting a copy already there, and
+    refused outright when the source is not a regular file or the
+    destination cannot be written without following a link;
+  * a regular `.fv/ledger.md` is thereafter the project's live ledger, not a
+    destination: the current gate judges that file, a pass keeps its bytes
+    exactly as the operator left them even though they differ from the
+    legacy ledger, the legacy ledger becomes history like every other legacy
+    file, the include entry that named it follows the content to
+    `.fv/ledger.md`, and a live ledger the gate still refuses blocks at
+    `.fv/ledger.md#gate-a` -- the path the operator can actually fix;
   * a hard-killed apply strands nothing a verified-input snapshot hashes: the
     staging tree sits under one fixed, structurally excluded prefix, with a
     unique subdirectory per run that no later apply reuses or disturbs, and a
@@ -447,6 +461,22 @@ def artifact_of(report: dict, source: str) -> dict | None:
         if artifact["source"] == source:
             return artifact
     return None
+
+
+def write_row(report: dict, path: str) -> dict | None:
+    for write in report.get("writes", []):
+        if write.get("path") == path:
+            return write
+    return None
+
+
+def fv_entries(root: Path) -> set[str]:
+    """Everything under a real `.fv`, as project-relative paths. A `.fv` that
+    is a symlink or not a directory holds nothing this migration wrote."""
+    fv = root / ".fv"
+    if fv.is_symlink() or not fv.is_dir():
+        return set()
+    return {path.relative_to(root).as_posix() for path in fv.rglob("*")}
 
 
 # --------------------------------------------------------------------------
@@ -1616,26 +1646,33 @@ def check_apply_and_idempotency(tmp: Path) -> None:
 
 
 def check_conflicts(tmp: Path) -> None:
-    """A destination that already differs fails; equal bytes are idempotent."""
+    """A destination that already differs fails; equal bytes are idempotent.
+
+    `.fv/ledger.md` is deliberately not the subject here. It is the one
+    destination a pre-existing regular file claims as the live candidate
+    rather than conflicts with, because that file is how an operator
+    remediates a ledger the current gate refuses; check_live_ledger_
+    remediation owns it. Every other destination is refused on sight.
+    """
     root = tmp / "conflict"
     scaffold(root)
     (root / ".fv").mkdir()
-    (root / ".fv/ledger.md").write_text("a different ledger\n")
+    (root / ".fv/obligations.json").write_text('{"schema": "hand-written"}\n')
     dry_code, dry_report, _ = report_of(root)
     check("a differing destination blocks the dry run",
           dry_code == 1 and dry_report["status"] == "blocked"
-          and any(".fv/ledger.md" in entry for entry in dry_report["conflicts"]),
+          and any(".fv/obligations.json" in entry for entry in dry_report["conflicts"]),
           f"exit={dry_code} {dry_report.get('conflicts')}")
     check("the conflicting write is reported with action conflict",
-          any(write["path"] == ".fv/ledger.md" and write["action"] == "conflict"
-              for write in dry_report["writes"]),
-          str([w for w in dry_report["writes"] if w["path"] == ".fv/ledger.md"]))
+          (write_row(dry_report, ".fv/obligations.json") or {}).get("action") == "conflict",
+          str(write_row(dry_report, ".fv/obligations.json")))
     apply_code, _, _ = report_of(root, "--apply")
     check("apply refuses and leaves the differing destination untouched",
-          apply_code == 1 and (root / ".fv/ledger.md").read_text() == "a different ledger\n",
+          apply_code == 1
+          and (root / ".fv/obligations.json").read_text() == '{"schema": "hand-written"}\n',
           f"exit={apply_code}")
     check("a blocked apply writes no other destination",
-          not (root / ".fv/obligations.json").exists()
+          not (root / ".fv/verification-plan.json").exists()
           and not (root / ".fv/history").exists())
     check("a blocked --apply says an apply was requested and refused",
           dry_report["requested_mode"] == "dry-run"
@@ -1644,12 +1681,19 @@ def check_conflicts(tmp: Path) -> None:
           str({key: report_of(root, "--apply")[1].get(key)
                for key in ("requested_mode", "applied", "mode")}))
 
-    (root / ".fv/ledger.md").write_text((root / ".colosseum/ledger.md").read_text())
+    # Equal bytes from a project this migration never ran in: the manifest a
+    # twin fixture migrates to is the same document, since every path it
+    # records is project-relative, so a destination already carrying it is
+    # the idempotent case rather than a conflict.
+    twin = tmp / "conflict-twin"
+    scaffold(twin)
+    report_of(twin, "--apply")
+    (root / ".fv/obligations.json").write_bytes(
+        (twin / ".fv/obligations.json").read_bytes())
     code, report, _ = report_of(root, "--apply")
     check("a destination with equal bytes is idempotent, not a conflict",
           code == 0 and report["status"] == "ok"
-          and any(write["path"] == ".fv/ledger.md" and write["action"] == "identical"
-                  for write in report["writes"]),
+          and (write_row(report, ".fv/obligations.json") or {}).get("action") == "identical",
           f"exit={code} {report.get('conflicts')}")
 
     # A directory or a symlink where a file must go is a conflict, not a crash.
@@ -2300,17 +2344,35 @@ LEGACY_GATE_SOURCE = (
     "raise SystemExit(0)\n"
 )
 
+# The remediation path out of a refused ledger. `.colosseum/` is history this
+# migration never writes, so a refusal there is unactionable until the
+# operator has a writable copy; the staging flag is how they get exactly one.
+STAGE_FLAG = "--stage-ledger-remediation"
+STAGE_MODE = "stage-ledger-remediation"
+LIVE_LEDGER = ".fv/ledger.md"
+LIVE_GATE_A_SOURCE = f"{LIVE_LEDGER}#gate-a"
+LEGACY_LEDGER_ENTRY = ".colosseum/ledger.md"
+# Every other live artifact a full migration authors. A staging run copies
+# one file, so a stage report that names any of these is claiming a
+# migration it did not perform.
+OTHER_FV_ARTIFACTS = (".fv/obligations.json", ".fv/verification-plan.json",
+                      ".fv/verified-inputs.txt", ".fv/dispatch.json", ".fv/history/")
 
-def run_gate_a(project: Path) -> tuple[int, str]:
-    """The current extension gate over the legacy ledger, invoked the way the
+
+def gate_a_over(ledger: Path, project: Path) -> tuple[int, str]:
+    """The current extension gate over one ledger file, invoked the way the
     migration's readiness check must invoke it: default strictness, `--root`
     at the project."""
     result = subprocess.run(
-        [sys.executable, str(GATE_A), str(project / ".colosseum/ledger.md"),
-         "--root", str(project)],
+        [sys.executable, str(GATE_A), str(ledger), "--root", str(project)],
         capture_output=True, text=True, timeout=300,
     )
     return result.returncode, result.stdout + result.stderr
+
+
+def run_gate_a(project: Path) -> tuple[int, str]:
+    """The current extension gate over the legacy ledger."""
+    return gate_a_over(project / LEGACY_LEDGER_ENTRY, project)
 
 
 def gate_a_fragments(output: str) -> list[str]:
@@ -2459,6 +2521,9 @@ def check_gate_a_readiness(tmp: Path) -> None:
             check(f"{label}: the {mode} diagnostic quotes the gate's refusal",
                   bool(fragments) and any(piece in detail for piece in fragments),
                   f"{fragments} :: {detail[:200]}")
+            check(f"{label}: the {mode} refusal names the way to act on it",
+                  STAGE_FLAG in detail,
+                  detail[-240:])
             check(f"{label}: the {mode} proposes no .fv/ledger.md write",
                   not any(write["path"] == ".fv/ledger.md"
                           for write in report.get("writes", [])),
@@ -2531,15 +2596,416 @@ def check_gate_a_readiness(tmp: Path) -> None:
               and tree_digest(unreadable / ".colosseum") == legacy_before)
 
 
+# --------------------------------------------------------------------------
+# ledger remediation: stage a writable copy, edit it, then migrate
+# --------------------------------------------------------------------------
+
+def replace_legacy_ledger(project: Path, how: str) -> None:
+    """Make `.colosseum/ledger.md` something a byte copy cannot read."""
+    ledger = project / LEGACY_LEDGER_ENTRY
+    ledger.unlink()
+    if how == "symlink":
+        ledger.symlink_to(Path("..") / "docs" / "intent.md")
+    elif how == "directory":
+        ledger.mkdir()
+
+
+def check_stage_ledger_remediation(tmp: Path) -> None:
+    """`--stage-ledger-remediation` hands the operator one writable file.
+
+    A legacy ledger the current Gate A refuses cannot be repaired where it
+    lies: `.colosseum/` is history this migration promises never to write,
+    so the refusal is unactionable on its own and the migration would be a
+    dead end for exactly the projects that need it. Staging is the narrowest
+    way out -- one byte-identical copy of `.colosseum/ledger.md` at
+    `.fv/ledger.md`, no obligations, no plan, no dispatch, no history, and
+    no claim that a migration happened -- so what the operator edits is a
+    file they own, and the legacy bytes stay the record they were.
+    """
+    root = tmp / "stage"
+    scaffold(root)
+    legacy = root / LEGACY_LEDGER_ENTRY
+    legacy.write_text(ledger_missing_hash(root))
+    legacy_bytes = legacy.read_bytes()
+    legacy_before = tree_digest(root / ".colosseum")
+    project_before = tree_digest(root)
+
+    code, report, err = report_of(root)
+    refusal = (artifact_of(report, GATE_A_SOURCE) or {}).get("detail") or ""
+    check("a refused legacy ledger blocks the regular run",
+          code == 1 and report.get("status") == "blocked" and bool(refusal),
+          f"exit={code} {err[-160:]}")
+    check("the refusal sends the operator to the staging flag",
+          STAGE_FLAG in refusal, refusal[-240:])
+    check("the blocked run leaves the operator nothing to edit",
+          not (root / ".fv").exists() and tree_digest(root) == project_before)
+
+    stage_code, stage_out, stage_err = migrate(root, "--json", STAGE_FLAG)
+    stage_report = json.loads(stage_out) if stage_out.startswith("{") else {}
+    staged = root / LIVE_LEDGER
+    check("staging exits 0 and copies the legacy ledger verbatim",
+          stage_code == 0 and staged.is_file() and not staged.is_symlink()
+          and staged.read_bytes() == legacy_bytes,
+          f"exit={stage_code} {stage_err[-200:]}")
+    check("staging copies exactly one file and nothing else",
+          fv_entries(root) == {LIVE_LEDGER}, sorted(fv_entries(root)))
+    check("staging leaves the legacy tree byte-identical",
+          tree_digest(root / ".colosseum") == legacy_before)
+    check("the staged copy is writable by the operator who has to edit it",
+          os.access(staged, os.W_OK), oct(staged.stat().st_mode & 0o7777))
+
+    row = write_row(stage_report, LIVE_LEDGER) or {}
+    check("the stage report declares the mode it was asked for and claims no apply",
+          stage_report.get("requested_mode") == STAGE_MODE
+          and stage_report.get("mode") == STAGE_MODE
+          and stage_report.get("applied") is False
+          and stage_report.get("status") == "ok",
+          str({key: stage_report.get(key)
+               for key in ("requested_mode", "mode", "applied", "status")}))
+    check("the stage report names exactly the one write it made",
+          [write.get("path") for write in stage_report.get("writes", [])] == [LIVE_LEDGER]
+          and row.get("action") == "written"
+          and row.get("sha256") == hashlib.sha256(legacy_bytes).hexdigest(),
+          str(stage_report.get("writes")))
+    copied = artifact_of(stage_report, LEGACY_LEDGER_ENTRY) or {}
+    check("the stage report classifies the one file it read",
+          len(stage_report.get("artifacts", [])) == 1
+          and copied.get("classification") == MAPPED
+          and copied.get("destination") == LIVE_LEDGER,
+          str(stage_report.get("artifacts")))
+    serialized = json.dumps(stage_report, sort_keys=True)
+    check("the stage report claims no full migration",
+          not [name for name in OTHER_FV_ARTIFACTS if name in serialized]
+          and stage_report.get("target_spec") is None
+          and stage_report.get("counts", {}).get(UNSUPPORTED) == 0,
+          str([name for name in OTHER_FV_ARTIFACTS if name in serialized]))
+
+    # Determinism, asserted across two projects rather than two runs of one:
+    # a stage report is a copy of one file's identity, and nothing about the
+    # machine it ran on belongs in it.
+    twin = tmp / "stage-twin"
+    scaffold(twin)
+    (twin / LEGACY_LEDGER_ENTRY).write_text(ledger_missing_hash(twin))
+    twin_out = migrate(twin, "--json", STAGE_FLAG)[1]
+    check("the stage JSON is deterministic and carries no machine path",
+          twin_out == stage_out and str(root) not in stage_out,
+          stage_out[:200] if twin_out != stage_out else str(root))
+    check("the stage JSON is key-sorted",
+          list(json.loads(stage_out)) == sorted(json.loads(stage_out)))
+
+    text_root = tmp / "stage-text"
+    scaffold(text_root)
+    (text_root / LEGACY_LEDGER_ENTRY).write_text(ledger_missing_hash(text_root))
+    text_code, text_out, _ = migrate(text_root, STAGE_FLAG)
+    check("the stage text report names the one file and claims no applied migration",
+          text_code == 0 and not text_out.strip().startswith("{")
+          and LIVE_LEDGER in text_out and "VERDICT: STAGED" in text_out
+          and "VERDICT: APPLIED" not in text_out
+          and not [name for name in OTHER_FV_ARTIFACTS if name in text_out],
+          text_out[-240:])
+
+    # Re-staging is where an operator's work is at risk: the destination
+    # exists because the last run made it, and the bytes in it are the ones
+    # they came to write.
+    code, report, err = report_of(root, STAGE_FLAG)
+    row = write_row(report, LIVE_LEDGER) or {}
+    check("re-staging an unedited copy reports it identical and rewrites nothing",
+          code == 0 and row.get("action") == "identical"
+          and staged.read_bytes() == legacy_bytes
+          and fv_entries(root) == {LIVE_LEDGER},
+          f"exit={code} {row}")
+
+    edited = ledger_text(root).encode()
+    staged.write_bytes(edited)
+    code, report, err = report_of(root, STAGE_FLAG)
+    row = write_row(report, LIVE_LEDGER) or {}
+    check("re-staging never overwrites the edit the operator came here to make",
+          code == 0 and staged.read_bytes() == edited
+          and row.get("action") == "already-staged",
+          f"exit={code} {row}")
+    check("the already-staged run is a report, not a write",
+          report.get("status") == "ok" and report.get("applied") is False
+          and fv_entries(root) == {LIVE_LEDGER}
+          and tree_digest(root / ".colosseum") == legacy_before,
+          str({key: report.get(key) for key in ("status", "applied")}))
+
+    # A source that is not a regular file has no bytes to copy, and guessing
+    # at one -- following the link, walking the directory -- would stage
+    # something the legacy tree never recorded as its ledger.
+    for how in ("missing", "symlink", "directory"):
+        broken = tmp / f"stage-legacy-{how}"
+        scaffold(broken)
+        replace_legacy_ledger(broken, how)
+        before = tree_digest(broken)
+        code, report, err = report_of(broken, STAGE_FLAG)
+        check(f"staging a {how} legacy ledger fails and stages nothing",
+              code == 1 and report.get("status") == "blocked"
+              and not (broken / ".fv").exists() and tree_digest(broken) == before,
+              f"exit={code} {err[-160:]}")
+        check(f"staging a {how} legacy ledger names the file it could not copy",
+              any(LEGACY_LEDGER_ENTRY in entry for entry in report.get("unsupported", [])),
+              str(report.get("unsupported"))[:240])
+
+    # Staging writes into `.fv`, so it inherits every protection a
+    # destination gets: one narrow copy is still a copy that must not leave
+    # the tree it is allowed to write, and must never be written through a
+    # link somebody else planted.
+    outside = tmp / "stage-outside"
+    outside.mkdir()
+    planted = outside / "ledger.md"
+    planted.write_text("a file the migration may not touch\n")
+    planted_bytes = planted.read_bytes()
+
+    escaping = tmp / "stage-fv-symlink"
+    scaffold(escaping)
+    (escaping / ".fv").symlink_to(outside)
+    escaping_legacy = tree_digest(escaping / ".colosseum")
+    code, report, err = report_of(escaping, STAGE_FLAG)
+    check("staging through a symlinked .fv is refused",
+          code == 1 and report.get("status") == "blocked"
+          and any(LIVE_LEDGER in entry for entry in report.get("conflicts", [])),
+          f"exit={code} {report.get('conflicts')}")
+    check("nothing is staged outside the project through a symlinked .fv",
+          planted.read_bytes() == planted_bytes
+          and sorted(path.name for path in outside.rglob("*")) == ["ledger.md"]
+          and tree_digest(escaping / ".colosseum") == escaping_legacy,
+          str(sorted(path.name for path in outside.rglob("*"))))
+
+    linked = tmp / "stage-destination-symlink"
+    scaffold(linked)
+    (linked / ".fv").mkdir()
+    (linked / LIVE_LEDGER).symlink_to(planted)
+    code, report, err = report_of(linked, STAGE_FLAG)
+    check("staging onto a symlinked destination is refused",
+          code == 1 and report.get("status") == "blocked"
+          and any(LIVE_LEDGER in entry for entry in report.get("conflicts", [])),
+          f"exit={code} {report.get('conflicts')}")
+    check("the symlink target keeps its bytes and the link is still a link",
+          planted.read_bytes() == planted_bytes and (linked / LIVE_LEDGER).is_symlink(),
+          planted.read_bytes()[:60])
+
+    not_a_directory = tmp / "stage-fv-not-a-directory"
+    scaffold(not_a_directory)
+    (not_a_directory / ".fv").write_text("not a directory\n")
+    code, report, err = report_of(not_a_directory, STAGE_FLAG)
+    check("staging into a .fv that is not a directory is refused",
+          code == 1 and report.get("status") == "blocked"
+          and any(LIVE_LEDGER in entry for entry in report.get("conflicts", []))
+          and (not_a_directory / ".fv").read_text() == "not a directory\n",
+          f"exit={code} {report.get('conflicts')}")
+
+    unwritable = tmp / "stage-fv-unwritable"
+    scaffold(unwritable)
+    (unwritable / ".fv").mkdir()
+    (unwritable / ".fv").chmod(0o500)
+    try:
+        code, report, err = report_of(unwritable, STAGE_FLAG)
+        check("staging into an unwritable .fv is refused in preflight",
+              code == 1 and report.get("status") == "blocked"
+              and any(LIVE_LEDGER in entry for entry in report.get("conflicts", []))
+              and fv_entries(unwritable) == set(),
+              f"exit={code} {report.get('conflicts')}")
+    finally:
+        if (unwritable / ".fv").is_dir():
+            (unwritable / ".fv").chmod(0o755)
+
+    # The two modes answer different questions and write different amounts,
+    # so a run cannot be both: silently preferring one would either skip the
+    # migration the operator asked for or perform one they did not.
+    both = tmp / "stage-and-apply"
+    scaffold(both)
+    before = tree_digest(both)
+    code, _, err = migrate(both, STAGE_FLAG, "--apply")
+    check("staging and applying in one run is a usage error that writes nothing",
+          code == 2 and STAGE_FLAG in err and not (both / ".fv").exists()
+          and tree_digest(both) == before,
+          f"exit={code} {err[-160:]}")
+
+
+def check_live_ledger_remediation(tmp: Path) -> None:
+    """The remediation loop end to end: block, stage, edit, migrate.
+
+    Once `.fv/ledger.md` exists as a regular file it is the project's live
+    ledger, not a destination waiting to be overwritten: the migration runs
+    the current Gate A against that file, and a pass means the operator has
+    already answered the question the legacy ledger failed. Its bytes are
+    kept exactly as they are -- differing from the legacy ledger is the
+    whole point of the edit -- the legacy ledger is preserved as history
+    like every other legacy file, and the include entry that named
+    `.colosseum/ledger.md` follows the content to where it now lives. A live
+    ledger the gate still refuses blocks at its own path, because that is
+    the file the operator can edit.
+    """
+    root = tmp / "remediation"
+    scaffold(root)
+    # The legacy include list names the legacy ledger, so the translated
+    # policy has to follow the content rather than drop the entry.
+    (root / ".colosseum/verified-inputs.txt").write_text(
+        VERIFIED_INPUTS + f"{LEGACY_LEDGER_ENTRY}\n")
+    legacy = root / LEGACY_LEDGER_ENTRY
+    legacy.write_text(ledger_missing_hash(root))
+    legacy_bytes = legacy.read_bytes()
+    legacy_before = tree_digest(root / ".colosseum")
+    check("the project starts from a ledger the current Gate A refuses",
+          gate_a_over(legacy, root)[0] == 1)
+
+    stage_code = migrate(root, STAGE_FLAG)[0]
+    staged = root / LIVE_LEDGER
+    check("staging gives the operator a writable copy to work on",
+          stage_code == 0 and staged.is_file() and os.access(staged, os.W_OK),
+          f"exit={stage_code}")
+
+    # The edit: the same two claims, now content-bound, which is exactly
+    # what the gate refused the legacy file for.
+    edited = ledger_text(root).encode()
+    staged.write_bytes(edited)
+    gate_code, gate_out = gate_a_over(staged, root)
+    check("the edited ledger passes the current Gate A where it lies",
+          gate_code == 0 and edited != legacy_bytes, gate_out[-240:])
+
+    dry_code, dry_report, dry_err = report_of(root)
+    check("the regular dry run proceeds on the remediated ledger",
+          dry_code == 0 and dry_report.get("status") == "ok"
+          and dry_report.get("conflicts") == [] and dry_report.get("unsupported") == [],
+          f"exit={dry_code} {dry_report.get('conflicts')} "
+          f"{dry_report.get('unsupported')} {dry_err[-160:]}")
+    check("neither ledger raises a readiness row once the live one is clean",
+          artifact_of(dry_report, LIVE_GATE_A_SOURCE) is None
+          and artifact_of(dry_report, GATE_A_SOURCE) is None,
+          str([entry["source"] for entry in dry_report.get("artifacts", [])
+               if "#" in entry["source"]]))
+    row = write_row(dry_report, LIVE_LEDGER) or {}
+    check("the dry run proposes the operator's bytes for .fv/ledger.md, not the legacy ones",
+          row.get("action") == "identical"
+          and row.get("sha256") == hashlib.sha256(edited).hexdigest(),
+          f"{row} against {hashlib.sha256(edited).hexdigest()}")
+
+    code, report, err = report_of(root, "--apply")
+    check("the apply completes on a remediated project",
+          code == 0 and report.get("status") == "ok" and report.get("applied") is True,
+          f"exit={code} {report.get('conflicts')} {err[-200:]}")
+    check("the operator's edited bytes are exactly what is still on disk",
+          staged.read_bytes() == edited, staged.read_bytes()[:80])
+    history = root / ".fv/history/colosseum/ledger.md"
+    check("the superseded legacy ledger is preserved as history, byte for byte",
+          history.is_file() and history.read_bytes() == legacy_bytes,
+          history.read_bytes()[:80] if history.is_file() else "missing")
+    ledger_row = artifact_of(report, LEGACY_LEDGER_ENTRY)
+    check("the legacy ledger is classified history, never mapped over the live file",
+          ledger_row is not None and ledger_row["classification"] == PRESERVED
+          and ledger_row["destination"] == ".fv/history/colosseum/ledger.md",
+          str(ledger_row))
+    check("the legacy tree is byte-identical after the remediated migration",
+          tree_digest(root / ".colosseum") == legacy_before)
+    gate_code, gate_out = gate_a_over(staged, root)
+    check("the migrated project starts gate-clean at .fv/ledger.md",
+          gate_code == 0, gate_out[-300:])
+
+    policy = fv_project.load_policy(root)
+    selectors = set(policy.selectors())
+    check("the include entry that named the legacy ledger selects the live one",
+          LIVE_LEDGER in selectors and policy.selects(LIVE_LEDGER)
+          and not [entry for entry in selectors if entry.startswith(".colosseum/")],
+          sorted(selectors))
+    check("no imported history byte becomes a verified input",
+          not policy.selects(".fv/history/colosseum/ledger.md"), sorted(selectors))
+
+    fv_before = tree_digest(root / ".fv")
+    code, report, err = report_of(root, "--apply")
+    check("re-applying a remediated project changes nothing",
+          code == 0 and report.get("status") == "ok"
+          and {write["action"] for write in report.get("writes", [])} == {"identical"}
+          and tree_digest(root / ".fv") == fv_before
+          and staged.read_bytes() == edited
+          and tree_digest(root / ".colosseum") == legacy_before,
+          f"exit={code} {sorted({w['action'] for w in report.get('writes', [])})}")
+
+    # A live ledger the gate accepts wins even when the legacy ledger would
+    # have passed too: the project's own file is the project's ledger, and
+    # differing bytes are not a conflict to be resolved by overwriting it.
+    preferred = tmp / "remediation-preferred"
+    scaffold(preferred)
+    (preferred / ".fv").mkdir()
+    live = preferred / LIVE_LEDGER
+    live.write_text(code_only_ledger(preferred, "Reviewed 2026-09-15 after the migration."))
+    live_bytes = live.read_bytes()
+    legacy_kept = (preferred / LEGACY_LEDGER_ENTRY).read_bytes()
+    check("the live and legacy ledgers genuinely differ", live_bytes != legacy_kept)
+    code, report, err = report_of(preferred, "--apply")
+    check("a live ledger the gate accepts is kept, not overwritten by the legacy one",
+          code == 0 and report.get("status") == "ok" and report.get("conflicts") == []
+          and live.read_bytes() == live_bytes,
+          f"exit={code} {report.get('conflicts')} {err[-200:]}")
+    check("the superseded legacy ledger is history rather than a conflict",
+          (preferred / ".fv/history/colosseum/ledger.md").read_bytes() == legacy_kept
+          and (artifact_of(report, LEGACY_LEDGER_ENTRY) or {}).get("classification") == PRESERVED,
+          str(artifact_of(report, LEGACY_LEDGER_ENTRY)))
+
+    # Staged but not yet edited: the operator has the file and the gate
+    # still refuses it, so the block moves to the path they can fix.
+    stuck = tmp / "remediation-unedited"
+    scaffold(stuck)
+    (stuck / LEGACY_LEDGER_ENTRY).write_text(ledger_missing_hash(stuck))
+    migrate(stuck, STAGE_FLAG)
+    staged_bytes = (stuck / LIVE_LEDGER).read_bytes()
+    stuck_before = tree_digest(stuck)
+    for mode, flags in (("dry run", ()), ("apply", ("--apply",))):
+        code, report, err = report_of(stuck, *flags)
+        row = artifact_of(report, LIVE_GATE_A_SOURCE)
+        detail = (row or {}).get("detail") or ""
+        check(f"a staged but unedited ledger blocks the {mode} at its own path",
+              code == 1 and report.get("status") == "blocked"
+              and row is not None and row["classification"] == UNSUPPORTED
+              and row.get("destination") is None,
+              f"exit={code} {row} {err[-160:]}")
+        check(f"the {mode} block names the writable file to edit",
+              LIVE_LEDGER in detail, detail[:240])
+        check(f"the {mode} judges the live ledger instead of the legacy one",
+              artifact_of(report, GATE_A_SOURCE) is None
+              and [entry["source"] for entry in report.get("artifacts", [])
+                   ].count(LIVE_GATE_A_SOURCE) == 1,
+              str([entry["source"] for entry in report.get("artifacts", [])
+                   if "#gate-a" in entry["source"]]))
+        check(f"the blocked {mode} rewrites neither the staged copy nor anything else",
+              (stuck / LIVE_LEDGER).read_bytes() == staged_bytes
+              and fv_entries(stuck) == {LIVE_LEDGER}
+              and tree_digest(stuck) == stuck_before,
+              sorted(fv_entries(stuck)))
+
+    # A symlink is not a live candidate however clean the file behind it is:
+    # adopting one would bind the project's trust artifact to bytes outside
+    # the tree, and writing through one would leave `.fv` entirely.
+    symlinked = tmp / "remediation-live-symlink"
+    scaffold(symlinked)
+    elsewhere = tmp / "remediation-live-symlink-target.md"
+    elsewhere.write_text(code_only_ledger(symlinked, "Not the project's own ledger."))
+    elsewhere_bytes = elsewhere.read_bytes()
+    (symlinked / ".fv").mkdir()
+    (symlinked / LIVE_LEDGER).symlink_to(elsewhere)
+    check("the file behind the link would itself pass the gate",
+          gate_a_over(elsewhere, symlinked)[0] == 0,
+          gate_a_over(elsewhere, symlinked)[1][-200:])
+    code, report, err = report_of(symlinked, "--apply")
+    check("a symlink at .fv/ledger.md is never adopted as the live ledger",
+          code == 1 and report.get("status") == "blocked"
+          and any(LIVE_LEDGER in entry for entry in report.get("conflicts", []))
+          and artifact_of(report, LIVE_GATE_A_SOURCE) is None,
+          f"exit={code} {report.get('conflicts')}")
+    check("the link is left a link and its target keeps its bytes",
+          (symlinked / LIVE_LEDGER).is_symlink()
+          and elsewhere.read_bytes() == elsewhere_bytes,
+          elsewhere.read_bytes()[:80])
+
+
 def check_cli(tmp: Path) -> None:
     root = tmp / "cli"
     scaffold(root)
     code, out, err = migrate(root)
     check("the text report is not JSON", code == 0 and not out.strip().startswith("{"))
-    check("--help advertises the three-part CLI surface",
+    check("--help advertises every flag the CLI answers to",
           all(flag in subprocess.run([sys.executable, str(MIGRATE), "--help"],
                                      capture_output=True, text=True).stdout
-              for flag in ("PROJECT", "--apply", "--json")))
+              for flag in ("PROJECT", "--apply", "--json", STAGE_FLAG)))
     missing = subprocess.run([sys.executable, str(MIGRATE)], capture_output=True, text=True)
     check("a missing PROJECT is a usage error", missing.returncode == 2, f"exit={missing.returncode}")
     absent = migrate(tmp / "no-such-project")
@@ -2575,6 +3041,10 @@ def main() -> int:
         check_unsupported(tmp)
         print("ledger readiness")
         check_gate_a_readiness(tmp)
+        print("ledger remediation staging")
+        check_stage_ledger_remediation(tmp)
+        print("live ledger remediation")
+        check_live_ledger_remediation(tmp)
         print("apply and idempotency")
         check_apply_and_idempotency(tmp)
         print("conflicts")

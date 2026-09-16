@@ -54,9 +54,12 @@ Top-level fields: `schema`, `project_root`, `target_spec`, `requested_mode`,
   none could be. It is a field rather than a sentence inside a detail string, so
   a dry run tells you machine-readably which document every future evidence
   record will bind to.
-- `requested_mode` is what you asked for (`dry-run` or `apply`) and `mode` is
-  what the run did, with `applied` as the boolean. A blocked `--apply` reports
-  `requested_mode: apply`, `mode: dry-run`, `applied: false`.
+- `requested_mode` is what you asked for (`dry-run`, `apply`, or
+  `stage-ledger-remediation`) and `mode` is what the run did, with `applied` as
+  the boolean. A blocked `--apply` reports `requested_mode: apply`,
+  `mode: dry-run`, `applied: false`. A staging run reports both fields as
+  `stage-ledger-remediation` and still leaves `applied: false`: that field is the
+  full migration's claim, which one staged ledger copy never makes.
 - `error` is `null` unless an apply failed; then it carries the failure and the
   rollback result, and the report is still printed because it is the only
   enumeration of what landed.
@@ -81,15 +84,88 @@ Top-level fields: `schema`, `project_root`, `target_spec`, `requested_mode`,
   existing parent directory is not writable.
 - `writes[]`: every intended path under `.fv/` with the SHA-256 of its bytes and
   an `action`. In a dry run or a blocked run: `create`, `identical`, `adopt`, or
-  `conflict`. In an apply: `written`, and, when the apply failed, `rolled-back`
-  (undone), `failed` (the write that raised), `pending` (never started), or `lost`
-  when rollback could not restore an original destination. A retained staging
-  directory contains the recoverable original for any `lost` row.
+  `conflict`; a `--stage-ledger-remediation` run adds `already-staged`, the
+  existing `.fv/ledger.md` that differs from the legacy bytes and was kept. In an
+  apply: `written`, and, when the apply failed, `rolled-back` (undone), `failed`
+  (the write that raised), `pending` (never started), or `lost` when rollback
+  could not restore an original destination. A retained staging directory
+  contains the recoverable original for any `lost` row.
 
 `status` is `blocked` whenever `unsupported` or `conflicts` is nonempty. Resolve
 the named entries (fix the legacy artifact, or move the conflicting `.fv/` file
 aside), then re-run the dry run. `--apply` refuses a blocked migration and writes
 nothing.
+
+### Remediating a ledger Gate A refuses
+
+Before it proposes `.fv/ledger.md`, the migration runs the extension's own
+current Gate A (`scripts/check_ledger_references.py`, default strictness,
+`--root` the project root) over the ledger the migrated project would present to
+its first gate run. A rejection, or an infrastructure failure that stops the gate
+from returning a verdict at all, is one bounded `unsupported` row that blocks the
+run before any `.fv` write is proposed. Nothing is repaired for you: the
+migration validates readiness and never rewrites a citation.
+
+The row is keyed by the file that was checked, because the remedy differs:
+
+- `.fv/ledger.md#gate-a` — a live ledger the project already carries. It is
+  writable: fix its citations in place and re-run.
+- `.colosseum/ledger.md#gate-a` — a legacy-only ledger, inside the tree this tool
+  may only read. Stage a writable copy first.
+
+The staging flow, end to end:
+
+```bash
+# 1. dry run blocks on `.colosseum/ledger.md#gate-a`
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /path/to/project --json
+
+# 2. one writable copy at `.fv/ledger.md`, and nothing else
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /path/to/project \
+  --stage-ledger-remediation
+
+# 3. edit `.fv/ledger.md`: content-bind every citation, re-root one written
+#    relative to `.colosseum/`, drop one that cites nothing
+
+# 4. re-run the current Gate A over the edited file until it passes
+python3 "$FV_ROOT/scripts/check_ledger_references.py" \
+  /path/to/project/.fv/ledger.md --root /path/to/project
+
+# 5. the ordinary migration now judges and adopts that file
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /path/to/project --json
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /path/to/project --apply
+```
+
+What each step does and does not do:
+
+- `--stage-ledger-remediation` copies `.colosseum/ledger.md` to `.fv/ledger.md`
+  verbatim and proposes no other write: no history, no manifests, no dispatch
+  route, no include policy, no plan. It is mutually exclusive with `--apply`
+  (passing both is a usage error, exit 2), it is not a migration, and no gate runs
+  on the copy, since the bytes being staged are usually the ones the gate just
+  refused. The text render says `STAGED` or `ALREADY STAGED`, never `APPLIED`.
+- Containment is the ordinary containment. A symlink at `.fv` or at the
+  destination, a `.fv` that is not a directory or is not writable, a destination
+  that exists and is not a regular file, and a missing, symlinked, or non-regular
+  legacy ledger each block the run with nothing written. `.colosseum/` is still
+  only read.
+- An existing `.fv/ledger.md` is never clobbered, whatever its bytes say: it is
+  the operator's work, and replacing it would discard the remediation this mode
+  exists to enable. Byte-equal to the legacy ledger it reports `identical`,
+  different it reports `already-staged`, and the run is `ok` either way. A
+  destination that appears between preflight and the move is refused at the move
+  rather than replaced.
+- Step 4 is the decisive check because step 5 runs the same gate, loaded from the
+  extension's own path rather than from any copy a legacy project vendored under
+  `.colosseum/scripts/`.
+- Step 5 prefers the live `.fv/ledger.md` over the legacy ledger: it is the file
+  CI checks and the only one of the two an operator can repair. When the current
+  Gate A accepts it, its bytes are kept exactly as written (the destination
+  reports `identical`), the differing legacy ledger becomes `preserved-history` at
+  `.fv/history/colosseum/ledger.md` rather than a destination conflict, a legacy
+  `verified-inputs.txt` entry naming `.colosseum/ledger.md` is translated to bind
+  `.fv/ledger.md` instead, and the rest of the migration proceeds normally. A
+  staged copy the gate still refuses blocks at `.fv/ledger.md#gate-a` — the path
+  you can actually fix.
 
 ### Electing the dispatch target
 
@@ -112,7 +188,11 @@ uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project --app
 
 Every write lands under `.fv/`:
 
-- `.colosseum/ledger.md` to `.fv/ledger.md`, verbatim.
+- `.colosseum/ledger.md` to `.fv/ledger.md`, verbatim, the current Gate A
+  permitting. A project that already carries a live `.fv/ledger.md` the gate
+  accepts keeps that file byte for byte instead, and the legacy ledger is
+  preserved as history whose bytes an include entry naming it now resolves to
+  `.fv/ledger.md`.
 - the elected canonical intent as the dispatch target. When it is an external
   document, the legacy entrypoint's bytes go to history only; otherwise
   `.colosseum/intent.md` becomes `.fv/intent.md`.

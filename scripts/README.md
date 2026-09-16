@@ -5,7 +5,7 @@ All live orchestration is OMP-native. Historical calibration artifacts retain th
 ## Project setup and diagnostics
 
 - `fv_init.py`: creates project `.fv/` state, merges the FV checkout into `.omp/config.yml` `extensions:`, and installs `fv-canonical` under OMP's `panel.roles` settings.
-- `fv_migrate.py`: shadow-migrates a legacy `.colosseum` project into `.fv/`. Dry run by default; `--apply` writes only under `.fv/` and `--json` emits the deterministic report.
+- `fv_migrate.py`: shadow-migrates a legacy `.colosseum` project into `.fv/`. Dry run by default; `--apply` writes only under `.fv/`, `--stage-ledger-remediation` copies just the legacy ledger to a writable `.fv/ledger.md` and nothing else, and `--json` emits the deterministic report.
 - `fv_doctor.py`: checks exact proof-tool pins, the required OMP capability contract (recording OMP semver as provenance), extension discovery, MCP wiring, dispatch state, static frontmatter, OMP panel-role ownership, and live model candidates.
 - `validate_frontmatter.py`: validates `skills/*/SKILL.md` and static `agents/*.md` against the OMP contract.
 - `check_dispatch_config.py`: validates the OMP-only `dispatch.json` schema and route hash.
@@ -16,6 +16,7 @@ All live orchestration is OMP-native. Historical calibration artifacts retain th
 ```bash
 uv run --script scripts/fv_migrate.py /absolute/path/to/project --json
 uv run --script scripts/fv_migrate.py /absolute/path/to/project --apply
+uv run --script scripts/fv_migrate.py /absolute/path/to/project --stage-ledger-remediation
 ```
 
 `fv_migrate.py` reports in `fv-migration-report/v1`. Dry run is the default;
@@ -28,11 +29,14 @@ unresolvable project root.
 Report fields: `schema`, `project_root` (always `"."`, so a captured report
 carries no absolute machine path; the text render names the real directory),
 `target_spec` (the elected dispatch target, `null` when none could be elected),
-`requested_mode` (`dry-run` or `apply`, what the caller asked for), `mode` (what
-the run did), `applied`, `status` (`ok` or `blocked`), `error` (an apply failure
-message, otherwise `null`), `counts`, `artifacts[]`, `writes[]`, `conflicts[]`,
-`unsupported[]`. A blocked `--apply` reports `requested_mode: apply`, `mode:
-dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry run.
+`requested_mode` (`dry-run`, `apply`, or `stage-ledger-remediation`, what the
+caller asked for), `mode` (what the run did), `applied`, `status` (`ok` or
+`blocked`), `error` (an apply failure message, otherwise `null`), `counts`,
+`artifacts[]`, `writes[]`, `conflicts[]`, `unsupported[]`. A blocked `--apply`
+reports `requested_mode: apply`, `mode: dry-run`, `applied: false`, so a consumer
+can tell a refused apply from a dry run; a staging run reports both mode fields
+as `stage-ledger-remediation` and keeps `applied: false`, which is the full
+migration's claim alone.
 
 - Every legacy file is classified once: `mapped`, `preserved-history`, or
   `unsupported`. A `<file>#layers.<name>`, `<file>#claims.<id>`, `<file>#ids.<id>`
@@ -46,7 +50,8 @@ dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry ru
   `evidence_tool` id, an ambiguous dispatch target (two or more distinct canonical
   intents cited by whichever document decides), no dispatch target at all, a
   directory under `.colosseum/` that cannot be listed, an unreadable or
-  non-regular file.
+  non-regular file, a ledger the extension's current Gate A refuses or cannot be
+  run against at all.
 - `conflicts[]` blocks the run as well: a `.fv/` destination that exists with
   different content (both hashes are printed), crosses a symlink at any path
   component including `.fv` itself, is a directory, sits under a non-directory
@@ -54,9 +59,11 @@ dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry ru
   `--apply` refuses a blocked migration and writes nothing.
 - `writes[]` lists each intended `.fv/` path with the SHA-256 of its bytes and an
   `action`: `create`, `identical` (byte-equal already, nothing to do), `adopt`
-  (`.fv/dispatch.json` only), `conflict` (preflight refused it), or, in an apply,
-  `written`, `rolled-back`, `failed`, `pending`. Re-running a successful `--apply`
-  is byte-idempotent: every destination reports `identical`.
+  (`.fv/dispatch.json` only), `already-staged` (a `--stage-ledger-remediation`
+  destination that already exists and differs, kept untouched), `conflict`
+  (preflight refused it), or, in an apply, `written`, `rolled-back`, `failed`,
+  `pending`. Re-running a successful `--apply` is byte-idempotent: every
+  destination reports `identical`.
 - `--apply` is all-or-nothing. Every byte is staged under `.fv/` first, then each
   destination is moved into place with `os.replace`, which does not follow a
   symlink at the final name. A failure during the moves rolls back every
@@ -79,7 +86,38 @@ dry-run`, `applied: false`, so a consumer can tell a refused apply from a dry ru
   With no cited external intent, `.colosseum/intent.md` itself becomes
   `.fv/intent.md`. The elected spec is the report's own `target_spec` field, not
   only a sentence in a detail string.
-- Mapped: `ledger.md` verbatim, the elected intent as the dispatch target,
+- The ledger is gated before it is mapped. The migration runs the extension's own
+  current Gate A (`scripts/check_ledger_references.py`, default strictness,
+  `--root` the project root) over the ledger the migrated project would present to
+  its first gate run; a rejection, or a gate that cannot return a verdict at all,
+  is one bounded `unsupported` row that blocks before any `.fv` write is proposed.
+  No citation is rewritten for the operator. The row is keyed by the file checked,
+  because the remedy differs: `.fv/ledger.md#gate-a` is writable and is fixed in
+  place, while `.colosseum/ledger.md#gate-a` names a file this tool may only read,
+  so its refusal points at `--stage-ledger-remediation`.
+- `--stage-ledger-remediation` copies `.colosseum/ledger.md` to `.fv/ledger.md`
+  verbatim and proposes no other write: no history, no manifests, no dispatch
+  route, no include policy, no plan. It is mutually exclusive with `--apply` (both
+  flags together is a usage error, exit 2), runs no gate on the copy (those bytes
+  are usually the ones the gate just refused), keeps `applied: false`, and renders
+  `STAGED` or `ALREADY STAGED` rather than `APPLIED`. The usual containment holds:
+  a symlink at `.fv` or at the destination, a `.fv` that is not a directory or is
+  not writable, a destination that exists and is not a regular file, and a
+  missing, symlinked or non-regular legacy ledger each block the run with nothing
+  written. An existing `.fv/ledger.md` is never clobbered, whatever its bytes say:
+  `identical` when it equals the legacy ledger, `already-staged` when it differs,
+  and one that appears between preflight and the move is refused at the move.
+- Once the operator has edited `.fv/ledger.md` and the current Gate A accepts it,
+  the ordinary migration adopts that file. The live ledger outranks the legacy one
+  (it is what CI checks and the only one of the two that is writable), its bytes
+  are kept exactly as written and report `identical`, the differing legacy ledger
+  is `preserved-history` at `.fv/history/colosseum/ledger.md` instead of a
+  destination conflict, an include entry naming `.colosseum/ledger.md` is
+  translated to bind `.fv/ledger.md`, and the rest of the migration proceeds. A
+  staged copy the gate still refuses blocks at `.fv/ledger.md#gate-a`, the path
+  the operator can actually fix.
+- Mapped: `ledger.md` verbatim (or an accepted live `.fv/ledger.md` kept as it
+  stands), the elected intent as the dispatch target,
   `obligations.json` + `g1-claims.json` to `.fv/obligations.json` `system_claims`,
   `evidence/runs/layer-runs.json` to `.fv/verification-plan.json`,
   `verified-inputs.txt` to `.fv/verified-inputs.txt`. Everything else

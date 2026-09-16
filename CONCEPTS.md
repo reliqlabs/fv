@@ -245,15 +245,19 @@ by re-running the cohort, not by patching the one execution that moved.
 ## Shadow migration of a legacy tree
 
 A **shadow migration** brings a pre-FV `.colosseum` project under FV without
-touching it: `scripts/fv_migrate.py PROJECT [--apply]` reads the legacy tree,
-writes only under `.fv/`, and leaves `.colosseum/` byte-identical as the
-auditable original for everything the translation cannot carry. Dry run is the
-default. Before proposing `.fv/ledger.md`, the migrator runs the current Gate A
-against the legacy ledger at default strictness. A rejection or checker
-infrastructure failure becomes one bounded `.colosseum/ledger.md#gate-a`
-unsupported row and blocks dry-run/apply without rewriting citations. Legacy
-ledgers must therefore meet the FV citation contract before their trust claims
-can be mapped live. Every legacy file is classified exactly once as `mapped`,
+touching it: `scripts/fv_migrate.py PROJECT` reads the legacy tree, writes only
+under `.fv/`, and leaves `.colosseum/` byte-identical as the auditable original
+for everything the translation cannot carry. Dry run is the default; `--apply`
+writes the migration, and `--stage-ledger-remediation` is the one narrow write
+mode below. Before proposing `.fv/ledger.md`, the migrator runs the extension's
+own current Gate A — default strictness, `--root` the project root, loaded from
+the extension's own path rather than from any copy a legacy tree vendored —
+against the ledger the migrated project would actually present to its first
+gate run. A rejection, or a checker infrastructure failure that leaves no
+verdict at all, becomes one bounded `#gate-a` unsupported row and blocks dry
+run and apply alike without rewriting a citation. Legacy ledgers must therefore
+meet the FV citation contract before their trust claims can be mapped live.
+Every legacy file is classified exactly once as `mapped`,
 `preserved-history`, or `unsupported`, and any `unsupported` row or
 destination conflict blocks the run rather than producing a partial `.fv/`.
 
@@ -281,6 +285,26 @@ destination conflict blocks the run rather than producing a partial `.fv/`.
   Nothing garbage-collects it: a sweep would have to decide that another
   process's staging tree is dead, and guessing that wrong would delete a live
   migration's bytes or a rollback's only surviving originals.
+- **A refused ledger is remediated in a writable copy, never rewritten by the
+  tool.** The `#gate-a` row is keyed by the file that was checked, because the
+  remedy differs: `.fv/ledger.md#gate-a` is a live ledger the operator fixes in
+  place, while `.colosseum/ledger.md#gate-a` sits inside the tree this migration
+  may only read. That second refusal points at `--stage-ledger-remediation`,
+  which copies `.colosseum/ledger.md` to `.fv/ledger.md` verbatim and proposes
+  no other write — no history, no manifests, no dispatch route, no include
+  policy — under the same containment rules every destination gets, mutually
+  exclusive with `--apply`, running no gate on the copy (those bytes are usually
+  the ones just refused), and never clobbering an existing `.fv/ledger.md`,
+  which is the operator's own work and reports as `identical` or
+  `already-staged`. It is not a migration and never claims to be one: `applied`
+  stays false and the render says `STAGED` or `ALREADY STAGED`. The operator
+  edits that copy and re-runs the current Gate A until it passes, and the
+  ordinary migration then adopts it: the live ledger outranks the legacy one,
+  its accepted bytes are kept exactly as written, the differing legacy ledger
+  becomes preserved history and the auditable original rather than a destination
+  conflict, an include entry naming the legacy ledger is translated to bind
+  `.fv/ledger.md`, and the migration proceeds. No step of the loop rewrites a
+  citation; the operator owns every byte of the repair.
 - **The dispatch target is elected from a declaration, never from prose
   frequency.** The legacy pointer stub decides first; the ledger's citations
   decide only when the stub cites nothing. Two or more surviving candidates,

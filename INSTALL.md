@@ -134,6 +134,49 @@ counts as live `fv-evidence-run/v3` evidence. Legacy verification layers without
 a built-in pyramid step, `quint` among them, become `fv-verification-plan/v1`
 custom layers instead of being dropped.
 
+Before the migration proposes `.fv/ledger.md` it runs the extension's own
+current Gate A (`scripts/check_ledger_references.py`, default strictness,
+`--root` the project root) over the ledger the migrated project would present to
+its first gate run. A rejection, or an infrastructure failure that leaves the
+gate with no verdict at all, is one bounded `unsupported` row keyed by the file
+that was checked, and it blocks dry run and apply alike before any `.fv` write is
+proposed. No citation is rewritten for you in either direction.
+`.fv/ledger.md#gate-a` names a writable file: fix its citations in place and
+re-run. `.colosseum/ledger.md#gate-a` names a file this tool may only read, so
+that refusal points at `--stage-ledger-remediation`:
+
+```bash
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project \
+  --stage-ledger-remediation
+python3 "$FV_ROOT/scripts/check_ledger_references.py" \
+  /absolute/path/to/project/.fv/ledger.md --root /absolute/path/to/project
+uv run --script "$FV_ROOT/scripts/fv_migrate.py" /absolute/path/to/project --json
+```
+
+That mode copies `.colosseum/ledger.md` to `.fv/ledger.md` verbatim and proposes
+no other write: no history, no manifests, no dispatch route, no include policy,
+no plan. It is mutually exclusive with `--apply` (both flags together is a usage
+error, exit 2); it is not a migration, so `applied` stays false and the text
+render says `STAGED` or `ALREADY STAGED` rather than `APPLIED`; and no gate runs
+on the copy, because those bytes are usually the ones the gate just refused.
+Containment is unchanged: a symlink at `.fv` or at the destination, a `.fv` that
+is not a directory or is not writable, a destination that exists and is not a
+regular file, and a missing, symlinked, or non-regular legacy ledger each block
+the run with nothing written. An existing `.fv/ledger.md` is kept and never
+clobbered whatever its bytes say, reported as `identical` when it equals the
+legacy ledger and `already-staged` when it differs; one that appears between
+preflight and the move is refused at the move rather than replaced.
+
+The operator edits the staged `.fv/ledger.md` until the current Gate A accepts
+it, and the ordinary migration then takes over. A live `.fv/ledger.md` outranks
+the legacy ledger, since it is the file CI checks and the only one of the two
+that is writable: its accepted bytes are kept exactly as written, the differing
+legacy ledger becomes history at `.fv/history/colosseum/ledger.md` rather than a
+destination conflict, a legacy `verified-inputs.txt` entry naming
+`.colosseum/ledger.md` is translated to bind `.fv/ledger.md` instead, and the
+rest of the migration proceeds normally. A staged copy the gate still refuses
+blocks at `.fv/ledger.md#gate-a`, the path the operator can actually fix.
+
 Legacy `verified-inputs.txt` is an include list, and FV include mode means the
 same thing, so it is translated rather than inverted: the migrated policy
 declares `mode: include`, keeps every legacy source root verbatim, rebinds an
@@ -163,11 +206,14 @@ The report (`fv-migration-report/v1`) carries `schema`, `project_root` (always
 `"."`), `target_spec` (the elected dispatch target), `requested_mode`, `mode`,
 `applied`, `status`, `error`, `counts`, `artifacts[]`, `writes[]`, `conflicts[]`,
 and `unsupported[]`. A blocked `--apply` reports `requested_mode: apply`,
-`mode: dry-run`, `applied: false`. Each entry of `writes[]` carries an `action`:
-`create`, `identical`, `adopt`, `conflict` before an apply, and `written`,
-`rolled-back`, `failed`, `lost`, or `pending` after one. `lost` means rollback
-could not restore an original destination; the retained staging directory holds
-the recoverable original.
+`mode: dry-run`, `applied: false`; a `--stage-ledger-remediation` run reports
+both mode fields as `stage-ledger-remediation` with `applied: false`, since that
+field is the full migration's claim. Each entry of `writes[]` carries an
+`action`: `create`, `identical`, `adopt`, `conflict` before an apply, plus
+`already-staged` for a kept `.fv/ledger.md` under staging, and `written`,
+`rolled-back`, `failed`, `lost`, or `pending` after an apply. `lost` means
+rollback could not restore an original destination; the retained staging
+directory holds the recoverable original.
 
 `--apply` stages bytes under `.fv/.migrate-staging/<run>/` and moves them with
 `os.replace`. A failure rolls back every completed move and still prints the

@@ -13,10 +13,16 @@ remains the auditable original for everything the translation cannot carry
 across.
 
 USAGE
-    scripts/fv_migrate.py PROJECT [--apply] [--json]
+    scripts/fv_migrate.py PROJECT [--apply | --stage-ledger-remediation] [--json]
 
     PROJECT     project root holding `.colosseum/`
     --apply     write the migration (only under `.fv/`); default is dry-run
+    --stage-ledger-remediation
+                copy `.colosseum/ledger.md` to `.fv/ledger.md` and do nothing
+                else, so a ledger Gate A refuses can be repaired in a
+                writable file; an existing `.fv/ledger.md` is kept, never
+                overwritten. Not a migration, and mutually exclusive with
+                `--apply`
     --json      emit the deterministic JSON report instead of the text report
 
     Exit 0 when the report's status is `ok`, 1 when it is `blocked` (or the
@@ -34,7 +40,11 @@ INVENTORY
 
     mapped
         `.colosseum/ledger.md`                  -> `.fv/ledger.md` (verbatim,
-                                                   Gate A permitting)
+                                                   Gate A permitting; history
+                                                   instead when the project
+                                                   already carries a live
+                                                   remediated ledger that
+                                                   differs)
         `.colosseum/intent.md`                  -> the dispatch target
         `.colosseum/obligations.json`           -> `.fv/obligations.json`
         `.colosseum/g1-claims.json`             -> `.fv/obligations.json`
@@ -76,17 +86,29 @@ DISPATCH TARGET
     string, so a dry-run consumer can check the decision.
 
 LEDGER READINESS
-    `.fv/ledger.md` is the legacy ledger's bytes unchanged, and Gate A
-    resolves a citation against the project root from either location, so
-    whether the migrated project can pass Gate A is already decided by bytes
-    that exist before anything is written. It is decided here: when
-    `.colosseum/ledger.md` exists, the extension's own current
-    `scripts/check_ledger_references.py` is run over it with `--root PROJECT`
-    at default strictness, and only exit 0 permits the mapping. The gate is
-    loaded from its own path and called in-process, never through a shell: a
-    stale copy earlier on `sys.path` -- a project's own `.fv/scripts/` copy
-    is exactly that -- must not be what decides readiness, and the answer
-    must not depend on the cwd, on an interpreter on PATH, or on quoting.
+    Whether the migrated project can pass Gate A is already decided by bytes
+    that exist before anything is written, because the ledger it will present
+    is a file that is already on disk and Gate A resolves a citation against
+    the project root from either location. So it is decided here, against the
+    extension's own current `scripts/check_ledger_references.py` with `--root
+    PROJECT` at default strictness, and only exit 0 permits the mapping. The
+    gate is loaded from its own path and called in-process, never through a
+    shell: a stale copy earlier on `sys.path` -- a project's own
+    `.fv/scripts/` copy is exactly that -- must not be what decides
+    readiness, and the answer must not depend on the cwd, on an interpreter
+    on PATH, or on quoting.
+
+    Which file is checked is the project's own answer. A regular non-symlink
+    `.fv/ledger.md` is the live candidate and outranks the legacy ledger: it
+    is what CI checks and, since `.colosseum/` stays byte-identical, the only
+    one of the two an operator can repair. When it passes, its bytes are kept
+    exactly as written -- the destination reports as `identical`, nothing is
+    rewritten -- and the legacy ledger becomes history rather than a
+    destination conflict, since differing bytes are precisely what a
+    remediated ledger has. A legacy ledger byte-identical to it is the
+    ordinary re-run of a finished migration and stays the verbatim mapping it
+    was, with no second copy under history. Only a project with no live
+    candidate validates the legacy ledger itself.
 
     A nonzero exit the gate returns is a rejection of the ledger. Anything
     that stops it from returning a status at all -- a missing or unimportable
@@ -94,15 +116,38 @@ LEDGER READINESS
     those two arguments -- is an infrastructure failure of the check, and the
     two are reported as what they are instead of being merged into one
     verdict: the second says nothing about the ledger's bytes. Both add one
-    `.colosseum/ledger.md#gate-a` unsupported row carrying a bounded excerpt
-    of the gate's own output -- capped in lines and in line length, with
-    machine paths redacted, so the JSON report stays byte-identical across
-    checkouts -- and both block before any `.fv` write is proposed. Neither
-    rewrites anything: this is readiness validation, not ledger repair, and
-    the refused ledger's bytes still reach
-    `.fv/history/colosseum/ledger.md`. The remedy is in the refusal --
-    content-bind the citations, re-root one written relative to
-    `.colosseum/`, then re-run.
+    unsupported row carrying a bounded excerpt of the gate's own output --
+    capped in lines and in line length, with machine paths redacted, so the
+    JSON report stays byte-identical across checkouts -- and both block
+    before any `.fv` write is proposed. The row is keyed by the file that was
+    checked, `.fv/ledger.md#gate-a` or `.colosseum/ledger.md#gate-a`, because
+    the remedy differs: the first names a writable file to edit in place, and
+    the second a file this migration may only read, whose bytes still reach
+    `.fv/history/colosseum/ledger.md` and whose refusal therefore points at
+    `--stage-ledger-remediation` for a writable copy. Neither rewrites
+    anything: this is readiness validation, not ledger repair.
+
+LEDGER REMEDIATION
+    A refused ledger is repaired by editing its citations, and a legacy
+    project's only copy is inside the tree this tool must leave
+    byte-identical. `--stage-ledger-remediation` is what gives the operator a
+    writable one, and nothing else: it copies `.colosseum/ledger.md` to
+    `.fv/ledger.md` verbatim and proposes no other write -- no history, no
+    manifests, no dispatch, no include policy -- under the same containment
+    rules every destination gets, so a symlink at `.fv` or at the destination,
+    a non-directory or unwritable `.fv`, and a missing, symlinked or
+    non-regular legacy ledger each block with nothing written. No gate runs:
+    the bytes being staged are usually the ones the gate just refused.
+
+    An existing `.fv/ledger.md` is never overwritten, whatever its bytes say
+    -- it is the operator's work, and replacing it would discard the exact
+    remediation this mode exists to enable. It reports as `identical` or
+    `already-staged` and the run is still `ok`; a destination that appears
+    after preflight is refused at the move rather than replaced. The report
+    is the usual document with `requested_mode` and `mode` both
+    `stage-ledger-remediation`, and `applied` stays false: that field is the
+    full migration's claim, and a staged ledger copy must never make it. The
+    text render says `STAGED` or `ALREADY STAGED`, never `APPLIED`.
 
 OBLIGATIONS
     Legacy `obligations.json` carries only `{claim_id, required}`; the
@@ -229,33 +274,35 @@ APPLY
     `--apply` is all-or-nothing. Preflight refuses a destination whose path
     crosses a symlink at any component -- `.fv` itself included, since both
     `mkdir` and an ordinary open follow one -- a destination that exists with
-    different content, and a destination directory that is not writable. The
-    writes themselves are staged under `.fv/.migrate-staging/<run>/` in full
-    and then moved into place with `os.replace`, which does not follow a
-    symlink at the final name. A destination that already exists is moved
-    aside into the same staging tree before the new bytes land, so a failure
-    during the moves renames the original inode back and restores its mode,
-    ownership and timestamps together with its bytes, none of which writing
-    saved bytes into a fresh file reproduces. An aside that itself fails left
-    its destination untouched, so that write is `failed` and not `lost`, and
-    nothing is held back. Each write's reported action is what happened to it
-    (`written`, `rolled-back`, `failed`, `lost`, `pending`), and the report is
-    printed even when the apply fails, because it is the only enumeration of
-    what landed.
+    different content (with the two exceptions below), and a destination
+    directory that is not writable. The writes themselves are staged under
+    `.fv/.migrate-staging/<run>/` in full and then moved into place with
+    `os.replace`, which does not follow a symlink at the final name. A
+    destination that already exists is moved aside into the same staging tree
+    before the new bytes land, so a failure during the moves renames the
+    original inode back and restores its mode, ownership and timestamps
+    together with its bytes, none of which writing saved bytes into a fresh
+    file reproduces. An aside that itself fails left its destination
+    untouched, so that write is `failed` and not `lost`, and nothing is held
+    back. Each write's reported action is what happened to it (`written`,
+    `rolled-back`, `failed`, `lost`, `pending`), and the report is printed
+    even when the apply fails, because it is the only enumeration of what
+    landed.
 
     The staging prefix is every byte's first destination, so it is held to the
     same containment rule as a real one: preflight refuses a symlinked or
-    unwritable `.fv/.migrate-staging`, and the apply re-checks the prefix and
-    the run directory it creates under it before the first staged byte, since
-    the prefix is a fixed name anything with write access to `.fv` can replace
-    with a link. The prefix is also structurally excluded from the
-    verified-input snapshot, and every run stages under its own unique
-    subdirectory of it. A hard kill between the first and the last move
-    therefore strands only snapshot-excluded residue: it cannot move a
-    snapshot, no later or concurrent run reuses it, and nothing collects it.
-    Concurrent migrations of one project share only the prefix, and each drops
-    it once it is empty, so a sibling removing it while this run creates its
-    own directory is retried and then reported as the race it is.
+    unwritable `.fv/.migrate-staging` whenever some destination still has
+    bytes to land, and the apply re-checks the prefix and the run directory it
+    creates under it before the first staged byte, since the prefix is a fixed
+    name anything with write access to `.fv` can replace with a link. The
+    prefix is also structurally excluded from the verified-input snapshot, and
+    every run stages under its own unique subdirectory of it. A hard kill
+    between the first and the last move therefore strands only
+    snapshot-excluded residue: it cannot move a snapshot, no later or
+    concurrent run reuses it, and nothing collects it. Concurrent migrations
+    of one project share only the prefix, and each drops it once it is empty,
+    so a sibling removing it while this run creates its own directory is
+    retried and then reported as the race it is.
 
     `.fv/dispatch.json` is the single destination adopted rather than
     refused: an existing route keeps every field except the `project_root`
@@ -265,6 +312,13 @@ APPLY
     not come back at the umask default. Refusing it instead would make every
     project already initialized by `fv_init` unmigratable without moving the
     file aside.
+
+    `.fv/ledger.md` under `--stage-ledger-remediation` is the other
+    exception, in the opposite direction: an existing destination is kept
+    rather than replaced or refused, reported as `identical` or
+    `already-staged`, and the apply refuses to move over one that appeared
+    after preflight instead of renaming the operator's file into a staging
+    tree it then discards.
 """
 from __future__ import annotations
 
@@ -289,6 +343,11 @@ import fv_project  # noqa: E402  canonical project-root, target, and exclusion r
 import pyramid_run  # noqa: E402  single source of truth for the plan schema
 
 REPORT_SCHEMA = "fv-migration-report/v1"
+# The one narrow write mode: stage the legacy ledger as `.fv/ledger.md` so a
+# ledger Gate A refuses can be remediated in a writable file, without
+# migrating anything else. It is not a migration and never reports as one.
+STAGE_LEDGER_MODE = "stage-ledger-remediation"
+STAGE_LEDGER_FLAG = f"--{STAGE_LEDGER_MODE}"
 LEGACY_DIRNAME = ".colosseum"
 HISTORY_RELATIVE = ".fv/history/colosseum"
 HISTORY_EXCLUSION = ".fv/history/"
@@ -316,6 +375,10 @@ LEGACY_INTENT = "intent.md"
 LEGACY_LEDGER = "ledger.md"
 LEGACY_VERIFIED_INPUTS = "verified-inputs.txt"
 LEGACY_LAYER_RUNS = "evidence/runs/layer-runs.json"
+# The live ledger of a migrated project: the file CI's Gate A checks, the
+# file `--stage-ledger-remediation` creates, and the only ledger a migration
+# ever writes.
+LIVE_LEDGER = ".fv/ledger.md"
 
 OBLIGATIONS_SCHEMA = "colosseum-obligations"
 CLAIMS_SCHEMA = "colosseum-g1-claims"
@@ -685,6 +748,11 @@ class PlannedWrite:
     # `.fv/dispatch.json` is the one destination this migration may rewrite
     # rather than refuse: it adopts an existing route instead of replacing it.
     adopt: bool = False
+    # A destination that already exists is kept and reported, never replaced
+    # and never a conflict: `--stage-ledger-remediation` stages a copy for an
+    # operator to remediate, so a ledger already sitting there -- identical or
+    # not -- is the one thing that must survive the run untouched.
+    keep_existing: bool = False
     detail: str = ""
 
     def as_json(self) -> dict:
@@ -857,6 +925,13 @@ class Migration:
         self._writes: dict[str, PlannedWrite] = {}
         self._history_skip: set[str] = set()
         self._legacy_files: list[str] = []
+        # Legacy path -> the live `.fv` artifact this run made authoritative
+        # for its content when the inventory alone cannot say so. The live
+        # remediated ledger is the case: the legacy ledger's own bytes become
+        # history, but the document a layer reads in its place is
+        # `.fv/ledger.md`, so an include entry naming the legacy ledger has to
+        # bind that file rather than bind nothing.
+        self._rebound: dict[str, str] = {}
         # Every layer any migrated claim names, or None when no claim
         # manifest converted: the sentinel means "no claim says otherwise",
         # under which every recorded layer gates.
@@ -899,7 +974,8 @@ class Migration:
         return f"{HISTORY_RELATIVE}/{relative}"
 
     def _plan_write(self, path: str, data: bytes, *, mode: int | None = None,
-                    adopt: bool = False, detail: str = "") -> None:
+                    adopt: bool = False, keep_existing: bool = False,
+                    detail: str = "") -> None:
         """Record intended bytes for one `.fv` destination."""
         if not path.startswith(".fv/"):
             raise MigrationError(f"refusing to write outside .fv: {path}")
@@ -908,7 +984,8 @@ class Migration:
             if existing.data != data:
                 raise MigrationError(f"two sources disagree about {path}")
             return
-        self._writes[path] = PlannedWrite(path, data, mode=mode, adopt=adopt, detail=detail)
+        self._writes[path] = PlannedWrite(path, data, mode=mode, adopt=adopt,
+                                          keep_existing=keep_existing, detail=detail)
 
     # ---- inventory -------------------------------------------------------
 
@@ -1026,10 +1103,121 @@ class Migration:
             return candidates[0], False
         return None, False
 
+    def _live_ledger(self) -> Path | None:
+        """The project's own live ledger, when it has one this run may read.
+
+        A regular non-symlink `.fv/ledger.md` is the operator's ledger: it is
+        what `--stage-ledger-remediation` creates, what remediation edits, and
+        what CI's Gate A checks. Anything else -- absent, a symlink, a
+        directory, a device, or a path crossing a symlink at `.fv` -- is not a
+        candidate; the legacy ledger decides instead, and a destination in one
+        of those shapes is then reported by preflight as the conflict it is.
+        """
+        if self._symlinked_component(LIVE_LEDGER) is not None:
+            return None
+        live = self.project / LIVE_LEDGER
+        return live if live.is_file() else None
+
     def _migrate_ledger(self) -> None:
+        """Decide which ledger the migrated project presents to Gate A.
+
+        The live `.fv/ledger.md` outranks the legacy one whenever it exists:
+        it is the file CI checks and the only one of the two an operator may
+        edit, since `.colosseum/` stays byte-identical. So it is the file the
+        gate is run against, its bytes are never rewritten, and a legacy
+        ledger whose bytes differ is history rather than a destination
+        conflict -- differing bytes are precisely what a remediated ledger
+        has. Only a project with no live ledger falls back to validating the
+        legacy one, whose refusal then points at
+        `--stage-ledger-remediation` as the way to get a writable copy.
+        """
         relative = f"{LEGACY_DIRNAME}/{LEGACY_LEDGER}"
-        if relative not in self._legacy_files:
+        legacy_present = relative in self._legacy_files
+        live = self._live_ledger()
+        if live is not None:
+            self._adopt_live_ledger(live, relative if legacy_present else None)
+        elif legacy_present:
+            self._migrate_legacy_ledger(relative)
+
+    def _adopt_live_ledger(self, live: Path, legacy: str | None) -> None:
+        """Keep an existing `.fv/ledger.md` the current Gate A accepts."""
+        try:
+            current = live.read_bytes()
+        except OSError as error:
+            self.conflicts.append(
+                f"{LIVE_LEDGER}: exists and is unreadable ({error}), so the ledger the "
+                "migrated project would present to its first gate run cannot be checked and "
+                "must not be replaced"
+            )
             return
+        outcome, diagnostic = run_gate_a(live, self.project)
+        if outcome == GATE_A_REJECTED:
+            self._unsupported(
+                f"{LIVE_LEDGER}#{GATE_A_FRAGMENT}",
+                f"the extension's current Gate A ({GATE_A_SCRIPT.name}, default strictness, "
+                f"{GATE_A_ROOT_FLAG} the project root) refuses the live ledger this project "
+                f"already carries: {diagnostic}. This file, not "
+                + (f"{legacy}, " if legacy is not None else "the legacy tree, ")
+                + "is what the migrated project presents to its first gate run, and unlike "
+                f"the legacy tree it is writable: fix the citations in {LIVE_LEDGER} -- "
+                "content-bind them, drop one that cites nothing -- and re-run. This "
+                f"migration never rewrites a ledger, so {LIVE_LEDGER} is left exactly as you "
+                "wrote it and nothing was written",
+            )
+            return
+        if outcome != GATE_A_PASSED:
+            self._unsupported(
+                f"{LIVE_LEDGER}#{GATE_A_FRAGMENT}",
+                f"the extension's current Gate A could not be run against the live ledger "
+                f"this project already carries, so its readiness is unknown: {diagnostic}. "
+                "That is an infrastructure failure of the check, not a verdict on the bytes "
+                f"of {LIVE_LEDGER}: repair the check and re-run. The migration blocks rather "
+                "than adopting a ledger nothing confirmed, and neither that file nor the "
+                f"legacy {LEGACY_DIRNAME}/ tree is touched",
+            )
+            return
+        # The bytes already on disk are the intended bytes: planning them
+        # makes the destination `identical` in preflight, so the operator's
+        # ledger is what the migrated project keeps, and makes it the live
+        # artifact an include entry naming the legacy ledger can bind.
+        self._plan_write(LIVE_LEDGER, current)
+        if legacy is None:
+            return
+        self._rebound[legacy] = LIVE_LEDGER
+        legacy_data = self._read_bytes(legacy)
+        if legacy_data is None:
+            return
+        accepted = (
+            f"{LIVE_LEDGER} already exists and the extension's current Gate A "
+            f"({GATE_A_SCRIPT.name}, default strictness) accepts it against this project root, "
+            "so it is the migrated project's ledger and its bytes are kept exactly as written "
+            f"(gate warnings: {diagnostic})"
+        )
+        if legacy_data == current:
+            # The destination already holds these exact legacy bytes, which is
+            # what a re-run of a finished migration looks like. So it is the
+            # same verbatim mapping as a first run, and a history copy would
+            # be a second copy of bytes that already survive at the
+            # destination -- and would make an idempotent re-apply write.
+            self._mapped(
+                legacy,
+                LIVE_LEDGER,
+                f"{accepted}, and the legacy ledger is byte-identical to it: the mapping is "
+                "already in place and nothing is rewritten",
+                verbatim=True,
+            )
+            return
+        self._preserved(
+            legacy,
+            f"{accepted}. The legacy ledger differs from it (legacy "
+            f"sha256:{sha256_bytes(legacy_data)}, live sha256:{sha256_bytes(current)}), which "
+            "is exactly what a remediated ledger differs by, so it is history and the "
+            f"auditable original rather than a destination conflict. A verified-input entry "
+            f"naming {legacy} binds {LIVE_LEDGER}, the document a layer now reads in its place",
+        )
+
+    def _migrate_legacy_ledger(self, relative: str) -> None:
+        """Validate and copy the legacy ledger: this project has no live one."""
         data = self._read_bytes(relative)
         if data is None:
             return
@@ -1045,11 +1233,14 @@ class Migration:
                 f"{relative}#{GATE_A_FRAGMENT}",
                 f"the extension's current Gate A ({GATE_A_SCRIPT.name}, default strictness, "
                 f"{GATE_A_ROOT_FLAG} the project root) refuses this ledger: {diagnostic}. The "
-                "migrated .fv/ledger.md would be these same bytes checked against the same "
+                f"migrated {LIVE_LEDGER} would be these same bytes checked against the same "
                 "root, so the migrated project would fail its first gate run here. This "
-                "migration validates readiness and never rewrites a ledger: fix the citations "
-                f"in {relative} -- content-bind them, re-root one written relative to "
-                f"{LEGACY_DIRNAME}/, drop one that cites nothing -- and re-run",
+                "migration validates readiness and never rewrites a ledger, and it never "
+                f"writes into {LEGACY_DIRNAME}/ either: fix the citations in {relative} -- "
+                f"content-bind them, re-root one written relative to {LEGACY_DIRNAME}/, drop "
+                f"one that cites nothing -- and re-run, or run {STAGE_LEDGER_FLAG} to copy "
+                f"this ledger to {LIVE_LEDGER} and remediate it there, which a later "
+                "migration then adopts in place of the legacy bytes",
             )
             return
         if outcome != GATE_A_PASSED:
@@ -1062,13 +1253,13 @@ class Migration:
                 f"legacy {LEGACY_DIRNAME}/ tree is left exactly as it was",
             )
             return
-        self._plan_write(".fv/ledger.md", data)
+        self._plan_write(LIVE_LEDGER, data)
         self._mapped(
             relative,
-            ".fv/ledger.md",
+            LIVE_LEDGER,
             "legacy ledger, verbatim: the bytes are preserved exactly, and the extension's "
             f"current Gate A ({GATE_A_SCRIPT.name}, default strictness) accepts them against "
-            f"this project root, so .fv/ledger.md starts gate-clean (gate warnings: "
+            f"this project root, so {LIVE_LEDGER} starts gate-clean (gate warnings: "
             f"{diagnostic}). A citation written relative to {LEGACY_DIRNAME}/ resolves from "
             "neither location and would have blocked this migration instead of migrating into "
             "a ledger that fails its first gate run",
@@ -1203,7 +1394,12 @@ class Migration:
                 "names the legacy intent entrypoint, and this migration elected no dispatch "
                 "target, so there is no canonical document for the entry to bind"
             )
-        destination = self._live_destination(legacy_path)
+        # An explicit binding first: a legacy file whose own bytes became
+        # history can still have a live successor a layer reads in its place,
+        # which only the step that elected it knows. The live remediated
+        # ledger is that case, and the inventory row for the legacy ledger is
+        # then a history row, not a mapping.
+        destination = self._rebound.get(legacy_path) or self._live_destination(legacy_path)
         if destination is not None:
             return destination, ""
         # The bare legacy directory has no `_history_path` of its own: its
@@ -1969,7 +2165,6 @@ class Migration:
     # ---- preflight -------------------------------------------------------
 
     def _preflight(self) -> None:
-        self._preflight_staging()
         for path, write in sorted(self._writes.items()):
             destination = self.project / path
             symlinked = self._symlinked_component(path)
@@ -2016,6 +2211,11 @@ class Migration:
                 continue
             if current == write.data:
                 write.action = "identical"
+                if write.keep_existing:
+                    write.detail = write.detail or (
+                        f"{path} already holds exactly these bytes: it is identical to the "
+                        "source, so there is nothing to stage and nothing was written"
+                    )
             elif write.adopt:
                 # The one adopted destination: an existing dispatch keeps its
                 # route and has only the two fields this migration owns
@@ -2027,12 +2227,33 @@ class Migration:
                 # failed apply already restores the mode exactly.
                 write.action = "adopt"
                 write.mode = current_mode
+            elif write.keep_existing:
+                # Kept, not refused and not replaced: this destination is a
+                # copy staged for an operator to remediate, so a file already
+                # there is the remediation and the whole point of the mode is
+                # to leave it alone. Reporting it as a conflict would demand
+                # the operator move their own work aside to be told nothing
+                # needed doing.
+                write.action = "already-staged"
+                write.detail = write.detail or (
+                    f"{path} already exists and differs from the source (have "
+                    f"sha256:{sha256_bytes(current)}, source sha256:{sha256_bytes(write.data)}): "
+                    "kept exactly as it is, because a staged remediation is expected to differ "
+                    "from the ledger it was staged from. Nothing was written"
+                )
             else:
                 self.conflicts.append(
                     f"{path}: exists with different content "
                     f"(have sha256:{sha256_bytes(current)}, would write sha256:{sha256_bytes(write.data)})"
                 )
                 write.action = "conflict"
+        # Last, and only for a write that still has bytes to land: the
+        # staging prefix is where those bytes go first, but a run whose every
+        # destination is already identical stages nothing at all, and
+        # blocking it on a prefix no byte passes through would refuse a
+        # completed migration for a name it never uses.
+        if any(write.action in ("create", "adopt") for write in self._writes.values()):
+            self._preflight_staging()
 
     def _preflight_staging(self) -> None:
         """Refuse a staging prefix that cannot hold this run's bytes safely.
@@ -2108,6 +2329,81 @@ class Migration:
         self._preserve_history()
         self._preflight()
 
+    def build_ledger_remediation(self) -> None:
+        """Stage the legacy ledger as `.fv/ledger.md`, and nothing else.
+
+        The single write this mode proposes is a byte-identical copy of
+        `.colosseum/ledger.md`. It exists because a ledger Gate A refuses is
+        repaired by editing its citations, and the only copy a legacy project
+        has lives in the tree this tool must leave byte-identical: the
+        operator needs a writable one at the destination a later migration
+        will adopt. So nothing else is inventoried, translated, or written --
+        no history, no manifests, no dispatch, no verified-input policy -- and
+        no gate is run either, since the bytes being staged are usually the
+        ones the gate just refused. A staged remediation can therefore never
+        be mistaken for a migration, and an existing `.fv/ledger.md` is
+        reported and kept whatever its bytes say: it is the operator's work,
+        and overwriting it would discard exactly the remediation this mode
+        exists to enable.
+        """
+        relative = f"{LEGACY_DIRNAME}/{LEGACY_LEDGER}"
+        source = self.project / relative
+        symlinked = self._symlinked_component(relative)
+        if symlinked is not None:
+            self._unsupported(
+                relative,
+                f"{symlinked} is a symlink: staging through it would copy the bytes of "
+                "whatever it points at under the identity of the legacy ledger, and a "
+                "remediation has to start from the bytes the gate actually read",
+            )
+            return
+        if not source.exists():
+            self._unsupported(
+                relative,
+                f"no legacy ledger to stage: this mode copies {relative} and nothing else"
+                + ("" if self.legacy.is_dir() else
+                   f", and {LEGACY_DIRNAME}/ is not a directory of this project either"),
+            )
+            return
+        if not source.is_file():
+            self._unsupported(
+                relative,
+                "not a regular file: there are no ledger bytes to stage for remediation",
+            )
+            return
+        data = self._read_bytes(relative)
+        if data is None:
+            return
+        destination_symlink = self._symlinked_component(LIVE_LEDGER)
+        if destination_symlink is not None:
+            self.conflicts.append(
+                f"{LIVE_LEDGER}: {destination_symlink} is a symlink; a write through it would "
+                "leave the .fv tree this tool is allowed to write, and its target is not this "
+                "project's ledger"
+            )
+            return
+        live = self.project / LIVE_LEDGER
+        if live.exists() and not live.is_file():
+            self.conflicts.append(
+                f"{LIVE_LEDGER}: destination exists and is not a regular file, so it is "
+                "neither a ledger to keep nor a name this mode may replace"
+            )
+            return
+        # `keep_existing`: preflight reports an existing destination as
+        # `identical` or `already-staged` instead of refusing it, and the
+        # apply refuses to replace one that appears after preflight looked.
+        self._plan_write(LIVE_LEDGER, data, keep_existing=True)
+        self._mapped(
+            relative,
+            LIVE_LEDGER,
+            f"legacy ledger staged for remediation: {LIVE_LEDGER} is a byte-identical copy an "
+            f"operator can edit, which the next migration runs Gate A against and adopts in "
+            f"place of the legacy bytes. Nothing else is migrated by {STAGE_LEDGER_FLAG}: "
+            f"{LEGACY_DIRNAME}/ is only read, no other .fv artifact is created, and an existing "
+            f"{LIVE_LEDGER} is kept rather than overwritten",
+        )
+        self._preflight()
+
     # ---- results ---------------------------------------------------------
 
     @property
@@ -2170,6 +2466,18 @@ class Migration:
                 destination = self.project / write.path
                 created.extend(self._make_dirs(destination.parent))
                 self._guard_destination(destination)
+                if write.keep_existing and destination.exists():
+                    # Preflight saw no destination here, so this one appeared
+                    # while the run was in flight. A `keep_existing` write
+                    # never replaces a destination -- it stages a copy for an
+                    # operator to remediate -- and the aside below would move
+                    # that new file into a staging tree this run then
+                    # discards. Refused before anything is touched, so the
+                    # file that appeared stays exactly where it is.
+                    raise MigrationError(
+                        f"{write.path}: appeared after preflight; this write stages a copy and "
+                        "never replaces an existing destination, so nothing was written to it"
+                    )
                 moved = _Moved(write, destination)
                 touched.append(moved)
                 if destination.is_file():
@@ -2361,7 +2669,13 @@ class Migration:
             except OSError:
                 pass  # not empty, or already gone with the staging tree
 
-    def report(self, *, requested: str, applied: bool, error: str | None = None) -> dict:
+    def report(self, *, requested: str, applied: bool, error: str | None = None,
+               mode: str | None = None) -> dict:
+        """The run's report. `mode` names what the run actually did when that
+        is not one of the two migration modes: `--stage-ledger-remediation`
+        performs no migration at all, so it reports its own mode and leaves
+        `applied` false -- that field is the full migration's claim, and a
+        staged ledger copy must never make it."""
         counts = {name: 0 for name in CLASSIFICATIONS}
         for artifact in self.artifacts:
             counts[artifact.classification] += 1
@@ -2372,7 +2686,7 @@ class Migration:
             # rule keeps out of a persisted trust artifact. The human render
             # names the real directory.
             "project_root": ".",
-            "mode": "apply" if applied else "dry-run",
+            "mode": mode or ("apply" if applied else "dry-run"),
             "requested_mode": requested,
             "applied": applied,
             "target_spec": self.target_spec,
@@ -2394,15 +2708,24 @@ def render_text(report: dict, root: str | None = None) -> str:
     for write in report["writes"]:
         actions[write["action"]] = actions.get(write["action"], 0) + 1
     requested = report.get("requested_mode", report["mode"])
+    staging = requested == STAGE_LEDGER_MODE
     mode = report["mode"] if requested == report["mode"] else f"{requested} requested, not applied"
-    lines = [
-        f"FV shadow migration ({mode}) of {root or report['project_root']}",
-        f"  dispatch target: {report.get('target_spec') or 'none'}",
-        "  classified: " + "  ".join(f"{name}={report['counts'][name]}" for name in CLASSIFICATIONS),
-        "  writes: " + (
-            "  ".join(f"{action}={count}" for action, count in sorted(actions.items())) or "none"
-        ),
-    ]
+    where = root or report["project_root"]
+    lines = (
+        # A staged ledger copy is not a migration, so the render states no
+        # dispatch target and no inventory: neither was decided, and a header
+        # that reported them as `none` would read as a migration that found
+        # nothing.
+        [f"FV ledger remediation staging of {where}"] if staging else [
+            f"FV shadow migration ({mode}) of {where}",
+            f"  dispatch target: {report.get('target_spec') or 'none'}",
+            "  classified: " + "  ".join(
+                f"{name}={report['counts'][name]}" for name in CLASSIFICATIONS),
+        ]
+    )
+    lines.append("  writes: " + (
+        "  ".join(f"{action}={count}" for action, count in sorted(actions.items())) or "none"
+    ))
     for artifact in report["artifacts"]:
         # Bulk history is a count, not 174 lines of listing. A deviation row
         # (`<file>#<item>`) is what a reader has to see: it names the part of a
@@ -2419,12 +2742,21 @@ def render_text(report: dict, root: str | None = None) -> str:
     for label, entries in (("unsupported", report["unsupported"]), ("conflicts", report["conflicts"])):
         for entry in entries:
             lines.append(f"  [{label}] {entry}")
+    happened = {write["action"] for write in report["writes"]}
     if report.get("error"):
         lines.append(f"  [error] {report['error']}")
         lines.append("VERDICT: FAILED (see each write's action above; whatever the rollback "
                      "could not undo is named in the error)")
     elif report["status"] == "blocked":
         lines.append("VERDICT: BLOCKED (nothing written; resolve the entries above)")
+    elif staging:
+        if "written" in happened:
+            lines.append(f"VERDICT: STAGED ({LIVE_LEDGER} now holds the legacy ledger's bytes; "
+                         "nothing else was migrated -- remediate its citations there, then "
+                         f"re-run without {STAGE_LEDGER_FLAG} to migrate)")
+        else:
+            lines.append(f"VERDICT: ALREADY STAGED (nothing written; {LIVE_LEDGER} is the "
+                         "operator's file and was kept, see its write row above)")
     elif report["applied"]:
         lines.append("VERDICT: APPLIED")
     else:
@@ -2438,8 +2770,13 @@ def main(argv: list[str] | None = None) -> int:
         description="Shadow-migrate a legacy .colosseum project into .fv (dry run by default).",
     )
     parser.add_argument("project", metavar="PROJECT", help="project root holding .colosseum/")
-    parser.add_argument("--apply", action="store_true",
-                        help="write the migration; only .fv is written and .colosseum is never touched")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--apply", action="store_true",
+                       help="write the migration; only .fv is written and .colosseum is never touched")
+    modes.add_argument(STAGE_LEDGER_FLAG, action="store_true", dest="stage_ledger_remediation",
+                       help=(f"stage {LEGACY_DIRNAME}/{LEGACY_LEDGER} as a byte-identical, "
+                             f"editable {LIVE_LEDGER} and do nothing else; an existing "
+                             f"{LIVE_LEDGER} is kept, never overwritten"))
     parser.add_argument("--json", action="store_true",
                         help="emit the deterministic JSON report instead of the text report")
     args = parser.parse_args(argv)
@@ -2450,17 +2787,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
 
+    staging = args.stage_ledger_remediation
     migration = Migration(project)
     try:
-        migration.build()
+        if staging:
+            migration.build_ledger_remediation()
+        else:
+            migration.build()
     except MigrationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
-    requested = "apply" if args.apply else "dry-run"
+    requested = STAGE_LEDGER_MODE if staging else ("apply" if args.apply else "dry-run")
+    writing = staging or args.apply
+    # `applied` is the full migration's claim and staging never makes it: the
+    # staged copy is reported by its own mode and its write's action.
     applied = args.apply and not migration.blocked
     failure: str | None = None
-    if applied:
+    if writing and not migration.blocked:
         try:
             migration.apply()
         except (MigrationError, OSError) as error:
@@ -2469,7 +2813,8 @@ def main(argv: list[str] | None = None) -> int:
             # with one errno.
             failure = str(error)
             applied = False
-    report = migration.report(requested=requested, applied=applied, error=failure)
+    report = migration.report(requested=requested, applied=applied, error=failure,
+                              mode=STAGE_LEDGER_MODE if staging else None)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
@@ -2478,8 +2823,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {failure}", file=sys.stderr)
         return 1
     if migration.blocked:
-        if args.apply and not args.json:
-            print("nothing was written: --apply refuses a blocked migration", file=sys.stderr)
+        if writing and not args.json:
+            print(f"nothing was written: {STAGE_LEDGER_FLAG if staging else '--apply'} refuses "
+                  "a blocked run", file=sys.stderr)
         return 1
     return 0
 

@@ -46,6 +46,15 @@ What this suite holds the migration to:
     `.colosseum/scripts/` never required and the migration blocks with one
     bounded `.colosseum/ledger.md#gate-a` row, writing nothing, rather than
     copying a ledger no FV gate accepts into `.fv/ledger.md`;
+  * and a refused ledger is not a dead end: the refusal names
+    `--stage-ledger-remediation`, that mode copies the legacy ledger to
+    `.fv/ledger.md` and writes nothing else, the operator binds the
+    citations in that copy, and the ordinary migration then treats it as
+    the project's live ledger -- keeping the edited bytes, preserving the
+    legacy ledger as history, following the include entry that named the
+    legacy ledger to the live one, passing both gates, and staying
+    idempotent; a staged copy still refused blocks at `.fv/ledger.md#gate-a`
+    and a symlink there is never adopted;
   * every obligation the manifest declares is keyed by an id
     `fv_evidence_run` accepts, so a migrated claim is dischargeable with no
     post-migration rename, while the exact legacy `<layer>:<name>` target
@@ -116,6 +125,13 @@ STAGING_EXCLUSION = ".fv/.migrate-staging/"
 # and the sentence framing them, never the gate's transcript.
 GATE_A_SOURCE = ".colosseum/ledger.md#gate-a"
 DIAGNOSTIC_LIMIT = 3000
+# The remediation path out of a refused ledger: one writable copy of the
+# legacy ledger at the live path, edited by the operator, then an ordinary
+# migration that judges and keeps that file.
+STAGE_FLAG = "--stage-ledger-remediation"
+STAGE_MODE = "stage-ledger-remediation"
+LIVE_LEDGER = ".fv/ledger.md"
+LIVE_GATE_A_SOURCE = f"{LIVE_LEDGER}#gate-a"
 PROFILE = "dossier-bounded-composition/v1"
 ENVIRONMENT_POLICY = (
     "single-host observation, unrecorded environment (TA-07); every layer ran "
@@ -1030,10 +1046,210 @@ def check_gate_a_readiness(root: Path, project: Path) -> None:
                       for entry in report.get("writes", []))
               and rows.get(".colosseum/ledger.md", {}).get("classification") != "mapped",
               str(rows.get(".colosseum/ledger.md")))
+        check(f"{label}: the refusal names the way to act on it",
+              STAGE_FLAG in detail, detail[-240:])
         check(f"{label}: nothing is written and no legacy byte moves",
               not (copy / ".fv").exists() and file_map(copy) == before
               and tree_hash(copy / ".colosseum") == legacy_hash,
               sorted(set(file_map(copy)) ^ set(before))[:5])
+
+
+def check_ledger_remediation(root: Path, project: Path) -> None:
+    """The remediation loop on the real shape: block, stage, edit, migrate.
+
+    This is the path this project actually takes. Its ledger predates the
+    content-binding requirement, so the current Gate A refuses it and the
+    migration blocks -- and `.colosseum/` is history the migration promises
+    never to write, so the refusal cannot be acted on where it lands. The
+    operator stages one writable copy at `.fv/ledger.md`, binds the
+    citations there, and re-runs the ordinary migration, which must then
+    treat that file as the project's live ledger: judge it, keep its bytes,
+    preserve the legacy ledger as history, follow the include entry that
+    named the legacy ledger to the live one, and hold both gates.
+    """
+    copy = root / "ledger-remediation"
+    shutil.copytree(project, copy, symlinks=True)
+    ledger = copy / ".colosseum" / "ledger.md"
+    bound = ledger.read_text()
+    ledger.write_text(strip_content_bindings(bound))
+    # The legacy include list names the ledger, so the translated policy has
+    # to follow the content rather than drop the entry.
+    inputs = copy / ".colosseum" / "verified-inputs.txt"
+    inputs.write_text(inputs.read_text() + ".colosseum/ledger.md\n")
+    legacy_bytes = ledger.read_bytes()
+    legacy_hash = tree_hash(copy / ".colosseum")
+    outside_before = outside_files(copy)
+
+    result, report = migrate_json(copy)
+    rows = {entry["source"]: entry for entry in report.get("artifacts", [])}
+    refusal = str(rows.get(GATE_A_SOURCE, {}).get("detail") or "")
+    check("remediation: the unbound legacy ledger blocks the ordinary migration",
+          result.returncode == 1 and report.get("status") == "blocked" and bool(refusal),
+          f"exit={result.returncode} {report.get('status')}")
+    check("remediation: the refusal sends the operator to the staging flag",
+          STAGE_FLAG in refusal, refusal[-240:])
+    check("remediation: the blocked run leaves the operator nothing to edit",
+          not (copy / ".fv").exists())
+
+    staged = copy / LIVE_LEDGER
+    stage_result, stage_report = migrate_json(copy, STAGE_FLAG)
+    fv_entries = (sorted(path.relative_to(copy).as_posix()
+                         for path in (copy / ".fv").rglob("*"))
+                  if (copy / ".fv").is_dir() else [])
+    check("remediation: staging copies the legacy ledger and nothing else",
+          stage_result.returncode == 0 and staged.is_file() and not staged.is_symlink()
+          and staged.read_bytes() == legacy_bytes and fv_entries == [LIVE_LEDGER],
+          f"exit={stage_result.returncode} {fv_entries}")
+    check("remediation: the stage report declares stage mode and claims no apply",
+          stage_report.get("requested_mode") == STAGE_MODE
+          and stage_report.get("applied") is False
+          and [entry.get("path") for entry in stage_report.get("writes", [])] == [LIVE_LEDGER],
+          {key: stage_report.get(key) for key in ("requested_mode", "mode", "applied")})
+    check("remediation: staging writes nothing outside .fv and no legacy byte",
+          tree_hash(copy / ".colosseum") == legacy_hash
+          and outside_files(copy) == outside_before)
+    check("remediation: the staged copy is writable by the operator who must edit it",
+          os.access(staged, os.W_OK), oct(staged.stat().st_mode & 0o7777))
+
+    # Determinism of the stage output, asserted across two identical project
+    # trees at different paths: a copy of one file's identity has nothing in
+    # it that may vary with where the project sits.
+    twin = root / "ledger-remediation-twin"
+    shutil.copytree(project, twin, symlinks=True)
+    (twin / ".colosseum" / "ledger.md").write_text(strip_content_bindings(bound))
+    twin_inputs = twin / ".colosseum" / "verified-inputs.txt"
+    twin_inputs.write_text(twin_inputs.read_text() + ".colosseum/ledger.md\n")
+    twin_stage = migrate(twin, "--json", STAGE_FLAG)
+    check("remediation: the stage JSON is deterministic across project paths",
+          twin_stage.stdout == stage_result.stdout and str(copy) not in stage_result.stdout,
+          twin_stage.stdout[:200])
+    restaged, restage_report = migrate_json(copy, STAGE_FLAG)
+    check("remediation: re-staging reports the copy already there and rewrites nothing",
+          restaged.returncode == 0 and staged.read_bytes() == legacy_bytes
+          and [entry.get("action") for entry in restage_report.get("writes", [])]
+          == ["identical"],
+          f"exit={restaged.returncode} {restage_report.get('writes')}")
+
+    # The edit: the same ledger, its citations content-bound, which is
+    # exactly what the current gate refused the legacy file for.
+    staged.write_text(bound)
+    edited = staged.read_bytes()
+    edit_gate = gate_a(copy)
+    check("remediation: the edited ledger passes the current Gate A where it lies",
+          edit_gate.returncode == 0 and edited != legacy_bytes,
+          (edit_gate.stdout + edit_gate.stderr)[-300:])
+
+    result, dry = migrate_json(copy)
+    check("remediation: the dry run proceeds once the live ledger is clean",
+          result.returncode == 0 and dry.get("status") == "ok"
+          and dry.get("conflicts") == [] and dry.get("unsupported") == [],
+          f"exit={result.returncode} {dry.get('conflicts')} {dry.get('unsupported')}")
+    check("remediation: neither ledger raises a readiness row",
+          not [entry for entry in dry.get("artifacts", [])
+               if entry["source"] in (GATE_A_SOURCE, LIVE_GATE_A_SOURCE)],
+          [entry["source"] for entry in dry.get("artifacts", []) if "#gate-a" in entry["source"]])
+
+    result, report = migrate_json(copy, "--apply")
+    rows = {entry["source"]: entry for entry in report.get("artifacts", [])}
+    check("remediation: the apply completes on the remediated project",
+          result.returncode == 0 and report.get("status") == "ok"
+          and report.get("applied") is True,
+          f"exit={result.returncode} {report.get('conflicts')} {result.stderr[-200:]}")
+    check("remediation: the operator's edited bytes are exactly what is on disk",
+          staged.read_bytes() == edited, staged.read_bytes()[:80])
+    history = copy / HISTORY_ROOT / "ledger.md"
+    check("remediation: the superseded legacy ledger is history, byte for byte",
+          history.is_file() and history.read_bytes() == legacy_bytes,
+          history.read_bytes()[:80] if history.is_file() else "missing")
+    check("remediation: the legacy ledger is classified history, not mapped over the live file",
+          rows.get(".colosseum/ledger.md", {}).get("classification") == "preserved-history"
+          and rows.get(".colosseum/ledger.md", {}).get("destination")
+          == f"{HISTORY_ROOT}/ledger.md",
+          rows.get(".colosseum/ledger.md"))
+    check("remediation: .colosseum is byte-identical and nothing outside .fv moved",
+          tree_hash(copy / ".colosseum") == legacy_hash
+          and outside_files(copy) == outside_before,
+          sorted(set(outside_files(copy).items()) ^ set(outside_before.items()))[:4])
+
+    passed = gate_a(copy)
+    check("remediation: Gate A passes on the remediated live ledger",
+          passed.returncode == 0 and "GATE PASSED" in passed.stdout,
+          (passed.stdout + passed.stderr)[-400:])
+    strict = gate_a(copy, "--strict-kani")
+    check("remediation: Gate A passes under --strict-kani too",
+          strict.returncode == 0, (strict.stdout + strict.stderr)[-300:])
+    check_gate_b(copy, "after remediation")
+
+    policy = fv_project.load_policy(copy)
+    selectors = set(policy.selectors())
+    check("remediation: the include entry that named the legacy ledger selects the live one",
+          LIVE_LEDGER in selectors and policy.selects(LIVE_LEDGER)
+          and not [entry for entry in selectors if entry.startswith(".colosseum/")],
+          sorted(selectors))
+    check("remediation: imported history is still no verified input",
+          not policy.selects(f"{HISTORY_ROOT}/ledger.md"), sorted(selectors))
+
+    fv_before = file_map(copy / ".fv")
+    result, report = migrate_json(copy, "--apply")
+    check("remediation: re-applying changes not a single byte",
+          result.returncode == 0 and report.get("status") == "ok"
+          and {entry.get("action") for entry in report.get("writes", [])} == {"identical"}
+          and file_map(copy / ".fv") == fv_before
+          and staged.read_bytes() == edited
+          and tree_hash(copy / ".colosseum") == legacy_hash,
+          f"exit={result.returncode} "
+          f"{sorted({str(e.get('action')) for e in report.get('writes', [])})}")
+
+    # Staged but not yet edited, and a link where the live ledger belongs:
+    # the two ways a half-finished remediation must fail. Both run on the
+    # twin, which is the same project with the same unbound ledger already
+    # staged.
+    twin_staged = twin / LIVE_LEDGER
+    staged_bytes = twin_staged.read_bytes()
+    twin_before = file_map(twin)
+    for label, flags in (("dry-run", ()), ("apply", ("--apply",))):
+        result, report = migrate_json(twin, *flags)
+        rows = {entry["source"]: entry for entry in report.get("artifacts", [])}
+        row = rows.get(LIVE_GATE_A_SOURCE, {})
+        detail = str(row.get("detail") or "")
+        check(f"remediation: a staged but unedited ledger blocks the {label} at its own path",
+              result.returncode == 1 and report.get("status") == "blocked"
+              and row.get("classification") == "unsupported"
+              and row.get("destination") is None,
+              f"exit={result.returncode} {row}")
+        check(f"remediation: the {label} block names the writable file to edit",
+              LIVE_LEDGER in detail, detail[:240])
+        check(f"remediation: the {label} judges the live ledger, not the legacy one",
+              GATE_A_SOURCE not in rows, sorted(key for key in rows if "#gate-a" in key))
+        check(f"remediation: the blocked {label} rewrites nothing",
+              twin_staged.read_bytes() == staged_bytes and file_map(twin) == twin_before,
+              sorted(set(file_map(twin)) ^ set(twin_before))[:5])
+
+    # A link where the live ledger belongs is never adopted, whatever is
+    # behind it. The twin's legacy ledger is restored to the bound form
+    # first, so nothing but the link itself is left to block the run: a run
+    # that followed the link would find a ledger this gate accepts and
+    # would report ok.
+    elsewhere = root / "ledger-remediation-elsewhere.md"
+    elsewhere.write_text(bound)
+    (twin / ".colosseum" / "ledger.md").write_text(bound)
+    twin_legacy_hash = tree_hash(twin / ".colosseum")
+    twin_staged.unlink()
+    twin_staged.symlink_to(elsewhere)
+    elsewhere_bytes = elsewhere.read_bytes()
+    check("remediation: the file behind the link would itself pass the gate",
+          run(["python3", str(GATE_A), str(elsewhere), "--root", str(twin)]).returncode == 0)
+    result, report = migrate_json(twin, "--apply")
+    check("remediation: a symlink at .fv/ledger.md is never adopted as the live ledger",
+          result.returncode == 1 and report.get("status") == "blocked"
+          and any(LIVE_LEDGER in str(entry) for entry in report.get("conflicts", []))
+          and not [entry for entry in report.get("artifacts", [])
+                   if entry["source"] == LIVE_GATE_A_SOURCE],
+          f"exit={result.returncode} {report.get('conflicts')}")
+    check("remediation: the link is left a link and its target keeps its bytes",
+          twin_staged.is_symlink() and elsewhere.read_bytes() == elsewhere_bytes
+          and tree_hash(twin / ".colosseum") == twin_legacy_hash,
+          elsewhere.read_bytes()[:80])
 
 
 def mutate_layer_run(copy: Path, layer: str, changes: dict) -> None:
@@ -1778,6 +1994,9 @@ def main() -> int:
         check_write_containment(root, project, colosseum_hash)
         check_uncovered_required_evidence(root, project)
         check_dispatch_adoption(root, project)
+
+        print("\n── ledger remediation ───────────────────────────────────")
+        check_ledger_remediation(root, project)
 
         print("\n── apply ────────────────────────────────────────────────")
         report = check_apply(project, dry_report, colosseum_hash, outside_before)
