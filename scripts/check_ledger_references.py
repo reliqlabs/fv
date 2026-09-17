@@ -115,9 +115,13 @@ from pathlib import Path
 CODE_PREFIX = "code:"
 # `code:` as an annotation marker, not the tail of a word ("barcode:").
 CODE_MARK_RE = re.compile(r"(?<![A-Za-z0-9_\-])code:[ \t]*")
-CITATION_BODY_RE = re.compile(
-    r"^(?P<path>\S(?:.*\S)?):(?P<line>\d+)(?:@sha256:(?P<hash>[0-9a-f]{12}))?$"
+# Two anchored forms, hash-bearing tried first: one combined pattern lets
+# the greedy path swallow ":<line>@sha256" whenever the hash is all
+# decimal digits, which silently reports a valid binding as malformed.
+CITATION_BOUND_RE = re.compile(
+    r"^(?P<path>\S(?:.*\S)?):(?P<line>\d+)@sha256:(?P<hash>[0-9a-f]{12})$"
 )
+CITATION_BARE_RE = re.compile(r"^(?P<path>\S(?:.*\S)?):(?P<line>\d+)$")
 # A bare backticked span is a citation only when its path carries a
 # dot-extension; that is what separates `src/guard.rs:2` from prose ratios
 # ("5:1") and from ordinary inline code (`inv_b1`). An explicit `code:`
@@ -129,6 +133,9 @@ PLAIN_PATH_TOKEN_RE = re.compile(r"[^\s`]+")
 # the punctuation into its token: `code: src/guard.rs:2@sha256:ab...cd).`
 # Trailing sentence punctuation is not part of the path.
 TRAILING_PUNCTUATION = ".,;:!?)]}\"'"
+# Inline Markdown wrappers around an annotation body. A fully backticked
+# annotation that ends a sentence carries both: `` `kani: h`. ``
+MARKDOWN_WRAPPERS = "*_`"
 # A `code:` value that did not parse but still carries a
 # `<path>.<ext>:<line>`-shaped substring was meant as a citation (an
 # unquoted path with spaces splits at the first space).
@@ -230,8 +237,8 @@ def is_comment_only(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return True
-    if stripped.startswith("#["):
-        return False  # Rust attribute lines (`#[kani::proof]`) are valid targets
+    if stripped.startswith("#[") or stripped.startswith("#!["):
+        return False  # Rust attributes (`#[kani::proof]`, `#![cfg(...)]`)
     return any(stripped.startswith(p) for p in COMMENT_PREFIXES)
 
 
@@ -252,13 +259,14 @@ class Citation:
 def parse_citation_body(body: str, *, require_extension: bool) -> Citation | None:
     """Parse one citation body. Returns None when `body` is not a citation
     at all (ordinary inline code, prose, a ratio)."""
-    m = CITATION_BODY_RE.match(body.strip())
+    text = body.strip()
+    m = CITATION_BOUND_RE.match(text) or CITATION_BARE_RE.match(text)
     if m is None:
         return None
     path = m.group("path")
     if require_extension and not EXTENSION_RE.search(path):
         return None
-    return Citation(path, int(m.group("line")), m.group("hash"))
+    return Citation(path, int(m.group("line")), m.groupdict().get("hash"))
 
 
 def split_code_spans(text: str) -> list[tuple[bool, str]]:
@@ -414,7 +422,8 @@ def kani_body_problem(body: str) -> str | None:
     """Parse one `kani:` annotation body against the coverage grammar.
     Returns None when the body IS coverage, else the failure text (without
     the `ledger:<n>: ` prefix)."""
-    text = body.strip().strip("*_`").strip()
+    text = body.strip().lstrip(MARKDOWN_WRAPPERS).rstrip(
+        MARKDOWN_WRAPPERS + TRAILING_PUNCTUATION).strip()
     if not text:
         return ("empty `kani:` annotation — name a harness or write "
                 "`kani: skipped because <reason>`")

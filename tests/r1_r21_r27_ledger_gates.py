@@ -153,6 +153,16 @@ def main() -> int:
         check("R21: #[...] attribute line accepted as citation target",
               code == 0, out[-300:])
 
+        # `#![...]` is an inner attribute, code exactly like `#[...]`: a
+        # `#![cfg(feature = "verification")]` gate is a citable target.
+        inner = root / "src" / "inner_attr.rs"
+        inner_line = '#![cfg(feature = "verification")]'
+        inner.write_text(inner_line + "\n")
+        code, out = gate_a(root, f"- gated at `src/inner_attr.rs:1@sha256:{line_hash(inner_line)}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("R21: #![...] inner attribute accepted as citation target",
+              code == 0, out[-300:])
+
         # ── axiom anchoring + justification threshold ───────────────────
         code, out = gate_a(root, f"- B1 at `src/guard.rs:2`. {KANI_OK}\n"
                                  f"- axiom: TODO figure this out later\n")
@@ -199,6 +209,15 @@ def main() -> int:
                                  f" kani: skipped because tbd\n", "--strict-kani")
         check("F10: `kani: skipped because <placeholder>` fails",
               code == 1 and "no reviewable reason" in out, out[-300:])
+
+        # A fully backticked annotation ending a sentence carries both the
+        # closing backtick and the period: `` `kani: h`. `` is coverage.
+        wrapped = (f"Depends on:\n"
+                   f"- L1 at `src/guard.rs:2@sha256:{h}`; `kani: harness_check`.\n"
+                   f"\n- {GOOD_AXIOM}\n")
+        code, out = gate_a(root, wrapped, "--strict-kani")
+        check("F10: backticked `kani: <harness>`. is per-link coverage",
+              code == 0 and "trust-chain link without" not in out, out[-400:])
 
         # The text "kani:" inside another word or inside a Rust path is
         # not an annotation: it covers no link and does not discharge the
@@ -511,6 +530,21 @@ def main() -> int:
                  f"- {GOOD_AXIOM}\n")
         code, out = gate_a(root, prose)
         check("parser: prose, ratios and inline code are not citations",
+              code == 0 and "Citations checked: 1 (1 content-bound)" in out,
+              out[-400:])
+
+        # A content hash is 12 hex digits, and hex digits may all be
+        # decimal: `@sha256:721494459133` binds as tightly as one with
+        # letters and must not read as part of the path.
+        decimal_probe = "pub const DECIMAL_HASH_PROBE_257: u32 = 257;"
+        probe = root / "src" / "decimal_probe.rs"
+        probe.write_text(decimal_probe + "\n")
+        probe_hash = line_hash(decimal_probe)
+        check("fixture: probe line hashes to an all-decimal binding",
+              probe_hash.isdigit(), probe_hash)
+        code, out = gate_a(root, f"- B1 at `src/decimal_probe.rs:1@sha256:{probe_hash}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: all-decimal content hash binds instead of failing malformed",
               code == 0 and "Citations checked: 1 (1 content-bound)" in out,
               out[-400:])
 

@@ -88,6 +88,10 @@ const relativeExecutable = await tool.execute("relative", {
   claim_id: "R1", command: ["./probe"], cwd: "sub",
   evidence_class: "test-witnessed", scope: "relative executable probe",
 }, undefined, {}, undefined);
+const multiplexed = await tool.execute("multiplexed", {
+  claim_id: "M2", command: ["./toolname"],
+  evidence_class: "test-witnessed", scope: "argv[0] multiplexer probe",
+}, undefined, {}, undefined);
 const namedTool = await tool.execute("named", {
   claim_id: "N1", command: ["sh", "-c", "echo 'test result: ok.'"],
   evidence_class: "test-witnessed", scope: "named evidence tool probe", tool: "quint",
@@ -186,6 +190,7 @@ await Bun.write(manifestFile, originalManifest);
 console.log(JSON.stringify({
   passing: passing.details, failing: failing.details, dirty: dirtyResult.details,
   customMarker: customMarker.details, relativeExecutable: relativeExecutable.details,
+  multiplexed: multiplexed.details,
   namedTool: namedTool.details, intentDrift: intentDrift.details, escapeError,
   cohort: cohort.details, cohortFailure: cohortFailure.details, rejections,
   probeMutation: probeMutation.details, manifestRejections,
@@ -1085,6 +1090,19 @@ def main() -> int:
             "echo mutating-v1; else echo 'test result: ok.'; fi\n"
         )
         mutating.chmod(0o755)
+        # rustup's `cargo` and elan's `lake` dispatch on argv[0], so a producer that
+        # runs the realpath runs the multiplexer instead of the requested tool.
+        dispatcher = root / "dispatcher"
+        dispatcher.write_text(
+            "#!/bin/sh\n"
+            "case \"$(basename \"$0\")\" in\n"
+            "  toolname) if [ \"$1\" = \"--version\" ]; then echo toolname-v1; "
+            "else echo 'test result: ok.'; fi ;;\n"
+            "  *) echo \"dispatched as $(basename \"$0\")\"; exit 1 ;;\n"
+            "esac\n"
+        )
+        dispatcher.chmod(0o755)
+        (root / "toolname").symlink_to(dispatcher)
         harness = root / "harness.ts"
         harness.write_text(HARNESS)
         run = subprocess.run(
@@ -1124,6 +1142,11 @@ def main() -> int:
         check("relative command executes the same binary whose digest is recorded",
               relative_binding["executable"] == str(sub_probe.resolve())
               and result["relativeExecutable"]["record"]["result"] == "PASS", relative_binding)
+        multiplexed_record = result["multiplexed"]["record"]
+        check("a multiplexer dispatching on argv[0] runs as the requested tool",
+              multiplexed_record["result"] == "PASS"
+              and multiplexed_record["bindings"]["toolchain_digests"]["executable"]
+              == str(dispatcher.resolve()), multiplexed_record["bindings"]["toolchain_digests"])
         custom_path = state / "evidence" / "records" / "C1.json"
         custom_checked = gate(custom_path, root, "C1")
         check("Gate B accepts a produced custom-marker PASS record",

@@ -139,10 +139,15 @@ type ExecutionRequest = {
 	passMarker: string | undefined;
 };
 
-/** A request whose cwd, executable identity, run id, and raw-artifact path are resolved. */
+/** A request whose cwd, executable identity, run id, and raw-artifact path are resolved.
+ * `invoked` is the PATH entry as resolved, `executable` its realpath: toolchain
+ * multiplexers (rustup's `cargo`, elan's `lake`) dispatch on argv[0], so running the
+ * realpath would run the multiplexer itself, while the identity worth recording is
+ * still the file the name resolves to. */
 type PlannedExecution = ExecutionRequest & {
 	cwdRelative: string;
 	cwdAbsolute: string;
+	invoked: string;
 	executable: string;
 	toolchainDigests: ToolchainDigests;
 	runId: string;
@@ -668,8 +673,9 @@ const factory: CustomToolFactory = pi => ({
 				? path.resolve(cwdAbsolute, requestedExecutable)
 				: Bun.which(requestedExecutable);
 			if (!executableLookup) throw new Error(`command executable not found: ${requestedExecutable}`);
-			const executable = await fs.realpath(executableLookup);
-			const versionProbe = await exec(executable, ["--version"], { cwd: cwdAbsolute, signal });
+			const invoked = executableLookup;
+			const executable = await fs.realpath(invoked);
+			const versionProbe = await exec(invoked, ["--version"], { cwd: cwdAbsolute, signal });
 			// Per-execution raw artifacts need filesystem-safe, collision-free names.
 			const runId = isCohortCall
 				? `${timestamp}-${index + 1}-${request.tool.replace(/[^A-Za-z0-9._-]+/g, "-")}`
@@ -679,6 +685,7 @@ const factory: CustomToolFactory = pi => ({
 				...request,
 				cwdAbsolute,
 				cwdRelative: path.relative(projectRoot, cwdAbsolute).split(path.sep).join("/") || ".",
+				invoked,
 				executable,
 				toolchainDigests: {
 					executable,
@@ -706,7 +713,7 @@ const factory: CustomToolFactory = pi => ({
 		const executions: Record<string, unknown>[] = [];
 		const exitCodes: number[] = [];
 		for (const plan of planned) {
-			const run = await exec(plan.executable, plan.command.slice(1), { cwd: plan.cwdAbsolute, signal });
+			const run = await exec(plan.invoked, plan.command.slice(1), { cwd: plan.cwdAbsolute, signal });
 			const trailer = `--- fv-evidence: exit=${run.code} ---`;
 			const streams = [run.stdout, run.stderr]
 				.filter(stream => stream.length > 0)
