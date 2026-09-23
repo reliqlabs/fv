@@ -501,6 +501,13 @@ def main() -> int:
                                  f"- {GOOD_AXIOM}\n")
         check("parser: truncated hash in a backticked path citation fails",
               code == 1 and "malformed content binding" in out, out[-300:])
+        probe = next(f"pub const DIGITS_PROBE_{n}: u8 = 1;" for n in range(1, 20000)
+                     if line_hash(f"pub const DIGITS_PROBE_{n}: u8 = 1;").isdigit())
+        (root / "src" / "digits.rs").write_text(probe + "\n")
+        code, out = gate_a(root, f"- D1 at `src/digits.rs:1@sha256:{line_hash(probe)}`. {KANI_OK}\n"
+                                 f"- {GOOD_AXIOM}\n")
+        check("parser: an all-digit content hash is a binding, not a malformed one",
+              code == 0 and "malformed content binding" not in out, out[-300:])
 
         # Prose and ordinary inline code are not citations: this paragraph
         # carries exactly one, and the ratio, symbol names, script name and

@@ -116,7 +116,7 @@ CODE_PREFIX = "code:"
 # `code:` as an annotation marker, not the tail of a word ("barcode:").
 CODE_MARK_RE = re.compile(r"(?<![A-Za-z0-9_\-])code:[ \t]*")
 CITATION_BODY_RE = re.compile(
-    r"^(?P<path>\S(?:.*\S)?):(?P<line>\d+)(?:@sha256:(?P<hash>[0-9a-f]{12}))?$"
+    r"^(?P<path>\S(?:.*?\S)?):(?P<line>\d+)(?:@sha256:(?P<hash>[0-9a-f]{12}))?$"
 )
 # A bare backticked span is a citation only when its path carries a
 # dot-extension; that is what separates `src/guard.rs:2` from prose ratios
