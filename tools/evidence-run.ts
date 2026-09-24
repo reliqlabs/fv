@@ -668,7 +668,8 @@ const factory: CustomToolFactory = pi => ({
 				? path.resolve(cwdAbsolute, requestedExecutable)
 				: Bun.which(requestedExecutable);
 			if (!executableLookup) throw new Error(`command executable not found: ${requestedExecutable}`);
-			const executable = await fs.realpath(executableLookup);
+			const executable = path.resolve(executableLookup);
+			await fs.realpath(executable); // Preserve the proxy name used for argv[0] dispatch (e.g. cargo via rustup).
 			const versionProbe = await exec(executable, ["--version"], { cwd: cwdAbsolute, signal });
 			// Per-execution raw artifacts need filesystem-safe, collision-free names.
 			const runId = isCohortCall

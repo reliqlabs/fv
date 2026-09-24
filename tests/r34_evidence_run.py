@@ -88,6 +88,10 @@ const relativeExecutable = await tool.execute("relative", {
   claim_id: "R1", command: ["./probe"], cwd: "sub",
   evidence_class: "test-witnessed", scope: "relative executable probe",
 }, undefined, {}, undefined);
+const proxyExecutable = await tool.execute("proxy", {
+  claim_id: "PX1", command: ["./cargo-proxy"],
+  evidence_class: "test-witnessed", scope: "argv-zero-sensitive proxy probe",
+}, undefined, {}, undefined);
 const namedTool = await tool.execute("named", {
   claim_id: "N1", command: ["sh", "-c", "echo 'test result: ok.'"],
   evidence_class: "test-witnessed", scope: "named evidence tool probe", tool: "quint",
@@ -186,6 +190,7 @@ await Bun.write(manifestFile, originalManifest);
 console.log(JSON.stringify({
   passing: passing.details, failing: failing.details, dirty: dirtyResult.details,
   customMarker: customMarker.details, relativeExecutable: relativeExecutable.details,
+  proxyExecutable: proxyExecutable.details,
   namedTool: namedTool.details, intentDrift: intentDrift.details, escapeError,
   cohort: cohort.details, cohortFailure: cohortFailure.details, rejections,
   probeMutation: probeMutation.details, manifestRejections,
@@ -1076,6 +1081,16 @@ def main() -> int:
             "else echo 'test result: ok.'; fi\n"
         )
         sub_probe.chmod(0o755)
+        proxy_target = root / "proxy-target"
+        proxy_target.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${0##*/}\" != cargo-proxy ]; then exit 7; fi\n"
+            "if [ \"$1\" = \"--version\" ]; then echo proxy-v1; "
+            "else echo \"test result: ok.\"; fi\n"
+        )
+        proxy_target.chmod(0o755)
+        proxy = root / "cargo-proxy"
+        proxy.symlink_to(proxy_target.name)
         # Answering --version mutates a listed verified input, which only registers as
         # dirt when the baseline binding predates the probe.
         mutating = root / "mutating"
@@ -1124,6 +1139,12 @@ def main() -> int:
         check("relative command executes the same binary whose digest is recorded",
               relative_binding["executable"] == str(sub_probe.resolve())
               and result["relativeExecutable"]["record"]["result"] == "PASS", relative_binding)
+        proxy_binding = result["proxyExecutable"]["record"]["bindings"]["toolchain_digests"]
+        check("argv-zero-sensitive symlink runs under its requested proxy name",
+              result["proxyExecutable"]["record"]["result"] == "PASS"
+              and proxy_binding["executable"] == str(root.resolve() / proxy.name)
+              and proxy_binding["sha256"] == hashlib.sha256(proxy.read_bytes()).hexdigest(),
+              result["proxyExecutable"]["record"])
         custom_path = state / "evidence" / "records" / "C1.json"
         custom_checked = gate(custom_path, root, "C1")
         check("Gate B accepts a produced custom-marker PASS record",
