@@ -285,8 +285,12 @@ are retained, and hash links do not authenticate store completeness.
 
 The default scheduler admits two independent recipes, serializes Cargo/Apalache
 resources and runs replay exclusively. First failure stops admission. The native
-supervisor preserves existing gated private-pipe collector ownership and cannot
-claim cleanup of unproven separate-session descendants. Live/indeterminate
+supervisor preserves gated private-pipe ownership under reviewed commands
+obeying their declared lifecycle, with no undeclared session escape/daemonization.
+This is not an OS sandbox or arbitrary malicious-process containment. Separately
+sessioned children need registered ownership; external services need declared
+identity/resource ownership. Observed escapes or unknown termination stay
+ERROR/indeterminate, with no foreign-PID signaling or unproven cleanup. Live/indeterminate
 locks are never stolen. Nested directories/ancestors are flushed before
 acknowledgment; post-pointer-replacement durability failure returns ERROR and
 may leave a visible new pointer. Every present generation still needs independent

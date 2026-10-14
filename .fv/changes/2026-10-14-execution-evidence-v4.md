@@ -66,4 +66,10 @@ Corrected only the quantifier and associated reuse prose: physical checkpoint va
 
 Added the exact EX-004 analytical acceptance trace: physical PASS10, C-01 PASS11, C-02 PASS12, C-04 observation FAIL13. C-01/C-02 may keep sequence10; C-04 cannot clear its barrier by rechecking sequence10 and needs a later actual invocation plus its own PASS observation. Selection of C-01 does not force a C-04 rerun; full policy remains FAIL. This is a required trace, not exercised evidence.
 
-Final delta review and union verification remain the orchestrator's responsibility. No tests, builds, gates, lint, formatters, commits, pushes or live-system operations ran for this bounded correction.
+## Native lifecycle operational boundary
+
+The parent reports that actual Darwin SDK NOTE_TRACK/NOTE_CHILD support is unavailable and that POSIX snapshots cannot prove absence of arbitrary setsid/double-fork/reparent escapes between enumerations. This observation is accepted without rerunning checks.
+
+Added one bounded native-lifecycle trust clarification: reviewed approved commands obey declared lifecycle and do not make undeclared group/session escapes or daemonize to evade supervision. Separate-session children require explicit registered ownership; external services require independently declared identity/resource ownership. The native supervisor remains responsible for owned-group cleanup, private-pipe gates/registration, durable windows and indeterminate recovery. Observed escapes/unknown termination remain ERROR/indeterminate; foreign or ambiguously owned PIDs cannot be signaled. Arbitrary malicious/nonconforming containment is outside the producer/OS/tool trust boundary, and no sandbox is promised. Matching overview prose carries the same limit.
+
+No policy/schema field, model, argv, bound, v3 behavior or settled trust-boundary subject changed. Independent delta review and union verification remain with the parent. No tests, builds, gates, formatters, commits or live-system operations ran for this clarification.

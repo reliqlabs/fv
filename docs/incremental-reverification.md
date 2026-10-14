@@ -237,6 +237,11 @@ replacement may expose the new pointer with indeterminate crash durability and
 returns ERROR. Resource locks serialize Cargo/Apalache, replay is exclusive and
 default jobs is two. Existing gated private-pipe collector ownership is retained;
 live or unproven descendant/spawn ownership cannot be stolen or called cleaned.
+Reviewed commands must obey declared lifecycle with no undeclared session escape
+or daemonization. Separate sessions require registered ownership and external
+services declared identity/resources. Group snapshots are not an OS sandbox or
+proof against arbitrary malicious escapes; observed escapes/unknown termination
+remain ERROR/indeterminate and never permit signaling foreign PIDs.
 
 An exact record selection is for focused collection/resume only. The final v4
 policy assessment still expands every required logical slot, and the canonical
