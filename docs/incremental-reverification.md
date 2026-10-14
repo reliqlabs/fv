@@ -42,6 +42,10 @@ under the wrong assumptions.
 
 ## What a change invalidates
 
+The whole-snapshot and cohort rules in this section apply to v3 and earlier
+records. Opt-in v4 execution reuse is specified separately below; it does not
+relax an existing v3 binding or permit v3 artifact sharing.
+
 A G1 record binds its evidence to a `source_snapshot`, an `intent_hash`, an
 `obligation_manifest_hash`, a `profile`, a toolchain digest set, and the exact
 command, configuration, and seeds. A `fv-evidence-run/v3` record additionally
@@ -132,7 +136,7 @@ Everything else re-runs. The `ledger_schema_version` is checked first: a schema
 migration invalidates the reuse computation itself (the record shape changed), so
 a version bump forces a full re-verification pass regardless of source snapshots.
 
-### System claim cohorts do not partially reuse
+### V3 system claim cohorts do not partially reuse
 
 A `system_claim` obligation names a `depends_on` set of declared
 invariants/witnesses and a `required_evidence` set of tool/layer IDs. It is
@@ -176,6 +180,70 @@ That conjunction fixes the reuse rule for system claims:
   live in the obligation manifest, so adding or removing either moves
   `obligation_manifest_hash` and stales every record bound to it — including the
   cohorts of claims the edit did not mention.
+
+### V4 execution checkpoints and scoped freshness
+
+The normative [execution evidence v4 contract](execution-evidence-v4.md) adds a
+reviewed execution policy, immutable physical execution artifacts, and claim
+records referencing them. It is an explicit `fv-evidence-run/v4` opt-in. Calls
+without that version retain v3 behavior, including unique claim-owned raw
+artifacts and all-or-nothing cohort reuse. Prior v3 records cannot become v4
+cache entries.
+
+V4 separates two decisions:
+
+- A local producer may skip an invocation only after revalidating its exact
+  descriptor, current clean source closure and path inventory, installed
+  transitive tool identities, sanitized environment, producer implementation,
+  and complete immutable output/collector attachments. Sharing requires a
+  declared fixed recipe with identical argv, cwd, class, marker, bounds and
+  bindings. Nonfixed-random or unclassified repetitions stay distinct.
+  Matching log bytes never authorize sharing.
+- A portable checker may accept retained producer evidence after recomputing
+  current policy/source bindings, artifact identities and every claim-specific
+  observation, class, tool and dependency requirement. It validates recorded
+  producer provenance under policy without requiring Darwin tools on Ubuntu.
+  This is separate from local installed-tool cache revalidation.
+
+A proven transitive source closure permits clean content-only changes outside
+that closure to leave an execution reusable. Unknown closure falls back to all
+verified inputs. Policy, intent/manifest/claim definitions, global path inventory
+and producer identity remain bindings. Additions, deletions, renames, symlinks,
+executable-bit changes and dirty state fail closed. Before/after scans detect
+endpoint drift, not an A-to-B-to-A change between scans. V4 declares a
+no-uncoordinated-source/tool/cache-mutation assumption; it adds no immutable OS
+sandbox. Known violations and detected drift reject the affected work.
+
+Existing Cargo/Kani/Lake/Node/replay commands keep their selected generated
+products and argv. Cache configuration/namespaces/resources are bound, while
+upstream build/cache correctness and freshness metadata remain disclosed trust.
+A real command invocation does not claim a fresh compilation from source hashes.
+
+Successful checkpoint bytes remain immutable; reuse eligibility is per canonical
+claim/tool association. Execution FAIL applies to all recorded members, while
+observation FAIL applies only to its selected member. That member needs a later
+actual current invocation and its own PASS observations; unaffected members may
+keep/revalidate the same shared artifact. Selecting an unaffected member does
+not require dispatch for a blocked unselected member, but full assessment still
+retains its FAIL. If selected work requires a rerun, one shared dispatch retains
+all member observations, with individual eligibility. Current unrun work stays
+MISSING and indeterminate completion remains ERROR. Required FAIL precedes gaps.
+Hash links detect retained inconsistencies, not deletion-resistant audit or a
+truncated export; completeness/nondeletion is explicit trusted-store provenance.
+
+Recursive file/directory/ancestor fsync precedes checkpoint acknowledgment.
+Pointer failure before replacement leaves the old pointer; failure after
+replacement may expose the new pointer with indeterminate crash durability and
+returns ERROR. Resource locks serialize Cargo/Apalache, replay is exclusive and
+default jobs is two. Existing gated private-pipe collector ownership is retained;
+live or unproven descendant/spawn ownership cannot be stolen or called cleaned.
+
+An exact record selection is for focused collection/resume only. The final v4
+policy assessment still expands every required logical slot, and the canonical
+merge/activation gate retains its complete required set. A dashboard that does
+not recompute freshness reports `binding=not-recomputed`; stored PASS is not a
+reuse license. Full schema, canonical hashing bytes, observation/collector time
+bindings, host API and recovery cases are in the v4 contract.
 
 ### Worked shape
 

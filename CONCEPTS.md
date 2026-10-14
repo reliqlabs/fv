@@ -90,6 +90,11 @@ A project's `.fv/ledger.md` records every cross-component trust claim with:
 
 ## The verified-input content snapshot
 
+This section describes the existing v3 whole-snapshot contract. V4 retains
+these bytes and input-policy rules as its complete before/after stability
+check, with stricter source enumeration and separately declared execution
+closures for reuse, as described below. Existing v3 behavior is unchanged.
+
 What a G1 evidence record binds its verdict to. A *verified input* is a file
 whose content could change what a verification run concludes; the snapshot is a
 single hash over all of them, so a record names the exact tree state it was
@@ -190,6 +195,9 @@ ordering alike, so producer and gate bind identically.
 
 ## System claims and evidence cohorts
 
+The cohort rules in this section apply to `fv-evidence-run/v3`. V4 is a
+separate opt-in contract; it never retrofits shared ownership onto old logs.
+
 A **system claim** is an obligation no single tool discharges. It lives in
 `obligations.json` beside `invariants` and `witnesses`, and carries:
 
@@ -241,6 +249,55 @@ invalidates the claim.** A content-snapshot change, a re-run of a single tool
 that now FAILs, a dropped tool from the cohort, or a `depends_on` obligation
 losing its own evidence each take the system claim out of PASS; it is re-earned
 by re-running the cohort, not by patching the one execution that moved.
+
+## V4 physical executions and logical claim slots
+
+[Execution evidence v4](docs/execution-evidence-v4.md) separates a physical
+producer invocation from each logical claim/tool association it discharges. A
+reviewed `.fv/execution-policy.json` declares exact recipes, deterministic
+sharing, source/tool/environment closure, member observations and resource
+conflicts. Claims reference immutable execution-owned artifacts under
+`.fv/evidence/v4/`; v3 claim-owned records and raw output remain unchanged.
+
+Only an explicitly fixed recipe with an identical complete execution identity
+may share one actual invocation. Output equality or a common tool/class does
+not authorize sharing. Random or unclassified repetitions retain distinct
+slots. Every member still has its own observation, admissibility and required
+tool/dependency checks. Fewer invocations never means fewer required claims.
+
+V4 preflights the complete policy and durably checkpoints actual execution
+bytes. Resume checks current installed transitive tools, semantic environment,
+clean input closure/inventory, cache selection and complete retained history.
+Unknown source closure falls back to all verified inputs. Dirty state, path
+changes and symlinks fail closed. Endpoint scans detect net drift, not an edit
+and undo between scans; no-uncoordinated-mutation is a disclosed assumption.
+Generated build products rely on declared upstream cache/freshness integrity.
+A real command is not a promise of fresh compilation. No old log becomes a new
+invocation.
+
+A physical execution failure blocks older references for all its recorded
+members. An observation failure blocks only the selected canonical claim/tool
+association. Eligibility is checked separately: an unaffected member may retain
+the shared checkpoint while the failed member needs a later actual invocation
+and its own PASS observation. Full assessment retains that FAIL regardless of
+selection. Current unrun work is MISSING separately; complete descriptor/history
+are retained, and hash links do not authenticate store completeness.
+
+The default scheduler admits two independent recipes, serializes Cargo/Apalache
+resources and runs replay exclusively. First failure stops admission. The native
+supervisor preserves existing gated private-pipe collector ownership and cannot
+claim cleanup of unproven separate-session descendants. Live/indeterminate
+locks are never stolen. Nested directories/ancestors are flushed before
+acknowledgment; post-pointer-replacement durability failure returns ERROR and
+may leave a visible new pointer. Every present generation still needs independent
+source/artifact/history and complete canonical-scope checking.
+
+Portable checking revalidates current source bindings and recorded producer
+provenance under the policy. It does not need the producer's Darwin tools on an
+Ubuntu CI host and cannot stand in for local installed-tool cache lookup.
+Selection/resume never narrows the full policy or canonical activation gate.
+The dashboard distinguishes logical slots from physical invocations and says
+`binding=not-recomputed` when it only reads stored records.
 
 ## Shadow migration of a legacy tree
 
