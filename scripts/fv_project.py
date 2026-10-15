@@ -30,6 +30,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+PROJECT_SCRIPT_NAMES = (
+    "check_ledger_references.py",
+    "check_evidence_records.py",
+    "fv_project.py",
+    "fv_evidence_v4.py",
+    "fv_evidence_v4_schema.py",
+)
 DISPATCH_RELATIVE = ".fv/dispatch.json"
 VERIFIED_INPUTS_RELATIVE = ".fv/verified-inputs.txt"
 DEFAULT_TARGET_SPEC = ".fv/intent.md"

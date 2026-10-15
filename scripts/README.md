@@ -4,7 +4,7 @@ All live orchestration is OMP-native. Historical calibration artifacts retain th
 
 ## Project setup and diagnostics
 
-- `fv_init.py`: creates project `.fv/` state, merges the FV checkout into `.omp/config.yml` `extensions:`, and installs `fv-canonical` under OMP's `panel.roles` settings.
+- `fv_init.py`: initializes project FV state and OMP settings. `--refresh-project-scripts` updates only the installed validator/helper copies; see [refresh instructions](../INSTALL.md#refresh-project-validators).
 - `fv_migrate.py`: shadow-migrates a legacy `.colosseum` project into `.fv/`. Dry run by default; `--apply` writes only under `.fv/`, `--stage-ledger-remediation` copies just the legacy ledger to a writable `.fv/ledger.md` and nothing else, and `--json` emits the deterministic report.
 - `fv_doctor.py`: checks exact proof-tool pins, the required OMP capability contract (recording OMP semver as provenance), extension discovery, MCP wiring, dispatch state, static frontmatter, OMP panel-role ownership, and live model candidates.
 - `validate_frontmatter.py`: validates `skills/*/SKILL.md` and static `agents/*.md` against the OMP contract.
@@ -195,11 +195,21 @@ explicitly accepted.
 
 - `check_ledger_references.py`: Gate A, including required content hashes for every cited executable artifact.
 - `check_evidence_records.py`: Gate B, including raw-artifact resolution, SHA-256 recomputation, PASS markers, obligation compatibility, and system-claim cohort coverage.
+- `fv_evidence_v4.py` and `fv_evidence_v4_schema.py`: Gate B's v4 implementation and schema helpers. They are installed beside the gate, not invoked as replacement project-specific observation checkers.
 - `obligation_check.py`: validates the frozen obligation manifest against generated specifications.
 - `lean_axiom_gate.py`: rejects prohibited Lean axioms.
 - `check_ledger_version.py`: validates the ledger version envelope.
 - `check_fixture_tracking.py`: fails when required fixtures are untracked.
 - `ci.py`: runs the default fail-closed gate set. `INCOMPLETE` fails unless `--tolerate-incomplete` is explicit.
+
+### Opt-in execution evidence v4
+
+The existing `fv_evidence_run` factory accepts the versioned policy-backed request
+in [execution evidence v4](../docs/execution-evidence-v4.md). Runtime helpers live
+under `tools/evidence-v4/`, outside the auto-discovered tool entry points.
+Refresh installed Python helpers separately; this does not switch the runtime
+extension or rebind old evidence. Legacy migration still preserves historical
+records without converting them to v4.
 
 ### Evidence records (`fv-evidence-run/v3`)
 

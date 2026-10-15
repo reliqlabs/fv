@@ -18,11 +18,6 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 import fv_project  # noqa: E402  canonical project-root and target resolution
 
-PROJECT_SCRIPT_NAMES = (
-    "check_ledger_references.py",
-    "check_evidence_records.py",
-    "fv_project.py",
-)
 VERIFIED_INPUTS_HEADER = (
     "# Verified-input policy for the FV evidence content snapshot.\n"
     "# Blank lines and # comments are ignored; directory prefixes end in /.\n"
@@ -54,6 +49,19 @@ def _copy_owned_file(
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     results.append(("overwrote" if existed else "wrote", destination))
+
+
+def install_project_scripts(
+    project: Path,
+    force: bool,
+    results: list[tuple[str, Path]],
+) -> None:
+    for name in fv_project.PROJECT_SCRIPT_NAMES:
+        _copy_owned_file(
+            REPO / "scripts" / name, project / ".fv" / "scripts" / name,
+            force, results,
+        )
+
 
 
 def build_dispatch_json(target_spec: str) -> str:
@@ -387,18 +395,33 @@ def main() -> int:
              "(default: .fv/intent.md, or the target already declared in .fv/dispatch.json)",
     )
     parser.add_argument("--force", action="store_true", help="replace FV-owned project state")
+    parser.add_argument(
+        "--refresh-project-scripts", action="store_true",
+        help="refresh only canonical gate/helper copies; leave other project state unchanged",
+    )
     args = parser.parse_args()
 
-    required = [
-        CONFIG_EXAMPLE,
-        PANEL_SETTINGS,
-        *PACKAGE_REQUIREMENTS,
-        *(REPO / "scripts" / name for name in PROJECT_SCRIPT_NAMES),
-    ]
+    required = [REPO / "scripts" / name for name in fv_project.PROJECT_SCRIPT_NAMES]
+    if not args.refresh_project_scripts:
+        required = [CONFIG_EXAMPLE, PANEL_SETTINGS, *PACKAGE_REQUIREMENTS, *required]
     missing = [path for path in required if not path.exists()]
     if missing:
         print(f"FATAL: canonical files missing: {missing}")
         return 1
+
+    if args.refresh_project_scripts:
+        try:
+            project = fv_project.resolve_project_root(args.project)
+        except fv_project.ProjectError as error:
+            print(f"FATAL: {error}")
+            return 1
+        results: list[tuple[str, Path]] = []
+        install_project_scripts(project, True, results)
+        for action, path in results:
+            print(f"  [{action:>9}] {path.relative_to(project)}")
+        print(f"Refreshed project scripts in {project / '.fv' / 'scripts'}")
+        return 0
+
 
     project = args.project.resolve()
     project.mkdir(parents=True, exist_ok=True)
@@ -420,9 +443,7 @@ def main() -> int:
     for subdirectory in ("attacks", "verify", "evidence", "scripts", "panels",
                          "changes", "code-adversarial"):
         (project / ".fv" / subdirectory).mkdir(parents=True, exist_ok=True)
-    for name in PROJECT_SCRIPT_NAMES:
-        source = REPO / "scripts" / name
-        _copy_owned_file(source, project / ".fv" / "scripts" / name, args.force, results)
+    install_project_scripts(project, args.force, results)
     errors.extend(install_dispatch_config(
         project, target_spec, args.target_spec is not None, args.force, results,
     ))

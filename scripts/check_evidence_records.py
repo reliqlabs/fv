@@ -809,6 +809,52 @@ def main() -> int:
     parser.add_argument("--allow-unbound", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+
+    import fv_evidence_v4
+    repo_root_v4 = args.root.resolve() if args.root else infer_repo_root(args.records)
+    try:
+        is_v4 = fv_evidence_v4.detect_v4(repo_root_v4, args.records)
+    except fv_evidence_v4.V4Error as error:
+        report = fv_evidence_v4._report(repo_root_v4, args.records, not args.allow_unbound)
+        report["errors"].append(str(error))
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"ERROR: {error}")
+        print("\nVERDICT: ERROR", file=sys.stderr)
+        return 2
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        # Legacy input errors retain their established CLI handling below.
+        is_v4 = False
+    if is_v4:
+        pinned_v4 = args.expect_snapshot is not None or args.expect_intent is not None
+        recompute_v4 = not args.allow_unbound and not pinned_v4
+        report, code = fv_evidence_v4.assess_v4(repo_root_v4, args.records, args.manifest,
+                                              args.require, recompute=recompute_v4,
+                                              recheck_observations=recompute_v4)
+        overrides = (("source_snapshot", args.expect_snapshot, report.get("captured_source_snapshot")),
+                     ("intent_hash", args.expect_intent, report.get("common", {}).get("intent_hash")),
+                     ("manifest_hash", args.expect_manifest, report.get("common", {}).get("manifest_hash")))
+        for field, expected, actual in overrides:
+            if expected is not None and expected != actual:
+                report["errors"].append(f"pinned {field} mismatch")
+                if not report["failed"]:
+                    report["verdict"], code = "ERROR", 2
+        binding_v4 = "unbound" if args.allow_unbound else "pinned" if pinned_v4 else "recomputed"
+        if binding_v4 != "recomputed":
+            report["binding"] = binding_v4
+            report["verdict"] = report["verdict"].replace("binding=not-recomputed", "binding=" + binding_v4)
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print("required claims: " + ",".join(report["required_claims"]))
+            for entry in report["per_claim"]:
+                print(f"  [{entry['status']:>18}] {entry['claim_id']} ({entry.get('evidence_class', '-')})")
+            for message in report["failed"] + report["incomplete"] + report["errors"]:
+                print(f"  ! {message}")
+        print(f"\nVERDICT: {report['verdict']}", file=sys.stderr)
+        return code
+
     try:
         records = load_records(args.records)
         manifest_required: list[str] = []

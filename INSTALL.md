@@ -28,6 +28,11 @@ Use the repository-supported OMP build described by the Oh My Pi project, then v
 omp --version
 ```
 
+Panel resolution requires OMP to export `cfgPanel` with its panel resolver APIs.
+FV reads `cfgPanel.get(ctx.settings)` on registry-based OMP builds and retains
+the released `Settings.get("panel")` path for older builds. A build exposing
+neither reader fails closed; `panelLineupFreeze` alone does not attest this export.
+
 ## Clone FV
 
 ```bash
@@ -87,7 +92,7 @@ The initializer:
 
 - creates `.fv/{attacks,verify,evidence,scripts,panels}`;
 - writes the OMP-only `.fv/dispatch.json`;
-- copies the Gate A/B validators and the shared `fv_project.py` target resolver into `.fv/scripts/`;
+- copies Gate A/B, `fv_project.py`, `fv_evidence_v4.py`, and `fv_evidence_v4_schema.py` into `.fv/scripts/`;
 - installs the default `fv-canonical` role under OMP's project `panel.roles` settings;
 - merges the FV checkout into `.omp/config.yml` `extensions:`;
 - writes `.fv/harness` as `omp`.
@@ -114,6 +119,55 @@ the new repo-relative path. Editing one without the other leaves downstream
 stages reading the old target.
 
 It does not copy package agents, skills, tools, or MCP definitions. Existing extension entries are preserved. Use `--force` only to replace FV-owned project state.
+
+## Refresh project validators
+
+Update only the FV-owned Python validators and helpers in an existing project:
+
+```bash
+uv run --script "$FV_ROOT/scripts/fv_init.py" \
+  /absolute/path/to/project --refresh-project-scripts
+```
+
+This mode leaves intent, policy, dispatch, `.omp/config.yml`, evidence and history
+unchanged. It does not initialize missing project state or select another extension.
+Use it instead of `--force` when only the installed validator copies need updating.
+
+V3 remains the default producer format. Opt-in v4 requires a reviewed project-owned
+execution policy and observation checker; see [the v4 contract](docs/execution-evidence-v4.md).
+The [plan request example](templates/evidence-run-v4.example.json) is a tool request,
+not evidence or a generated project policy. V3 evidence is never converted into v4 checkpoints.
+
+Runtime modules stay in the extension checkout. Keep that checkout unchanged while
+its collection is running. Updating the runtime and reloading OMP are separate
+from refreshing project validators. Only `tools/evidence-run.ts` and
+`tools/panel-resolver.ts` are tool entry points; `tools/evidence-v4/` contains private helpers.
+
+### Large Quint IR with Apalache 0.62.1
+
+The reviewed `ApalacheJsonLimits` bootstrap raises only Jackson's input-string limit
+to 67,108,864 characters. It preserves all solver classes and proof bounds. The
+source is retained in `tools/evidence-v4/ApalacheJsonLimits.java`. Build with JDK 27
+and `--release 21`; the adapter checks the exact compiled bootstrap class bytes.
+
+With `JAVA_HOME` selecting that JDK, stage a separate JAR from the default Quint cache:
+
+```bash
+base_jar="$HOME/.quint/apalache-dist-0.62.1/apalache/lib/apalache.jar"
+stage="$(mktemp -d)"
+"$JAVA_HOME/bin/javac" --release 21 -classpath "$base_jar" -d "$stage/classes" "$FV_ROOT/tools/evidence-v4/ApalacheJsonLimits.java"
+cp "$base_jar" "$stage/apalache-json-limit.jar"
+"$JAVA_HOME/bin/jar" --update --file "$stage/apalache-json-limit.jar" --main-class fv.compat.ApalacheJsonLimits --date=2026-10-14T00:00:00Z -C "$stage/classes" fv/compat/ApalacheJsonLimits.class
+export APALACHE_JAR="$stage/apalache-json-limit.jar"
+```
+
+Use the selected installed JAR path instead when the Quint cache is relocated.
+The project policy must include `APALACHE_JAR` in both `environment.inherit` and
+`environment.identity`. Its selected JAR bytes are part of the tool identity.
+External manifest classpaths, JAR index delegation and unsupported loaders reject
+before dispatch. Staging does not replace the installed JAR, qualify activation or
+permit historical records to be rebound to the modified toolchain.
+
 
 ## Migrate a legacy Colosseum project
 

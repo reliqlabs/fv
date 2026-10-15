@@ -168,6 +168,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_evidence_records as gate  # noqa: E402  sibling Gate B: one schema, not two
+import fv_evidence_v4 as v4  # noqa: E402
 
 # Gate B's schema, read rather than restated. A record shape the gate rejects
 # structurally must never render as covered here, and the only way to keep
@@ -816,6 +817,70 @@ def build_dashboard(records_path: Path, required: list[str],
     return dashboard, code
 
 
+def build_v4_dashboard(root: Path, records_path: Path,
+                       manifest_path: Path | None = None,
+                       require: list[str] | None = None) -> tuple[dict, int]:
+    report, code = v4.assess_v4(
+        root, records_path, manifest_path, require,
+        recompute=False, recheck_observations=False)
+    if report.get("binding") != BINDING_MODE:
+        raise ValueError("v4 dashboard assessment must not recompute bindings")
+    required = report["required_claims"]
+    kinds = report.get("obligation_kinds", {})
+    entries: dict[str, dict] = {}
+    for entry in report["per_claim"]:
+        cid = entry["claim_id"]
+        if cid in entries:
+            raise ValueError(f"duplicate v4 assessment for claim {cid!r}")
+        entries[cid] = entry
+    rows = []
+    for cid in required:
+        entry = entries.get(cid)
+        if entry is None:
+            raise ValueError(f"v4 assessment omitted required claim {cid!r}")
+        row = {**entry, "waived": False, "obligation_kind": kinds.get(cid),
+               "assumed_executions": []}
+        for field in ("evidence_class", "result", "scope"):
+            value = row.get(field)
+            row[field] = value if isinstance(value, str) else None
+        status = row["status"]
+        if status not in GAP_STATUSES | {"PASS", "FAIL"}:
+            raise ValueError(f"unknown v4 claim status {status!r}")
+        cohort = []
+        for index, slot in enumerate(entry.get("executions") or []):
+            fields = slot if isinstance(slot, dict) else {}
+            readable = {name: value if isinstance(value, str) else None
+                        for name, value in (("tool", fields.get("tool")),
+                                            ("result", fields.get("state")),
+                                            ("evidence_class", fields.get("evidence_class")))}
+            cohort.append({**fields, "index": index, **readable})
+        row["executions"] = cohort
+        row["non_passing_executions"] = non_passing_executions(cohort)
+        if row["obligation_kind"] == SYSTEM_CLAIM:
+            tools = report.get("required_evidence", {}).get(cid)
+            row["required_evidence"] = tools
+            coverage, gaps = cohort_coverage(tools or [], cohort)
+            row["evidence_coverage"] = coverage if tools is not None else None
+            row["evidence_gaps"] = gaps if tools is not None else None
+            row["depends_on"] = report.get("dependencies", {}).get(cid)
+            row.setdefault("dependency_gaps", [])
+            row.setdefault("dependencies_not_evaluated", [])
+            if row["status"] == "PASS" and gaps:
+                row["status"] = "evidence-gap"
+        rows.append(row)
+    apply_dependency_coverage(rows)
+    dashboard = {**report, "gate": "coverage-dashboard",
+                 "records": str(records_path), "rows": rows,
+                 "summary": summarize(rows),
+                 "pass_semantics": "stored-only; freshness and reuse eligibility not assessed"}
+    if code != 2:
+        if any(row["status"] == "FAIL" for row in rows):
+            dashboard["verdict"], code = "FAILED", 1
+        elif any(row["status"] in GAP_STATUSES for row in rows) and code == 0:
+            dashboard["verdict"], code = "INCOMPLETE", 3
+    return dashboard, code
+
+
 def render_system_claims(rows: list[dict]) -> list[str]:
     """Per-system-claim cohort detail: which required tool IDs PASSed, which
     did not, and which dependencies are uncovered or unevaluated."""
@@ -874,8 +939,38 @@ def render_text(dashboard: dict) -> str:
         f"evidence-gap={s['evidence_gap']} "
         f"dependency-gap={s['dependency_gap']}"
     )
-    lines.append(f"bindings: {BINDING_MODE} (snapshot and intent freshness are "
-                 "Gate B's to recompute; this view reads records only)")
+    if dashboard.get("schema_version") == "fv-evidence-run/v4":
+        lines.append(f"bindings: {BINDING_MODE} (stored results only; "
+                     "freshness and reuse eligibility are not assessed)")
+        counts = dashboard["counts"]
+        lines.append(
+            f"logical-associations={counts['logical_associations']} "
+            f"unique-physical-executions={counts['unique_physical_executions']} "
+            f"actual-dispatches={counts['actual_dispatches']} "
+            f"cache-hits={counts['cache_hits']}")
+        lines.append(
+            f"association-work: missing={counts['missing_associations']} "
+            f"failed={counts['failed_associations']} "
+            f"error={counts['error_associations']} "
+            f"cancelled={counts['cancelled_associations']}")
+        for row in dashboard["rows"]:
+            for slot in row["executions"]:
+                observation = slot.get("observation")
+                observation_result = (observation.get("result")
+                                      if isinstance(observation, dict) else "missing")
+                lines.append(
+                    f"  {row['claim_id']}/{slot.get('slot_id') or slot['index']} "
+                    f"tool={slot['tool'] or 'unreadable'} "
+                    f"state={slot['result'] or 'unreadable'} "
+                    f"observation={observation_result} "
+                    f"history-blockers={len(slot.get('blocking_events') or [])}")
+            for defect in row.get("defects") or []:
+                lines.append(f"  ! {row['claim_id']}: {defect}")
+        for defect in dashboard.get("errors") or []:
+            lines.append(f"  ! {defect}")
+    else:
+        lines.append(f"bindings: {BINDING_MODE} (snapshot and intent freshness are "
+                     "Gate B's to recompute; this view reads records only)")
     if s["waived_or_assumed"]:
         lines.append(f"waived-or-assumed: {', '.join(s['waived_or_assumed'])}")
     lines.append("by evidence_class:")
@@ -883,7 +978,9 @@ def render_text(dashboard: dict) -> str:
         lines.append(f"  {klass}: pass={c['pass']} fail={c['fail']} "
                       f"incomplete={c['incomplete']} other={c['other']}")
     if s["by_execution_evidence_class"]:
-        lines.append("by execution evidence_class:")
+        lines.append("by logical association evidence_class:"
+                     if dashboard.get("schema_version") == "fv-evidence-run/v4"
+                     else "by execution evidence_class:")
         for klass, c in sorted(s["by_execution_evidence_class"].items()):
             lines.append(f"  {klass}: pass={c['pass']} fail={c['fail']} "
                           f"incomplete={c['incomplete']} other={c['other']}")
@@ -902,6 +999,31 @@ def verdict_line(verdict: str) -> str:
     return f"VERDICT: {verdict}"
 
 
+def emit_dashboard(dashboard: dict, code: int, *, as_json: bool,
+                   check: bool) -> int:
+    if check:
+        text = render_text(dashboard)
+        vline = verdict_line(dashboard["verdict"])
+        payload = json.dumps(dashboard, indent=2)
+        blob = "\n".join([text, vline, payload])
+        offending = [ln for ln in blob.splitlines() if UNSCOPED_VERDICT_RE.search(ln)]
+        if offending:
+            print("CHECK: bare VERIFIED token found in dashboard output:",
+                  file=sys.stderr)
+            for ln in offending:
+                print(f"  {ln}", file=sys.stderr)
+            return 1
+        print("CHECK: clean, no bare VERIFIED token in dashboard output",
+              file=sys.stderr)
+        return 0
+    if as_json:
+        print(json.dumps(dashboard, indent=2))
+    else:
+        print(render_text(dashboard))
+    print(verdict_line(dashboard["verdict"]), file=sys.stderr)
+    return code
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--records", required=True, type=Path)
@@ -918,6 +1040,25 @@ def main() -> int:
                      help="self-conformance: exit nonzero if this tool's own "
                           "rendered output would ever emit a bare VERIFIED")
     args = ap.parse_args()
+
+    root = gate.infer_repo_root(args.records)
+    try:
+        is_v4 = v4.detect_v4(root, args.records)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot read records: {e}", file=sys.stderr)
+        print(verdict_line("ERROR"), file=sys.stderr)
+        return 2
+    if is_v4:
+        try:
+            required = ([c.strip() for c in args.require.split(",") if c.strip()]
+                        if args.require is not None else None)
+            dashboard, code = build_v4_dashboard(
+                root, args.records, args.manifest, required)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot assess v4 records: {e}", file=sys.stderr)
+            print(verdict_line("ERROR"), file=sys.stderr)
+            return 2
+        return emit_dashboard(dashboard, code, as_json=args.json, check=args.check)
 
     try:
         records = load_records(args.records)
@@ -990,28 +1131,7 @@ def main() -> int:
                                       system_claims, dependency_expansion,
                                       expected_targets, expect_manifest)
 
-    if args.check:
-        text = render_text(dashboard)
-        vline = verdict_line(dashboard["verdict"])
-        payload = json.dumps(dashboard, indent=2)
-        blob = "\n".join([text, vline, payload])
-        offending = [ln for ln in blob.splitlines() if UNSCOPED_VERDICT_RE.search(ln)]
-        if offending:
-            print("CHECK: bare VERIFIED token found in dashboard output:",
-                  file=sys.stderr)
-            for ln in offending:
-                print(f"  {ln}", file=sys.stderr)
-            return 1
-        print("CHECK: clean, no bare VERIFIED token in dashboard output",
-              file=sys.stderr)
-        return 0
-
-    if args.json:
-        print(json.dumps(dashboard, indent=2))
-    else:
-        print(render_text(dashboard))
-    print(verdict_line(dashboard["verdict"]), file=sys.stderr)
-    return code
+    return emit_dashboard(dashboard, code, as_json=args.json, check=args.check)
 
 
 if __name__ == "__main__":

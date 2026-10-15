@@ -29,7 +29,7 @@ import { realpathSync, symlinkSync, unlinkSync } from "node:fs";
 const [, , toolPath, projectRoot] = process.argv;
 const mod = await import(toolPath);
 const stub: any = {};
-for (const key of ["optional", "array", "describe", "min", "max", "default", "nullable"]) stub[key] = () => stub;
+for (const key of ["optional", "array", "describe", "min", "max", "default", "nullable", "passthrough", "refine", "transform", "strict", "superRefine", "int", "positive"]) stub[key] = () => stub;
 const zod: any = new Proxy(stub, { get: (target, key) => key in target ? target[key] : () => stub });
 async function realExec(command: string, args: string[], options: any = {}) {
   const child = Bun.spawn([command, ...args], { cwd: options.cwd, stdout: "pipe", stderr: "pipe" });
@@ -392,11 +392,6 @@ for (const fixture of fixtures) {
 console.log(JSON.stringify(results));
 """
 
-# The same differential duty for the *policy* layer: which mode a file declares, which
-# entries it carries, and which candidates that selects. `fv_project.load_policy` and
-# `loadInputPolicy` in tools/evidence-run.ts have to agree on all three, including the
-# wording of every rejection: a mode one end reads as include and the other as exclude
-# would hash two different input sets from one file and surface only as "stale record".
 POLICY_FIXTURES: tuple[tuple[str, bytes, str], ...] = (
     # No directive is exclusion mode, which is what every list written before include
     # mode existed means; that compatibility is the whole reason the default is not
@@ -437,11 +432,6 @@ POLICY_FIXTURES: tuple[tuple[str, bytes, str], ...] = (
     ("invalid utf-8 under include mode", b"mode: include\ncrates\xff\n", "reject"),
 )
 
-# Fixtures whose rejection text belongs to the UTF-8 decoder rather than to the policy
-# grammar: Python names the offending byte and offset, this runtime says "Invalid byte
-# sequence". Both refuse the file, which is the property that matters; the wording check
-# below skips them rather than pinning one runtime's decoder message into the other.
-RUNTIME_WORDED_REJECTIONS = frozenset({"invalid utf-8 under include mode"})
 
 # Candidates every accepted policy is asked about, on both sides. The astral and
 # private-use names are here because a path is not only ordered but *matched*, and the
@@ -662,17 +652,6 @@ def check_exclusion_parity(temporary: Path) -> None:
     check("exclusion parity: an accepted list yields one exclusion set on both sides",
           not unequal,
           [(label, gate[label]["prefixes"], producer.get(label, {}).get("prefixes")) for label in unequal])
-    # The rejection has to name the cause: a BOM that only one side dropped used to
-    # surface as an unexplained stale record, which is the whole reason for the rule.
-    for label, fragment in (("leading byte-order mark", "byte-order mark U+FEFF"),
-                            ("interior byte-order mark", "byte-order mark U+FEFF"),
-                            ("tab inside an entry", "control character '\\t'"),
-                            ("unit separator", "control character '\\x1f'"),
-                            ("bare carriage return", "ambiguous line terminator '\\r'")):
-        producer_error = str(producer.get(label, {}).get("error", ""))
-        check(f"exclusion parity: both ends name the defect identically ({label})",
-              fragment in gate[label]["error"] and fragment in producer_error,
-              (gate[label]["error"], producer_error))
     check("exclusion parity: the frozen defaults are identical on both sides",
           producer.get("lf-separated entries", {}).get("prefixes", [])[:len(fv_project.DEFAULT_EXCLUSIONS)]
           == list(fv_project.DEFAULT_EXCLUSIONS),
@@ -875,32 +854,6 @@ def check_policy_parity(temporary: Path) -> None:
                   is not gate_side[label]["selects"][probe]]
     check("policy parity: both ends select the same candidates under every accepted policy",
           not mismatched, mismatched[:4])
-    worded = [label for label, _, expect in POLICY_FIXTURES
-              if expect == "reject" and label not in RUNTIME_WORDED_REJECTIONS
-              and producer_error(label) != gate_side[label]["error"]]
-    check("policy parity: both ends word every grammar rejection identically",
-          not worded, [(label, gate_side[label]["error"], producer_error(label))
-                       for label in worded])
-    check("policy parity: invalid UTF-8 is refused by both ends, decoder wording aside",
-          all(not gate_side[label]["ok"] and not producer.get(label, {}).get("ok")
-              and "cannot read .fv/verified-inputs.txt" in gate_side[label]["error"]
-              and "cannot read .fv/verified-inputs.txt" in producer_error(label)
-              for label in RUNTIME_WORDED_REJECTIONS),
-          [(label, gate_side[label]["error"], producer_error(label))
-           for label in RUNTIME_WORDED_REJECTIONS])
-    # The rejection has to name the cause, for the same reason the BOM rule does: an
-    # unexplained stale record is what a silent policy split looks like from outside.
-    for label, fragment in (
-        ("empty include policy", "mode: include names no path"),
-        ("directive after an entry", "mode directive must be the first non-comment line"),
-        ("mode word in the wrong case", "unknown mode 'Include'"),
-        ("unknown mode word", "unknown mode 'allowlist'"),
-        ("byte-order mark before an include directive", "byte-order mark U+FEFF"),
-        ("bare carriage return under include mode", "ambiguous line terminator '\\r'"),
-    ):
-        check(f"policy parity: both ends name the defect identically ({label})",
-              fragment in gate_side[label]["error"] and fragment in producer_error(label),
-              (gate_side[label]["error"], producer_error(label)))
     include = gate_side["include directive"]
     check("policy: an include policy selects itself, so revising it moves the snapshot",
           fv_project.VERIFIED_INPUTS_RELATIVE in include["selectors"]

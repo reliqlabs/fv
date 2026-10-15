@@ -124,7 +124,7 @@ def check_package(report: Report) -> None:
     if not missing_tools and shutil.which("bun"):
         paths = [str(REPO / "tools" / name) for name in sorted(required_tools)]
         script = (
-            "const stub={}; for(const k of ['optional','array','enum','record','object','string','number','boolean']) stub[k]=()=>stub; "
+            "const stub={}; for(const k of ['optional','array','enum','record','object','string','number','boolean','describe','min','max','default','nullable','passthrough','refine','transform','strict','superRefine','int','positive']) stub[k]=()=>stub; "
             "stub.parse=x=>x; const zod=new Proxy(stub,{get:(t,k)=>k in t?t[k]:()=>stub}); "
             f"for(const p of {json.dumps(paths)}){{const m=await import(p); const tool=await m.default({{cwd:{json.dumps(str(REPO))},zod}}); "
             "if(!tool||typeof tool.execute!=='function'||!tool.name) throw new Error('invalid custom tool '+p);}"
@@ -431,10 +431,20 @@ def check_project(report: Report, project: Path) -> None:
         "; ".join(panel_errors) if panel_errors else "OMP owns a structurally valid fv-canonical panel role",
     )
 
-    for name in ("check_evidence_records.py", "check_ledger_references.py", "fv_project.py"):
+    try:
+        helper = load_module("fv_project", REPO / "scripts" / "fv_project.py")
+    except (OSError, RuntimeError, ImportError, SyntaxError) as error:
+        report.add("project", "project-scripts", "fail",
+                   f"cannot load canonical project-script list: {error}")
+        return
+    for name in helper.PROJECT_SCRIPT_NAMES:
         installed = state / "scripts" / name
         canonical = REPO / "scripts" / name
-        current = installed.is_file() and sha256(installed) == sha256(canonical)
+        try:
+            current = installed.is_file() and sha256(installed) == sha256(canonical)
+        except OSError as error:
+            report.add("project", name, "fail", f"cannot compare project script copy: {error}")
+            continue
         report.add(
             "project",
             name,

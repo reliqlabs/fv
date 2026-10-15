@@ -81,3 +81,31 @@ Accepted the parent's implementation-source observations without rerunning check
 Narrowly qualified the observation clause: exact complete counts remain required where printed, with all witness summaries unchanged. For this reviewed pinned native no-witness path, attested tool success semantics plus exact argv and normal-zero artifact PASS may establish declared-budget completion. Observations label declared_samples, completion_basis="quint-0.33.0/evaluator-v0.7.0-ok-full-budget" and exact_count_reported=false; no observed exact count is invented. Rates/timing are diagnostic text only, never count reconstruction or heuristic budget gates. Unknown/weaker/unsupported backend semantics fail closed.
 
 DossierV4Observations supplied the matching summary literal and pinned simulator/main blob grounding. It reports a parent-authorized v4-only binaryManager.js selector pin and confirms default Rust selection and normal-success mapping. The clause explicitly retains upstream/source-to-binary distribution honesty and actual tool attestation as trust, not binary authentication. No schema, recipe, model, seed,100000/other sample budget, step bound or v3 behavior changed. Overview text already states member-specific checks without requiring an unprinted count and is intentionally unchanged. No tests, builds, gates, formatters, commits or live-system operations ran; independent bounded review remains with the parent.
+
+## Parent implementation checks
+
+The actual public factory and installed OMP Zod facade completed plan, run and unchanged-input resume with the legacy execution callback set to reject use. Results were READY, PASS and PASS. The shared fixture executed once, retained the same immutable artifact on resume, and passed the portable checker with profile `producer-trusted-execution-v4`.
+
+The complete v4 schema/source/cache/lifecycle/portable and dashboard regression batch passed on Linux arm64. Native ownership cases also passed on Darwin; compiled Bun-host execution and controlled cancellation/resume were exercised on both platforms. Linux cancellation uses a real init reaper: a diagnostic container with sleep as PID1 retained zombies and correctly could not prove group termination.
+
+Seven existing ledger, installer, v3 producer, migration, rehearsal and example suites passed. Dossier passed 72 checker tests, eight host tests, 61 collector tests and Gate A with 322 content-bound citations. Installer refresh remained script-only; the actual OMP discovery surface contained only the two public tool factories.
+
+Dossier host and portable-consumer reviews are closed, with reports and corrections retained in its optimization branch. Those reviews used distinct agents from the implementation authors but one provider family; they do not establish multi-family independence or review of the external native producer.
+
+The actual complete Dossier native plan reached READY with 69 records, 108 logical slots, 82 physical recipes and 24 shared groups. Metadata captured all 41 declared tool identities plus the producer identity with the staged backend. Native producer code review and fresh canonical v4 collection remain pending. No model, recipe, seed, sample/depth bound or activation prerequisite was reduced. The original installed runtime is unchanged.
+
+The complete Darwin regression run passed 36 of 38 suites. The two failures were the installed Quint version differing from the BOM and the current OMP registry-based settings API. Both pass targeted reruns with an isolated Quint 0.32.0 and the approved OMP/FV panel bridge. The five required CI structure gates passed. A later Linux rerun overlapped a Rust-adapter edit and is not union acceptance evidence.
+
+Public-factory acceptance with the real OMP schema facade exercised unchanged and unrelated-content reuse, relevant-content invalidation, required-failure admission stopping and checkpoint resume. Four successful calls produced two physical executions. A three-recipe failure stopped before the third recipe; resume retained the first checkpoint byte for byte and ended with execution counts 1,2,1. Both scenarios passed the portable gate.
+
+## Original collection diagnosis and staged backend repair
+
+The original legacy host emitted its final FAILED verdict but remained alive after all cohort/checker calls. Its scoped report contains 44 PASS, 22 FAIL and three missing records among 69 required claims. Retained-log analysis traced the 20 leaf failures and two derived system failures to Apalache 0.62.1 rejecting the private-v2 IR at Jackson's 20,000,000-character string limit, before proof checking. The three missing records also retained ownership-pipe EPIPE errors. These outcomes were read from retained output, not rerun or reclassified as proof counterexamples.
+
+The user subsequently authorized closing that completed host. Its PID, birth identity, parent, command and cwd were checked before SIGTERM; the existing wrapper then recorded host exit 143 and checker exit 1. Outputs and installed tools were preserved. Isolated release/crash, signal-listener, Bash/file-output and repeated forced-GC scenarios exited normally. The legacy Bun keepalive cause remains unresolved; no speculative source patch was applied.
+
+The user approved an isolated backend fix. Compiling the unchanged model produced 49,923,516 JSON bytes. A staged launcher raises only Jackson's string limit to 67,108,864 and delegates to the unchanged Apalache main. Archive comparison retained 31,119 entries byte for byte; the only added class is the launcher, with Main-Class and Created-By manifest changes. The installed JAR was not replaced.
+
+Staged JAR SHA-256: `68c3d272f913e2450c1ef3a714d4baefdc1854b7103cf4c88d52995bf03efbfa`. Original JAR SHA-256: `880c0b2b72354816f12e9a9755829f2907071e9a181ffea1937954c23d54739d`. Source SHA-256: `9c9e7fc0839b29839bd9430876a2ec29de785194bdd0285dbc3c6a7d0d35c65a`.
+
+The staged backend completed `invPS7` at the unchanged four-step bound with exit zero, using a private server endpoint and the unchanged model hash `6739f855e1712e19ae142d5765556bb44f47fd4e25fc4e217447a42517223663`. This is isolated toolchain acceptance, not canonical claim evidence or production activation. Deployment still requires explicit tool/environment binding and fresh affected evidence.

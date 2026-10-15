@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
+import { runEvidenceV4 } from "./evidence-v4/evidence-v4-run";
+import { validateCall } from "./evidence-v4/evidence-v4-policy";
 
 const PASS_MARKERS: Record<string, RegExp> = {
 	"code-enforced": /--- fv-evidence: exit=0 ---/,
@@ -583,9 +585,9 @@ function obligationTargets(manifest: unknown, manifestPath: string): {
 const factory: CustomToolFactory = pi => ({
 	name: "fv_evidence_run",
 	label: "FV Evidence Run",
-	description: "Run one argv command, or a cohort of them atomically, and persist a hash-bound FV evidence record.",
+	description: "Produce hash-bound evidence. V3 runs commands; opt-in v4 plans or collects reviewed policy recipes with checkpoints and shared executions.",
 	approval: "exec",
-	parameters: pi.zod.object({
+	parameters: pi.zod.union([pi.zod.object({
 		claim_id: pi.zod.string(),
 		command: pi.zod.array(pi.zod.string()).optional(),
 		cwd: pi.zod.string().optional(),
@@ -605,9 +607,31 @@ const factory: CustomToolFactory = pi => ({
 				}),
 			)
 			.optional(),
-	}),
+	}).passthrough().refine(value => !["schema_version", "policy", "mode", "records", "jobs", "resume"].some(key => key in value),
+		"v3 calls must omit schema_version and v4 fields").transform(value => Object.fromEntries(
+		["claim_id", "command", "cwd", "evidence_class", "scope", "required", "pass_marker", "tool", "executions"]
+			.filter(key => Object.hasOwn(value, key)).map(key => [key, value[key]]))), pi.zod.object({
+		schema_version: pi.zod.literal("fv-evidence-run/v4"),
+		policy: pi.zod.string(),
+		mode: pi.zod.enum(["plan", "run"]),
+		records: pi.zod.array(pi.zod.string()).optional(),
+		jobs: pi.zod.number().int().positive().optional(),
+		resume: pi.zod.boolean().optional(),
+	}).strict().superRefine((value, ctx) => {
+		try { validateCall(value); } catch (error) {
+			ctx.addIssue({ code: "custom", message: error instanceof Error ? error.message : String(error) });
+		}
+	})]),
 
-	async execute(_toolCallId, params, _onUpdate, _ctx, signal) {
+	async execute(_toolCallId, rawParams, _onUpdate, _ctx, signal) {
+		if (rawParams !== null && typeof rawParams === "object" && "schema_version" in rawParams) {
+			const result = await runEvidenceV4({ cwd: pi.cwd }, validateCall(rawParams), signal);
+			return { content: [{ type: "text", text: `${result.schema_version}: ${result.result}${result.reason ? ` (${result.reason})` : ""}` }], details: result };
+		}
+		if (rawParams !== null && typeof rawParams === "object" && ["policy", "mode", "records", "jobs", "resume"].some(key => key in rawParams)) {
+			throw new Error("v4 fields require schema_version fv-evidence-run/v4");
+		}
+		const params = rawParams as EvidenceParams;
 		if (!CLAIM_ID.test(params.claim_id)) {
 			throw new Error("claim_id must be a filesystem-safe identifier");
 		}

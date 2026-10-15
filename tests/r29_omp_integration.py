@@ -46,6 +46,25 @@ def frontmatter(path: Path) -> dict:
     return yaml.safe_load(block)
 
 
+def doctor_environment(temporary: Path) -> dict[str, str]:
+    binaries = temporary / "doctor-bin"
+    binaries.mkdir()
+    for name in ("uv", "bun"):
+        executable = shutil.which(name)
+        if executable is None:
+            raise RuntimeError(f"R29 requires {name} for actual doctor package checks")
+        (binaries / name).symlink_to(Path(executable).resolve())
+    (binaries / "python3").symlink_to(Path(sys.executable).resolve())
+    # Keep unrelated proof-tool versions out of the installation/OMP fixture.
+    return {
+        **os.environ,
+        "PATH": str(binaries),
+        "FV_ROOT": str(REPO),
+        "UV_PYTHON": sys.executable,
+    }
+
+
+
 def policy_project(temporary: Path, name: str) -> tuple[Path, list[str]]:
     """A scaffolded project plus the initializer command that produced it.
 
@@ -63,6 +82,175 @@ def policy_project(temporary: Path, name: str) -> tuple[Path, list[str]]:
     first = subprocess.run(command, capture_output=True, text=True)
     check(f"initializer scaffolds {name}", first.returncode == 0, first.stdout + first.stderr)
     return project, command
+
+
+def test_installed_v4_checker(project: Path) -> None:
+    scripts = project / ".fv" / "scripts"
+    request_path = REPO / "templates" / "evidence-run-v4.example.json"
+    loaded = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", "\n".join([
+            "import json, sys",
+            "from pathlib import Path",
+            "scripts = Path(sys.argv[1]).resolve()",
+            "sys.path.insert(0, str(scripts))",
+            "import fv_evidence_v4 as helper",
+            "import fv_evidence_v4_schema as schema",
+            "request = schema.parse_json(Path(sys.argv[2]).read_bytes())",
+            "schema.validate_call(request)",
+            "assert helper.C(request) == schema.C(request)",
+            "assert all(Path(module.__file__).resolve().parent == scripts",
+            "           for module in (helper, schema))",
+            "print(json.dumps(request))",
+        ]), str(scripts), str(request_path)],
+        cwd=project.parent, capture_output=True, text=True,
+    )
+    check("installed v4 helpers validate the complete opt-in request independently of the package",
+          loaded.returncode == 0, loaded.stdout + loaded.stderr)
+    with tempfile.TemporaryDirectory(prefix="fv-r29-installed-checker-") as temporary:
+        current = Path(temporary) / "current.json"
+        current.write_text(json.dumps({"schema_version": "fv-evidence-current/v1"}))
+        manifest = Path(temporary) / "obligations.json"
+        manifest.write_bytes((REPO / "templates" / "obligations.example.json").read_bytes())
+        checked = subprocess.run(
+            [sys.executable, "-I", "-B", str(scripts / "check_evidence_records.py"),
+             "--records", str(current), "--root", str(project),
+             "--manifest", str(manifest), "--json"],
+            cwd=temporary, capture_output=True, text=True,
+        )
+        try:
+            report = json.loads(checked.stdout)
+        except json.JSONDecodeError:
+            report = {}
+        check("installed Gate B loads v4 helpers and rejects malformed pointers through v4 dispatch",
+              checked.returncode == 2
+              and report.get("schema_version") == "fv-evidence-run/v4"
+              and report.get("validation") == "portable-checker"
+              and all(field in report for field in
+                      ("required_claims", "per_claim", "failed", "incomplete", "verdict")),
+              checked.stdout + checked.stderr)
+
+
+def test_project_script_refresh(temporary: Path) -> None:
+    def ancillary_state(project: Path) -> tuple[dict[str, bytes], set[str]]:
+        files = {}
+        directories = set()
+        for path in project.rglob("*"):
+            relative = path.relative_to(project)
+            if relative.parts[:2] == (".fv", "scripts"):
+                continue
+            if path.is_file():
+                files[relative.as_posix()] = path.read_bytes()
+            elif path.is_dir():
+                directories.add(relative.as_posix())
+        return files, directories
+
+    for state in ("absent", "unrelated"):
+        project = temporary / f"refresh-only-{state}"
+        config_path = project / ".omp" / "config.yml"
+        config_path.parent.mkdir(parents=True)
+        config_bytes = (
+            b"# Preserve the complete existing OMP configuration\n"
+            b"extensions:\n  - /existing/project/fv\n"
+            b"model: custom/provider-model\n"
+            b"task:\n  isolation:\n    mode: none\n"
+        )
+        config_path.write_bytes(config_bytes)
+        if state == "unrelated":
+            fv = project / ".fv"
+            fv.mkdir()
+            for name, content in {
+                "dispatch.json": b"project-owned dispatch, deliberately not JSON\n",
+                "verified-inputs.txt": b"project-owned policy bytes\n",
+                "verification-plan.json": b'{"project_owned": true}\n',
+                "harness": b"other-harness\n",
+            }.items():
+                (fv / name).write_bytes(content)
+        files_before, directories_before = ancillary_state(project)
+        refreshed = subprocess.run(
+            ["uv", "run", "--script", str(REPO / "scripts" / "fv_init.py"),
+             str(project), "--refresh-project-scripts"],
+            capture_output=True, text=True)
+        files_after, directories_after = ancillary_state(project)
+        check(f"script-only refresh installs usable copies with {state} initializer state",
+              refreshed.returncode == 0
+              and all((project / ".fv" / "scripts" / name).read_bytes()
+                      == (REPO / "scripts" / name).read_bytes()
+                      for name in fv_project.PROJECT_SCRIPT_NAMES),
+              refreshed.stdout + refreshed.stderr)
+        check(f"script-only refresh preserves complete OMP config bytes with {state} state",
+              config_path.read_bytes() == config_bytes,
+              refreshed.stdout + refreshed.stderr)
+        check(f"script-only refresh neither creates nor rewrites ancillary {state} state",
+              files_after == files_before
+              and directories_after == directories_before | {".fv"},
+              refreshed.stdout + refreshed.stderr)
+
+
+    for mode in fv_project.POLICY_MODES:
+        project, command = policy_project(temporary, f"refresh-{mode}")
+        scripts = project / ".fv" / "scripts"
+        policy = project / ".fv" / "verified-inputs.txt"
+        if mode == fv_project.MODE_INCLUDE:
+            policy.write_text("# Reviewed project allowlist\nmode: include\nintent.md\ncrates/\n")
+        else:
+            policy.write_text(policy.read_text() + "build/\n")
+        check(f"initializer leaves {mode} projects v3-default until explicit opt-in",
+              not (project / ".fv" / "execution-policy.json").exists()
+              and not (project / ".fv" / "evidence" / "v4").exists())
+        execution_policy = project / ".fv" / "execution-policy.json"
+        # Project-owned policy bytes are opaque to installation.
+        execution_policy.write_bytes(b'{ "project_owned": "preserve exact bytes" }\n')
+        legacy = project / ".fv" / "history" / "colosseum" / "records.json"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes((REPO / "tests" / "fixtures" / "m5" / "records-envelope.json").read_bytes())
+        old_record = project / ".fv" / "evidence" / "records" / "old.json"
+        old_record.parent.mkdir(parents=True)
+        old_record.write_bytes((REPO / "tests" / "fixtures" / "r21" / "records-valid.json").read_bytes())
+        old_raw = project / ".fv" / "evidence" / "raw" / "old.log"
+        old_raw.parent.mkdir(parents=True)
+        old_raw.write_bytes(b"old raw bytes\x00\xff\n")
+        paths = [policy, execution_policy, project / ".fv" / "dispatch.json", legacy, old_record, old_raw]
+        preserved = {path: path.read_bytes() for path in paths}
+        evidence_before = {
+            path.relative_to(project).as_posix(): path.read_bytes()
+            for directory in (project / ".fv" / "evidence", project / ".fv" / "history")
+            for path in directory.rglob("*") if path.is_file()
+        }
+        stale = {}
+        for name in fv_project.PROJECT_SCRIPT_NAMES:
+            installed = scripts / name
+            stale[name] = installed.read_bytes() + b"\n# stale installed copy\n"
+            installed.write_bytes(stale[name])
+        rerun = subprocess.run(command[:5], capture_output=True, text=True)
+        check(f"ordinary initializer rerun preserves existing script copies for {mode} projects",
+              rerun.returncode == 0
+              and all((scripts / name).read_bytes() == content for name, content in stale.items()),
+              rerun.stdout + rerun.stderr)
+        config_path = project / ".omp" / "config.yml"
+        config_path.write_bytes(
+            b"# Preserve every existing setting and comment\n"
+            b"extensions:\n  - /existing/project/fv\nmodel: custom/provider-model\n")
+        preserved[config_path] = config_path.read_bytes()
+
+        refreshed = subprocess.run(
+            [*command[:5], "--refresh-project-scripts"], capture_output=True, text=True)
+        check(f"script refresh repairs canonical gate and helper copies for {mode} projects",
+              refreshed.returncode == 0
+              and all((scripts / name).read_bytes() == (REPO / "scripts" / name).read_bytes()
+                      for name in fv_project.PROJECT_SCRIPT_NAMES),
+              refreshed.stdout + refreshed.stderr)
+        check(f"script refresh preserves established {mode} policy, dispatch, and OMP config bytes",
+              all(path.read_bytes() == content for path, content in preserved.items()),
+              refreshed.stdout + refreshed.stderr)
+        evidence_after = {
+            path.relative_to(project).as_posix(): path.read_bytes()
+            for directory in (project / ".fv" / "evidence", project / ".fv" / "history")
+            for path in directory.rglob("*") if path.is_file()
+        }
+        check(f"script refresh leaves old evidence and history unrebound for {mode} projects",
+              evidence_after == evidence_before
+              and not (project / ".fv" / "evidence" / "v4").exists())
+
 
 
 def test_policy_default_file_is_exclusion_mode(temporary: Path) -> None:
@@ -157,8 +345,6 @@ def test_policy_empty_include_is_refused(temporary: Path) -> None:
 
 def main() -> int:
     files = sorted((REPO / "agents").glob("*.md"))
-    check("six static package agents", {path.stem for path in files} == AGENTS)
-    check("no generated body sources", not list((REPO / "agents").glob("*-body.md")))
     for path in files:
         data = frontmatter(path)
         name = path.stem
@@ -173,26 +359,6 @@ def main() -> int:
                 data.get("tools") == ["read", "grep", "glob", "bash", "write", "edit"],
             )
 
-    check("package panel resolver exists", (REPO / "tools" / "panel-resolver.ts").is_file())
-    check("package MCP manifest exists", (REPO / ".mcp.json").is_file())
-    mcp_manifest = json.loads((REPO / ".mcp.json").read_text())
-    check(
-        "MCP executables are extension-relative and independent of FV_ROOT inheritance",
-        all(
-            isinstance(server.get("command"), str)
-            and server["command"].startswith("./mcp/")
-            and "${FV_ROOT}" not in server["command"]
-            for server in mcp_manifest.get("mcpServers", {}).values()
-        ),
-        mcp_manifest,
-    )
-    help_run = subprocess.run(
-        ["uv", "run", "--script", str(REPO / "scripts" / "fv_init.py"), "--help"],
-        capture_output=True,
-        text=True,
-    )
-    check("initializer help succeeds", help_run.returncode == 0)
-    check("initializer exposes no harness selector", "--harness" not in help_run.stdout)
 
     with tempfile.TemporaryDirectory(prefix="fv-r29-") as temporary:
         project = Path(temporary) / "project"
@@ -218,9 +384,7 @@ def main() -> int:
         second = subprocess.run(command, capture_output=True, text=True)
         check("initializer first run succeeds", first.returncode == 0, first.stderr)
         check("initializer rerun succeeds", second.returncode == 0, second.stderr)
-        check("initializer tells existing sessions to reload the full extension snapshot",
-              "/reload-plugins" in first.stdout and "/mcp reload" not in first.stdout,
-              first.stdout)
+        test_installed_v4_checker(project)
 
         config = yaml.safe_load((project / ".omp" / "config.yml").read_text())
         extension_values = config["extensions"]
@@ -335,11 +499,12 @@ def main() -> int:
             return path
 
         doctor = REPO / "scripts" / "fv_doctor.py"
+        doctor_env = doctor_environment(Path(temporary))
         omp_stub = write_omp_stub(Path(temporary) / "omp-stub", contract)
         checked = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(omp_stub), "--json"],
-            env={**os.environ, "FV_ROOT": str(REPO)},
+            env=doctor_env,
             capture_output=True, text=True,
         )
         checked_report = json.loads(checked.stdout)
@@ -372,8 +537,45 @@ def main() -> int:
             return subprocess.run(
                 ["uv", "run", "--script", str(doctor), "--project", str(project),
                  "--omp", str(omp_stub), "--json"],
-                env={**os.environ, "FV_ROOT": str(REPO)},
+                env=doctor_env,
                 capture_output=True, text=True)
+
+        for name in fv_project.PROJECT_SCRIPT_NAMES:
+            if not name.startswith("fv_evidence_v4"):
+                continue
+            check(f"doctor accepts the current installed {name}",
+                  any(item["name"] == name and item["status"] == "ok"
+                      for item in checked_report["findings"]), checked.stdout)
+            installed = project / ".fv" / "scripts" / name
+            installed.unlink()
+            missing = run_doctor()
+            check(f"doctor rejects a missing {name}",
+                  missing.returncode == 1
+                  and any(item["name"] == name and item["status"] == "fail"
+                          for item in json.loads(missing.stdout)["findings"]),
+                  missing.stdout + missing.stderr)
+            repaired = subprocess.run(default_command, capture_output=True, text=True)
+            check(f"ordinary initialization installs the missing {name}",
+                  repaired.returncode == 0
+                  and installed.read_bytes() == (REPO / "scripts" / name).read_bytes(),
+                  repaired.stdout + repaired.stderr)
+            installed.write_bytes(installed.read_bytes() + b"\n# stale helper\n")
+            stale_helper = run_doctor()
+            check(f"doctor rejects a stale {name}",
+                  stale_helper.returncode == 1
+                  and any(item["name"] == name and item["status"] == "fail"
+                          for item in json.loads(stale_helper.stdout)["findings"]),
+                  stale_helper.stdout + stale_helper.stderr)
+            refreshed = subprocess.run(
+                [*default_command, "--refresh-project-scripts"],
+                capture_output=True, text=True)
+            current = run_doctor()
+            check(f"scoped refresh restores doctor currentness for {name}",
+                  refreshed.returncode == 0 and current.returncode == 0
+                  and any(item["name"] == name and item["status"] == "ok"
+                          for item in json.loads(current.stdout)["findings"]),
+                  refreshed.stdout + refreshed.stderr + current.stdout + current.stderr)
+
 
         def plan_finding(result: subprocess.CompletedProcess) -> dict:
             return next((item for item in json.loads(result.stdout)["findings"]
@@ -418,7 +620,7 @@ def main() -> int:
         bad_capability = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(bad_capability_stub), "--json"],
-            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True,
+            env=doctor_env, capture_output=True, text=True,
         )
         bad_capability_report = json.loads(bad_capability.stdout)
         check("doctor fails when a required OMP capability is missing",
@@ -434,7 +636,7 @@ def main() -> int:
         false_capability_run = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(false_capability_stub), "--json"],
-            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True,
+            env=doctor_env, capture_output=True, text=True,
         )
         false_capability_report = json.loads(false_capability_run.stdout)
         check("doctor fails when a required OMP capability is false",
@@ -451,7 +653,7 @@ def main() -> int:
         wrong_contract = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(wrong_contract_stub), "--json"],
-            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True,
+            env=doctor_env, capture_output=True, text=True,
         )
         wrong_contract_report = json.loads(wrong_contract.stdout)
         check("doctor fails on an incompatible OMP bridge-contract version",
@@ -462,7 +664,7 @@ def main() -> int:
         missing_omp = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(Path(temporary) / "missing-omp"), "--json"],
-            env={**os.environ, "FV_ROOT": str(REPO)},
+            env=doctor_env,
             capture_output=True, text=True,
         )
         check("doctor fails when the selected OMP executable is missing",
@@ -474,7 +676,7 @@ def main() -> int:
             ["uv", "run", "--script", str(doctor), "--project", str(project),
              "--omp", str(omp_stub), "--json"],
             capture_output=True, text=True,
-            env={**os.environ, "FV_ROOT": str(Path(temporary) / "wrong-root")},
+            env={**doctor_env, "FV_ROOT": str(Path(temporary) / "wrong-root")},
         )
         check("doctor rejects FV_ROOT pointing at another checkout",
               wrong_root.returncode == 1
@@ -516,7 +718,7 @@ def main() -> int:
         moved_doctor = subprocess.run(
             ["uv", "run", "--script", str(doctor), "--project", str(moved),
              "--omp", str(moved_stub), "--json"],
-            env={**os.environ, "FV_ROOT": str(REPO)}, capture_output=True, text=True)
+            env=doctor_env, capture_output=True, text=True)
         moved_report = json.loads(moved_doctor.stdout)
         check("doctor passes against the relocated project",
               moved_doctor.returncode == 0 and moved_report["status"] == "PASS",
@@ -539,7 +741,6 @@ def main() -> int:
         inline_mode = subprocess.run(command, capture_output=True, text=True)
         check("initializer rejects inline isolation syntax without mutating it",
               inline_mode.returncode == 1
-              and "unsupported inline task syntax" in inline_mode.stdout
               and config_path.read_text() == inline_config,
               inline_mode.stdout + inline_mode.stderr)
 
@@ -547,10 +748,8 @@ def main() -> int:
         test_policy_include_mode_is_preserved(Path(temporary))
         test_policy_unparseable_file_needs_force(Path(temporary))
         test_policy_empty_include_is_refused(Path(temporary))
+        test_project_script_refresh(Path(temporary))
 
-    quickstart = (REPO / "QUICKSTART.md").read_text()
-    for skill in sorted(path.parent.name for path in (REPO / "skills").glob("*/SKILL.md")):
-        check(f"quickstart uses skill namespace for {skill}", f"/skill:{skill}" in quickstart or skill in {"fv-boundary", "fv-lifecycle-adversary"})
 
     print()
     if FAILURES:

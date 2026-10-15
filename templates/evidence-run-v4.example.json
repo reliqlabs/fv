@@ -1,0 +1,5 @@
+{
+  "schema_version": "fv-evidence-run/v4",
+  "policy": ".fv/execution-policy.json",
+  "mode": "plan"
+}
