@@ -46,7 +46,19 @@ const factory: CustomToolFactory = pi => ({
 		}
 		if (!ctx.settings) throw new Error("OMP session settings are unavailable");
 
-		const panelSettings = parseSettings(ctx.settings.get("panel"));
+		const panelSetting = pi.pi && "cfgPanel" in pi.pi ? pi.pi.cfgPanel : undefined;
+		let rawPanelSettings: unknown;
+		if (
+			panelSetting && typeof panelSetting === "object" &&
+			"get" in panelSetting && typeof panelSetting.get === "function"
+		) {
+			rawPanelSettings = panelSetting.get(ctx.settings);
+		} else if ("get" in ctx.settings && typeof ctx.settings.get === "function") {
+			rawPanelSettings = ctx.settings.get("panel");
+		} else {
+			throw new Error("this OMP build does not expose its registered panel setting");
+		}
+		const panelSettings = parseSettings(rawPanelSettings);
 		const role = resolveRole(panelSettings, params.role);
 		const context = { modelRegistry: ctx.modelRegistry, settings: ctx.settings };
 		const lineup = resolveLineup({

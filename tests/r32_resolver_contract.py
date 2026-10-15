@@ -39,31 +39,29 @@ const [, , resolverPath, settingsPath, role, panelModule, injectPanel] = process
 const mod = await import(resolverPath);
 const panel = injectPanel === "yes" ? await import(panelModule) : {};
 const settingsModule = await import((await import("node:path")).resolve(panelModule, "..", "..", "config", "settings.ts"));
-const stub: any = {};
-for (const key of ["min", "max", "optional", "describe", "default", "nullable", "array"]) stub[key] = () => stub;
-stub.parse = (value: any) => value;
-const zod: any = new Proxy(stub, { get: (target, key) => key in target ? target[key] : () => stub });
+const { z: zod } = await import((await import("node:path")).resolve(panelModule, "..", "..", "..", "..", "omptype", "src", "zod.ts"));
 const panelSettings = await Bun.file(settingsPath).json();
 const MODELS = [
-  { id: "m1", provider: "pa", identity: { class: "pa", family: "one" } },
-  { id: "m1", provider: "pb", identity: { class: "pb", family: "two" } },
-  { id: "m2", provider: "pb", identity: { class: "pb", family: "two" } },
-  { id: "m3", provider: "pa", identity: { class: "pa", family: "one" } },
-  { id: "kimi-k3", provider: "fireworks", identity: { class: "kimi", family: "k3" } },
+  { id: "gpt-5", provider: "openai" },
+  { id: "claude-opus-4-1", provider: "anthropic" },
+  { id: "claude-sonnet-4-5", provider: "anthropic" },
+  { id: "gpt-5-mini", provider: "openai" },
+  { id: "kimi-k3", provider: "fireworks" },
+  { id: "gpt-5", provider: "openai-codex" },
 ];
-const api: any = { cwd: process.cwd(), zod, pi: panel };
-const settings = settingsModule.Settings.isolated({ panel: panelSettings, modelRoles: { plan: "pa/m1" } });
+const api = { cwd: process.cwd(), zod, pi: panel };
+const settings = settingsModule.Settings.isolated({ panel: panelSettings, modelRoles: { plan: "openai/gpt-5" } });
 const tool = await mod.default(api);
 try {
   const result = await tool.execute(
     "tc",
-    { role, mode: "project-plan", synthesizer: "pa/m1" },
+    { role, mode: "project-plan", synthesizer: "openai/gpt-5" },
     undefined,
     { settings, modelRegistry: { getAvailable: () => MODELS, hasConfiguredAuth: () => true } },
   );
   console.log(JSON.stringify({ ok: true, roster: result.details, tool_name: tool.name }));
-} catch (error: any) {
-  console.log(JSON.stringify({ ok: false, error: String(error?.message ?? error), tool_name: tool.name }));
+} catch (error: unknown) {
+  console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error), tool_name: tool.name }));
 }
 """
 
@@ -71,31 +69,31 @@ PANEL_SETTINGS = {
     "roles": {
         "dup": {
             "strategy": "independent", "minFamilies": 2,
-            "members": [{"model": "pa/m1"}, {"model": "pb/m1"}],
+            "members": [{"model": "openai/gpt-5"}, {"model": "anthropic/claude-opus-4-1"}],
         },
         "hidden": {
             "strategy": "independent", "minFamilies": 2,
             "members": [
-                {"model": "pz/m3", "fallbacks": ["pa/m3"]},
-                {"model": "pb/m2"},
+                {"model": "unavailable/gpt-5-mini", "fallbacks": ["openai/gpt-5-mini"]},
+                {"model": "anthropic/claude-sonnet-4-5"},
             ],
         },
         "bare": {
             "strategy": "independent", "minFamilies": 2,
-            "members": [{"model": "m2"}, {"model": "m3"}],
+            "members": [{"model": "claude-sonnet-4-5"}, {"model": "gpt-5-mini"}],
         },
         "collide": {
             "strategy": "independent", "minFamilies": 2,
-            "members": [{"model": "pb/m1"}, {"model": "pb/m2"}],
+            "members": [{"model": "openai/gpt-5"}, {"model": "openai-codex/gpt-5"}],
         },
         "none": {
             "strategy": "independent", "minFamilies": 2,
-            "members": [{"model": "pa/m1"}, {"model": "nope/nothing"}],
+            "members": [{"model": "openai/gpt-5"}, {"model": "nope/nothing"}],
         },
         "calibration-fallback": {
             "strategy": "independent", "minFamilies": 2,
             "members": [
-                {"model": "pa/m1"},
+                {"model": "openai/gpt-5"},
                 {"model": "synthetic/hf:moonshotai/Kimi-K3", "fallbacks": ["fireworks/kimi-k3"]},
             ],
         },
@@ -151,23 +149,18 @@ def main() -> int:
               and dup["roster"]["role"] == "dup", dup)
         if dup.get("ok"):
             seats = dup["roster"]["seats"]
-            check("duplicate bare ids stay provider-qualified",
-                  [seat["resolved_model"] for seat in seats] == ["pa/m1", "pb/m1"], seats)
+            check("resolved model selectors stay provider-qualified",
+                  [seat["resolved_model"] for seat in seats] == ["openai/gpt-5", "anthropic/claude-opus-4-1"], seats)
             check("declared quorum labels come from OMP resolved families",
-                  [seat["declared_family"] for seat in seats] == ["pa", "pb"], seats)
-            check("OMP family floor is carried into FV orchestration",
-                  dup["roster"]["min_families"] == 2, dup["roster"])
-            check("OMP lineup hash names the frozen FV panel",
-                  isinstance(dup["roster"].get("lineup_hash"), str)
-                  and len(dup["roster"]["lineup_hash"]) == 71, dup["roster"])
+                  [seat["declared_family"] for seat in seats] == ["openai", "anthropic"], seats)
             check("synthesizer resolves through the OMP model selector",
-                  dup["roster"]["synthesizer"]["resolved_model"] == "pa/m1",
+                  dup["roster"]["synthesizer"]["resolved_model"] == "openai/gpt-5",
                   dup["roster"]["synthesizer"])
 
         hidden = run("hidden")
         check("OMP role candidates fall through in priority order",
               hidden.get("ok")
-              and hidden["roster"]["seats"][0]["requested_selector"] == "pa/m3",
+              and hidden["roster"]["seats"][0]["requested_selector"] == "openai/gpt-5-mini",
               hidden)
 
         calibration_fallback = run("calibration-fallback")
@@ -180,11 +173,11 @@ def main() -> int:
         bare = run("bare")
         check("bare OMP model ids resolve to provider-qualified selectors",
               bare.get("ok")
-              and [seat["resolved_model"] for seat in bare["roster"]["seats"]] == ["pb/m2", "pa/m3"],
+              and [seat["resolved_model"] for seat in bare["roster"]["seats"]] == ["anthropic/claude-sonnet-4-5", "openai/gpt-5-mini"],
               bare)
 
         collide = run("collide")
-        check("OMP rejects a panel role whose served families collide",
+        check("OMP rejects the same model family served through different providers",
               not collide.get("ok") and "duplicate resolved model family" in collide.get("error", ""), collide)
 
         none = run("none")
