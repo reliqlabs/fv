@@ -329,9 +329,11 @@ export function reconstructRawOutput(
 ): Buffer {
 	const normal =
 		termination.exit_code !== null && termination.signal === null && !termination.timed_out && !termination.cancelled;
+	if (!normal && result !== "ERROR" && result !== "CANCELLED")
+		throw new Error("abnormal termination has normal result");
 	const trailer = normal
 		? `--- fv-evidence: exit=${termination.exit_code} ---\n`
-		: `--- fv-evidence-v4: result=${termination.cancelled || result === "CANCELLED" ? "CANCELLED" : "ERROR"} ---\n`;
+		: `--- fv-evidence-v4: result=${result} ---\n`;
 	return Buffer.concat([normalized(stdout), normalized(stderr), Buffer.from(trailer)]);
 }
 export function markerMatches(raw: Uint8Array | string, recipe: Recipe): boolean {
@@ -1186,7 +1188,16 @@ export class Store {
 							(event.kind === "indeterminate" && equal(event.indeterminate_owner, preserved))),
 				);
 				if (existing) {
-					result.push(snapshot.view.events[existing.sequence - 1]!);
+					const reference = snapshot.view.events[existing.sequence - 1]!;
+					const absolute = await checkedPath(this.root, reference.path);
+					const handle = await fs.open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+					try {
+						await seam(this.options, "fsync", absolute, () => handle.sync());
+					} finally {
+						await handle.close();
+					}
+					await syncAncestors(this.root, path.dirname(absolute), this.options);
+					result.push(reference);
 					continue;
 				}
 				result.push(

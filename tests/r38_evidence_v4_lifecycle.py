@@ -29,6 +29,8 @@ REPO = Path(__file__).resolve().parents[1]
 TIMEOUT = 120
 DRIVER = REPO / "tests" / "evidence_v4_lifecycle_driver.ts"
 COLLECTOR = REPO / "tests" / "evidence_v4_owned_collector.py"
+CANCEL_STDOUT = b"before cancellation\n"
+CANCEL_STDERR = b"before cancellation stderr\n"
 
 
 def read_json(path: Path) -> dict:
@@ -428,6 +430,53 @@ def native_environment(root):
     }
 
 
+def direct_group_signals_supported(environment=None):
+    environment = os.environ if environment is None else environment
+    if (
+        sys.platform != "darwin"
+        or "BUN_FEATURE_FLAG_FORCE_WAITER_THREAD" in environment
+    ):
+        return False
+    version = subprocess.run(
+        [shutil.which("bun") or "bun", "--version"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    return version.stdout.strip() == "1.3.14"
+
+
+def emit_before_cancellation(fixture):
+    def configure(policy):
+        command = policy["recipes"][0]["command"]
+        policy["recipes"][0]["command"] = [
+            fixture.shell,
+            "-c",
+            'printf "before cancellation\\n"; printf "before cancellation stderr\\n" >&2; exec "$@"',
+            "fixture-cancel",
+            *command,
+        ]
+
+    mutate_policy(fixture, configure)
+
+
+def cleanup_native_processes(root, extra=()):
+    registered = [item for item in extra if item is not None]
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        registered.extend(read_json(owner_path(root))["children"])
+    for recorded in registered:
+        actual = identity(recorded["pid"])
+        if (
+            actual is not None
+            and actual["process_start_id"] == recorded["process_start_id"]
+            and actual["process_group"] == recorded["process_group"]
+        ):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(recorded["process_group"], signal.SIGKILL)
+
+
 def identity(pid):
     result = driver_result({"mode": "identity", "pid": pid})
     if result["event"] == "error":
@@ -626,9 +675,12 @@ class EvidenceV4Scheduling(unittest.TestCase):
 
     def test_real_cancellation_retains_bytes_and_kills_owned_process_group(self):
         with EvidenceV4Fixture(claims=("A",)) as fixture:
+            emit_before_cancellation(fixture)
             fixture.set_control(
                 wait_for_gate="cancel", spawn_child=True, child_gate="cancel-child"
             )
+            can_signal = direct_group_signals_supported()
+            before = descendant = None
             process = fixture.start_call(jobs=1)
             try:
                 started = wait_for(
@@ -648,33 +700,83 @@ class EvidenceV4Scheduling(unittest.TestCase):
                 self.assertEqual(before["process_group"], descendant["process_group"])
                 fixture.cancel(process)
                 cancelled = fixture.finish_call(process)
-                self.assertEqual(cancelled["result"], "CANCELLED", cancelled)
-                self.assertIsNone(identity(started["pid"]))
-                self.assertIsNone(identity(child.get("child_pid", child["pid"])))
+                self.assertEqual(
+                    cancelled["result"],
+                    "CANCELLED" if can_signal else "ERROR",
+                    cancelled,
+                )
+                if can_signal:
+                    self.assertIsNone(identity(started["pid"]))
+                    self.assertIsNone(identity(child.get("child_pid", child["pid"])))
                 self.assertFalse(execution_events(fixture, "PASS"))
                 artifact = fixture.artifacts()[-1][1]
-                self.assertEqual(artifact["result"], "CANCELLED")
+                self.assertEqual(
+                    artifact["result"], "CANCELLED" if can_signal else "ERROR"
+                )
                 self.assertTrue(artifact["termination"]["cancelled"])
-                self.assertTrue(
-                    all(
-                        row["terminated_at"] is not None
-                        for row in artifact["ownership"]["children"]
-                    )
+                self.assertEqual(
+                    (fixture.root / artifact["stdout"]["path"]).read_bytes(),
+                    CANCEL_STDOUT,
                 )
-                self.assertTrue(
-                    all(
-                        row["state"] == "closed"
-                        for row in artifact["ownership"]["spawn_windows"]
-                    )
+                self.assertEqual(
+                    (fixture.root / artifact["stderr"]["path"]).read_bytes(),
+                    CANCEL_STDERR,
                 )
-                fixture.set_control(spawn_child=False)
-                resumed = fixture.run(resume=True)
-                self.assertEqual(resumed["result"], "PASS", resumed)
-                self.assertEqual(fixture.count(), 2)
+                if can_signal:
+                    self.assertTrue(
+                        all(
+                            row["terminated_at"] is not None
+                            for row in artifact["ownership"]["children"]
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            row["state"] == "closed"
+                            for row in artifact["ownership"]["spawn_windows"]
+                        )
+                    )
+                    fixture.set_control(spawn_child=False)
+                    resumed = fixture.run(resume=True)
+                    self.assertEqual(resumed["result"], "PASS", resumed)
+                    self.assertEqual(fixture.count(), 2)
+                else:
+                    self.assertIn(
+                        "process-lifetime capability", cancelled["reason"], cancelled
+                    )
+                    self.assertTrue(
+                        any(
+                            row["terminated_at"] is None
+                            for row in artifact["ownership"]["children"]
+                        ),
+                        artifact,
+                    )
+                    self.assertTrue(
+                        any(
+                            row["state"] == "indeterminate"
+                            for row in artifact["ownership"]["spawn_windows"]
+                        ),
+                        artifact,
+                    )
+                    retained = read_json(owner_path(fixture.root))
+                    self.assertTrue(
+                        any(
+                            row["state"] == "indeterminate"
+                            for row in retained["spawn_windows"]
+                        ),
+                        retained,
+                    )
+                    resumed = fixture.run(resume=True)
+                    self.assertEqual(resumed["result"], "ERROR", resumed)
+                    self.assertEqual(fixture.count(), 1)
             finally:
+                cleanup_native_processes(fixture.root, [before, descendant])
                 if process.poll() is None:
                     fixture.cancel(process)
-                    fixture.finish_call(process)
+                    try:
+                        process.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
 
 @unittest.skipUnless(os.name == "posix", "v4 requires POSIX process ownership")
@@ -883,6 +985,7 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
             (control / "hold").touch()
             os.mkfifo(control / "release.fifo")
             environment = native_environment(root)
+            can_signal = direct_group_signals_supported(environment)
             request = {
                 "mode": "native",
                 "cwd": str(root),
@@ -899,6 +1002,7 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
             }
             subject = None
             subject_identity = None
+            collector = None
             with LifecycleDriver(request, environment=environment) as driver:
                 try:
                     driver.receive("owner")
@@ -922,14 +1026,26 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
                     self.assertNotEqual(value["termination"]["exit_code"], 0)
                     self.assertIn("test result: ok.", value["stdout"])
                     driver.process.wait(timeout=TIMEOUT)
-                    self.assertIsNone(identity(subject["pid"]))
-                    self.assertIsNone(identity(gated["collector_pid"]))
-                    self.assertTrue(
-                        all(
-                            row["terminated_at"] is not None
-                            for row in value["ownership"]["children"]
+                    if can_signal:
+                        self.assertIsNone(identity(subject["pid"]))
+                        self.assertIsNone(identity(gated["collector_pid"]))
+                        self.assertTrue(
+                            all(
+                                row["terminated_at"] is not None
+                                for row in value["ownership"]["children"]
+                            )
                         )
-                    )
+                    else:
+                        self.assertIn(
+                            "process-lifetime capability", value["error"], value
+                        )
+                        self.assertTrue(
+                            any(
+                                row["terminated_at"] is None
+                                for row in value["ownership"]["children"]
+                            ),
+                            value,
+                        )
                     receipt = value["ownership"]
                     known_windows = {row["window_id"] for row in receipt["children"]}
                     windows = {
@@ -939,7 +1055,8 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
                     self.assertTrue(known_windows.issubset(windows), receipt)
                     self.assertTrue(
                         all(
-                            windows[window_id]["state"] == "closed"
+                            windows[window_id]["state"]
+                            == ("closed" if can_signal else "indeterminate")
                             for window_id in known_windows
                         ),
                         receipt,
@@ -967,7 +1084,10 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
                     retained_owner = read_json(owner_path(root))
                     self.assertEqual(retained_owner, release_failure["owner"])
                     self.assertEqual(retained_owner["owner_id"], receipt["owner_id"])
-                    self.assertFalse(retained_owner["children"], retained_owner)
+                    if can_signal:
+                        self.assertFalse(retained_owner["children"], retained_owner)
+                    else:
+                        self.assertTrue(retained_owner["children"], retained_owner)
                     self.assertEqual(
                         {
                             row["window_id"]: row
@@ -976,19 +1096,7 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
                         windows,
                     )
                 finally:
-                    if subject is not None and subject_identity is not None:
-                        current = identity(subject["pid"])
-                        if (
-                            current is not None
-                            and current["process_start_id"]
-                            == subject_identity["process_start_id"]
-                            and current["process_group"]
-                            == subject_identity["process_group"]
-                        ):
-                            with contextlib.suppress(ProcessLookupError):
-                                os.killpg(
-                                    subject_identity["process_group"], signal.SIGKILL
-                                )
+                    cleanup_native_processes(root, [subject_identity, collector])
 
 
 @unittest.skipUnless(os.name == "posix", "v4 requires POSIX process ownership")
@@ -1269,6 +1377,7 @@ class EvidenceV4LifecycleEdges(unittest.TestCase):
                 control = root / "control"
                 control.mkdir()
                 environment = native_environment(root)
+                can_signal = direct_group_signals_supported(environment)
                 public = "\n" * (40 * 1024)
                 environment["FV_NATIVE_TRANSPORT_PUBLIC"] = public
                 public_hash = hashlib.sha256(public.encode("utf-8")).hexdigest()
@@ -1328,13 +1437,37 @@ class EvidenceV4LifecycleEdges(unittest.TestCase):
                             for handle in gate_handles:
                                 self.assertEqual(os.write(handle, b"1"), 1)
                         response = driver.receive("result")
-                        self.assertEqual(response["event"], "result", response)
-                        self.assertTrue(response["released"], response)
-                        self.assertEqual(len(response["values"]), 4)
+                        unresolved = cancelled and not can_signal
+                        if unresolved:
+                            self.assertEqual(response["event"], "error", response)
+                            self.assertIn(
+                                "native ownership is unresolved", response["reason"]
+                            )
+                            values = [
+                                {
+                                    **value,
+                                    "stdout": bytes(value["stdout"]["data"]).decode(),
+                                    "stderr": bytes(value["stderr"]["data"]).decode(),
+                                }
+                                for value in response["native_results"]
+                            ]
+                            self.assertTrue(owner_path(root).exists())
+                            self.assertTrue(
+                                all(
+                                    window["state"] == "indeterminate"
+                                    for window in response["owner"]["spawn_windows"]
+                                ),
+                                response,
+                            )
+                        else:
+                            self.assertEqual(response["event"], "result", response)
+                            self.assertTrue(response["released"], response)
+                            values = response["values"]
+                            self.assertFalse(owner_path(root).exists())
+                        self.assertEqual(len(values), 4)
                         driver.process.wait(timeout=TIMEOUT)
-                        self.assertEqual(driver.process.returncode, 0)
-                        self.assertFalse(owner_path(root).exists())
-                        for index, value in enumerate(response["values"]):
+                        self.assertEqual(driver.process.returncode != 0, unresolved)
+                        for index, value in enumerate(values):
                             self.assertEqual(value["stderr"], "")
                             self.assertFalse(value["termination"]["timed_out"], value)
                             self.assertEqual(
@@ -1362,19 +1495,39 @@ class EvidenceV4LifecycleEdges(unittest.TestCase):
                                 ready[index]["pid"],
                                 [row["process"]["pid"] for row in receipt["children"]],
                             )
-                            self.assertTrue(
-                                all(
-                                    row["terminated_at"] is not None
-                                    for row in receipt["children"]
+                            if unresolved:
+                                self.assertIn(
+                                    "process-lifetime capability", value["error"], value
                                 )
-                            )
-                            self.assertTrue(
-                                all(
-                                    row["state"] == "closed"
-                                    for row in receipt["spawn_windows"]
+                                self.assertTrue(
+                                    any(
+                                        row["terminated_at"] is None
+                                        for row in receipt["children"]
+                                    ),
+                                    receipt,
                                 )
-                            )
+                                self.assertTrue(
+                                    all(
+                                        row["state"] == "indeterminate"
+                                        for row in receipt["spawn_windows"]
+                                    ),
+                                    receipt,
+                                )
+                            else:
+                                self.assertTrue(
+                                    all(
+                                        row["terminated_at"] is not None
+                                        for row in receipt["children"]
+                                    )
+                                )
+                                self.assertTrue(
+                                    all(
+                                        row["state"] == "closed"
+                                        for row in receipt["spawn_windows"]
+                                    )
+                                )
                 finally:
+                    cleanup_native_processes(root)
                     for handle in gate_handles:
                         os.close(handle)
 
@@ -1382,6 +1535,7 @@ class EvidenceV4LifecycleEdges(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="r38-timeout-") as directory:
             root = Path(directory).resolve(strict=True)
             environment = native_environment(root)
+            can_signal = direct_group_signals_supported(environment)
             command = [
                 str(Path(sys.executable).resolve()),
                 "-I",
@@ -1389,34 +1543,62 @@ class EvidenceV4LifecycleEdges(unittest.TestCase):
                 "-c",
                 "import signal; print('test result: ok.', flush=True); signal.pause()",
             ]
-            response = driver_result(
-                {
-                    "mode": "native",
-                    "cwd": str(root),
-                    "command": command,
-                    "environment": environment,
-                    "timeout_seconds": 2,
-                },
-                environment=environment,
-            )
-            self.assertEqual(response["event"], "result", response)
-            value = response["value"]
-            self.assertIn("test result: ok.", value["stdout"])
-            self.assertTrue(value["termination"]["timed_out"], value)
-            self.assertNotEqual(value["termination"]["exit_code"], 0)
-            self.assertTrue(value["ownership"]["children"])
-            self.assertTrue(
-                all(
-                    row["terminated_at"] is not None
-                    for row in value["ownership"]["children"]
+            try:
+                response = driver_result(
+                    {
+                        "mode": "native",
+                        "cwd": str(root),
+                        "command": command,
+                        "environment": environment,
+                        "timeout_seconds": 2,
+                    },
+                    environment=environment,
                 )
-            )
-            self.assertTrue(
-                all(
-                    row["state"] == "closed"
-                    for row in value["ownership"]["spawn_windows"]
-                )
-            )
+                self.assertEqual(response["event"], "result", response)
+                value = response["value"]
+                self.assertIn("test result: ok.", value["stdout"])
+                self.assertTrue(value["termination"]["timed_out"], value)
+                self.assertNotEqual(value["termination"]["exit_code"], 0)
+                self.assertTrue(value["ownership"]["children"])
+                if can_signal:
+                    self.assertTrue(
+                        all(
+                            row["terminated_at"] is not None
+                            for row in value["ownership"]["children"]
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            row["state"] == "closed"
+                            for row in value["ownership"]["spawn_windows"]
+                        )
+                    )
+                else:
+                    self.assertIn(
+                        value["error"],
+                        (
+                            "native invocation deadline expired",
+                            "refusing group signal without a retained process-lifetime capability",
+                        ),
+                        value,
+                    )
+                    self.assertTrue(
+                        any(
+                            row["terminated_at"] is None
+                            for row in value["ownership"]["children"]
+                        ),
+                        value,
+                    )
+                    self.assertTrue(
+                        all(
+                            row["state"] == "indeterminate"
+                            for row in value["ownership"]["spawn_windows"]
+                        ),
+                        value,
+                    )
+                    self.assertTrue(owner_path(root).exists())
+            finally:
+                cleanup_native_processes(root)
 
     def test_pointer_faults_report_pre_and_post_replacement_without_rollback_claim(
         self,

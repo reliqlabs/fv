@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { D, parseJSON, utf8Compare } from "./evidence-v4-model";
 import type { ToolDiscovery } from "./evidence-v4-model";
-import { inside, packageRoots, probeJSON, probeText } from "./evidence-v4-toolchain-common";
+import { canonicalToolPath, inside, packageRoots, probeJSON, probeText } from "./evidence-v4-toolchain-common";
 import type {
 	AdapterContext,
 	AdapterResult,
@@ -24,7 +24,7 @@ async function exists(value: string): Promise<boolean> {
 	}
 }
 async function regular(value: string, executable = false): Promise<string> {
-	const real = await fs.realpath(value),
+	const real = await canonicalToolPath(value),
 		stat = await fs.stat(real);
 	if (!stat.isFile() || (executable && (stat.mode & 0o111) === 0))
 		throw new Error(`Missing installed tool file: ${value}`);
@@ -88,7 +88,7 @@ async function bindLinkedRoots(roots: ToolRoot[], prefix: string): Promise<void>
 	const selected = roots.filter((root) => root.label === prefix || root.label.startsWith(prefix + "/"));
 	const views: { root: ToolRoot; real: string; directory: boolean }[] = [];
 	for (const root of selected) {
-		const real = await fs.realpath(root.path);
+		const real = await canonicalToolPath(root.path);
 		views.push({ root, real, directory: (await fs.stat(real)).isDirectory() });
 	}
 	const traversed = new Set<string>();
@@ -98,7 +98,7 @@ async function bindLinkedRoots(roots: ToolRoot[], prefix: string): Promise<void>
 			if (view.root.exclude?.some((ex) => relative === ex || relative.startsWith(ex.replace(/\/$/u, "") + "/"))) return;
 			const stat = await fs.lstat(actual);
 			if (stat.isSymbolicLink()) {
-				const real = await fs.realpath(actual),
+				const real = await canonicalToolPath(actual),
 					target = await fs.stat(real);
 				if (!target.isFile() && !target.isDirectory()) throw new Error("Unsupported JVM distribution link target");
 				if (views.some((candidate) => (candidate.directory ? inside(candidate.real, real) : candidate.real === real)))
@@ -195,7 +195,9 @@ const APALACHE_MANIFEST_ATTRIBUTES: Record<string, true> = {
 };
 
 export function parseApalacheJarManifest(entries: readonly string[], manifest: string): ApalacheJarEntrypoint {
-	let manifests = 0, toolClasses = 0, bootstrapClasses = 0;
+	let manifests = 0,
+		toolClasses = 0,
+		bootstrapClasses = 0;
 	for (const entry of entries) {
 		const upper = entry.toUpperCase();
 		if (upper === "META-INF/MANIFEST.MF") {
@@ -209,9 +211,14 @@ export function parseApalacheJarManifest(entries: readonly string[], manifest: s
 	if (manifests !== 1) throw new Error("Missing or ambiguous Apalache JAR manifest entry");
 	if (manifest.includes("\0") || !/[\r\n]$/u.test(manifest)) throw new Error("Malformed Apalache JAR manifest");
 	const attributes = new Map<string, string>();
-	let previous: string | null = null, ended = false;
+	let previous: string | null = null,
+		ended = false;
 	for (const line of manifest.split(/\r\n|\r|\n/u)) {
-		if (!line) { ended = true; previous = null; continue; }
+		if (!line) {
+			ended = true;
+			previous = null;
+			continue;
+		}
 		if (ended) throw new Error("Unsupported Apalache JAR named manifest sections");
 		if (line.startsWith(" ")) {
 			if (previous === null) throw new Error("Malformed Apalache JAR manifest continuation");
@@ -222,17 +229,21 @@ export function parseApalacheJarManifest(entries: readonly string[], manifest: s
 		if (!header) throw new Error("Malformed Apalache JAR manifest header");
 		const name = header[1].toLowerCase();
 		if (name === "class-path") throw new Error("Unsupported Apalache JAR Class-Path delegation");
-		if (!Object.hasOwn(APALACHE_MANIFEST_ATTRIBUTES, name)) throw new Error("Unsupported Apalache JAR manifest attribute: " + header[1]);
+		if (!Object.hasOwn(APALACHE_MANIFEST_ATTRIBUTES, name))
+			throw new Error("Unsupported Apalache JAR manifest attribute: " + header[1]);
 		if (attributes.has(name)) throw new Error("Duplicate Apalache JAR manifest attribute: " + header[1]);
 		attributes.set(name, header[2]);
 		previous = name;
 	}
 	if (attributes.get("manifest-version") !== "1.0") throw new Error("Unsupported Apalache JAR manifest version");
-	if (attributes.has("enable-native-access") && attributes.get("enable-native-access") !== "ALL-UNNAMED") throw new Error("Unsupported Apalache JAR native-access arrangement");
+	if (attributes.has("enable-native-access") && attributes.get("enable-native-access") !== "ALL-UNNAMED")
+		throw new Error("Unsupported Apalache JAR native-access arrangement");
 	const mainClass = attributes.get("main-class");
-	if (mainClass !== APALACHE_TOOL_MAIN && mainClass !== APALACHE_BOOTSTRAP_MAIN) throw new Error("Unsupported Apalache JAR entrypoint");
+	if (mainClass !== APALACHE_TOOL_MAIN && mainClass !== APALACHE_BOOTSTRAP_MAIN)
+		throw new Error("Unsupported Apalache JAR entrypoint");
 	if (toolClasses !== 1) throw new Error("Missing or ambiguous bundled Apalache Tool class");
-	if (mainClass === APALACHE_BOOTSTRAP_MAIN && bootstrapClasses !== 1) throw new Error("Missing or ambiguous reviewed Apalache bootstrap class");
+	if (mainClass === APALACHE_BOOTSTRAP_MAIN && bootstrapClasses !== 1)
+		throw new Error("Missing or ambiguous reviewed Apalache bootstrap class");
 	return { mainClass, bootstrapEntry: mainClass === APALACHE_BOOTSTRAP_MAIN ? APALACHE_BOOTSTRAP_ENTRY : null };
 }
 
@@ -400,6 +411,16 @@ export async function identifyQuint(context: AdapterContext): Promise<AdapterRes
 			if (value) {
 				const configFile = path.resolve(subject.cwd, value);
 				await configurationRoot(roots, "apalache", configFile);
+				if (flag === "tlc-config") {
+					const config = object(parseJSON(await fs.readFile(configFile)), "TLC configuration");
+					for (const [key, value] of Object.entries(config)) {
+						const valid =
+							key === "maxHeap"
+								? typeof value === "string" && /^-Xmx[1-9][0-9]*[kKmMgG]?$/u.test(value)
+								: key === "stackSize" && typeof value === "string" && /^-Xss[1-9][0-9]*[kKmMgG]?$/u.test(value);
+						if (!valid) throw new Error(`Unsupported TLC configuration field or memory-size value: ${key}`);
+					}
+				}
 				if (flag === "apalache-config")
 					await probe(
 						context,
@@ -438,7 +459,14 @@ export async function identifyQuint(context: AdapterContext): Promise<AdapterRes
 			const manifestProbe = await probe(context, discovery, [unzip, "-p", selectedJar, "META-INF/MANIFEST.MF"]);
 			const entrypoint = parseApalacheJarManifest(jarEntries, probeText(manifestProbe));
 			if (entrypoint.bootstrapEntry !== null) {
-				const classProbe = await probe(context, discovery, [node.invoked, "-e", APALACHE_BOOTSTRAP_CLASS_PROBE, unzip, selectedJar, entrypoint.bootstrapEntry]);
+				const classProbe = await probe(context, discovery, [
+					node.invoked,
+					"-e",
+					APALACHE_BOOTSTRAP_CLASS_PROBE,
+					unzip,
+					selectedJar,
+					entrypoint.bootstrapEntry,
+				]);
 				const observed = object(probeJSON(classProbe), "Apalache bootstrap class");
 				validateApalacheBootstrapHash(text(observed.hash, "Apalache bootstrap class hash"));
 			}
@@ -546,6 +574,8 @@ function leanOptions(subject: readonly string[]): LeanSelectionOptions {
 type LakeMetadata = {
 	name: string;
 	directory: string;
+	sourceDirectories: string[];
+	inputPaths: string[];
 	configuration: string;
 	manifest: string;
 	lakeDirectory: string;
@@ -571,7 +601,7 @@ type LakeMetadata = {
 	leanExecutable: string;
 	lakeExecutable: string;
 };
-type SelectedLean = { home: string; lean: string; lake: string; elan: string; selection: string };
+type SelectedLean = { home: string; lean: string; lake: string; elan: string; selection: string; entry: string };
 async function selectedLean(
 	context: AdapterContext,
 	cwd: string,
@@ -599,7 +629,7 @@ async function selectedLean(
 		const version = probeText(versionResult) + new TextDecoder("utf-8", { fatal: true }).decode(versionResult.stderr);
 		if (!pinnedVersion || !version.includes(`version ${pinnedVersion},`))
 			throw new Error("Direct Lean distribution does not match subject lean-toolchain");
-		return { home, lean, lake, elan: "", selection };
+		return { home, lean, lake, elan: "", selection, entry: entry.realpath };
 	}
 	const configuredElanHome =
 		context.effectiveEnv.ELAN_HOME ||
@@ -636,7 +666,7 @@ async function selectedLean(
 	if (!inside(home, lean) || !inside(home, lake))
 		throw new Error("Elan selected a different installed Lean/Lake distribution");
 	roots.push({ label: "distribution/elan", path: await regular(elan, true) });
-	return { home, lean, lake, elan, selection };
+	return { home, lean, lake, elan, selection, entry: entry.realpath };
 }
 
 export async function identifyLean(context: AdapterContext): Promise<AdapterResult> {
@@ -647,7 +677,7 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 		cacheNamespaces: CacheNamespaceSelection[] = [];
 	const options = leanOptions(context.subject);
 	const cwd = await directory(path.resolve(context.cwd, options.directory ?? "."));
-	const selected = await selectedLean(context, cwd, context.subject, discovery, roots);
+	const selected = await selectedLean(context, context.cwd, context.subject, discovery, roots);
 	roots.push({ label: "distribution", path: selected.home, exclude: ["lake/cache"] });
 	await probe(context, discovery, [selected.lean, "--version"], { cwd });
 	await probe(context, discovery, [selected.lake, "--version"], { cwd });
@@ -662,6 +692,29 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 		(await context.resolveCommand(context.effectiveEnv.LEAN, cwd)).realpath !== selected.lean
 	)
 		throw new Error("Unbound alternate Lean executable");
+	const applications = (context.commandContexts ?? context.applicationContexts ?? []).filter((app) =>
+		["lean", "lake"].includes(path.basename(app.subject[0])),
+	);
+	for (const application of applications) {
+		const kind = path.basename(application.subject[0]) as "lean" | "lake";
+		const entry = await context.resolveCommand(application.subject[0], application.cwd);
+		const expectedEntry =
+			kind === path.basename(context.subject[0])
+				? selected.entry
+				: selected.elan
+					? await regular(selected.elan, true)
+					: selected[kind];
+		if (entry.realpath !== expectedEntry)
+			throw new Error("Lean adapter declaration does not identify the selected application executable");
+		const actual = await selectedLean(context, application.cwd, application.subject, discovery, []);
+		if (
+			actual.selection !== selected.selection ||
+			actual.home !== selected.home ||
+			actual.lean !== selected.lean ||
+			actual.lake !== selected.lake
+		)
+			throw new Error("Lean adapter declaration does not identify the selected application toolchain");
+	}
 	if (path.basename(context.subject[0]) === "lean" && !(await exists(path.join(cwd, options.manifest)))) {
 		if ((await exists(path.join(cwd, "lakefile.lean"))) || (await exists(path.join(cwd, "lakefile.toml"))))
 			throw new Error("Lake workspace has no installed lock; metadata discovery cannot resolve packages offline");
@@ -669,8 +722,8 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 			if (!inside(selected.home, await directory(path.resolve(cwd, value))))
 				throw new Error("Standalone Lean imports an undeclared installed package");
 		}
-		const applications = context.applicationContexts.filter((app) => path.basename(app.subject[0]) === "lean");
-		const inputs = applications.length ? applications : [{ subject: context.subject, cwd }];
+		const leanApplications = applications.filter((app) => path.basename(app.subject[0]) === "lean");
+		const inputs = leanApplications.length ? leanApplications : [{ subject: context.subject, cwd }];
 		if (!inputs.some((application) => application.subject.slice(1).some((arg) => arg.endsWith(".lean"))))
 			throw new Error("Standalone Lean adapter has no identifiable source/import subject");
 		for (const application of inputs)
@@ -689,7 +742,7 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 		addResult(roots, discovery, native);
 		return { roots, packages: [], discovery, cacheNamespaces: [], sdk: native.sdk };
 	}
-	const applicationOptions = (context.applicationContexts ?? [])
+	const applicationOptions = applications
 		.filter((app) => path.basename(app.subject[0]) === "lake")
 		.map((app) => ({
 			cwd: path.resolve(app.cwd, leanOptions(app.subject).directory ?? "."),
@@ -700,6 +753,8 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 			(app) =>
 				app.cwd !== cwd ||
 				app.options.configuration !== options.configuration ||
+				app.options.manifest !== options.manifest ||
+				app.options.reconfigure !== options.reconfigure ||
 				D("lake-options", app.options.options) !== D("lake-options", options.options),
 		)
 	)
@@ -780,6 +835,8 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 		strings(raw.dependencies, "Lake dependency names");
 		strings(raw.initialLeanPath, "Lean initial library path");
 		strings(raw.initialSourcePath, "Lean initial source path");
+		strings(raw.sourceDirectories, "Lake source directories");
+		strings(raw.inputPaths, "Lake input paths");
 		if (!Array.isArray(raw.dependencyOptions)) throw new Error("Invalid Lake dependency options");
 		for (const value of raw.dependencyOptions) {
 			const edge = object(value, "Lake dependency options");
@@ -933,6 +990,46 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 			distributionExclusions.push(relative);
 		}
 	distributionRoot.exclude = [...new Set(distributionExclusions)].sort(utf8Compare);
+	const projectRoot = await directory(context.root);
+	const hashedRoots = roots.filter((root) => root.label === "distribution" || root.label.startsWith("packages/"));
+	const generatedPaths = [
+		path.join(projectRoot, ".git"),
+		...all.flatMap((pkg) => [
+			pkg.metadata.buildDirectory,
+			pkg.metadata.configurationCacheDirectory,
+			pkg.metadata.cacheDirectory,
+			pkg.metadata.packagesDirectory,
+			path.join(pkg.metadata.lakeDirectory, "build.barrel"),
+		]),
+	];
+	const excludedPaths = await Promise.all(
+		generatedPaths.map(async (value) => ((await exists(value)) ? canonicalToolPath(value) : path.resolve(value))),
+	);
+	const sourceRequirements = { directories: [] as string[], files: [] as string[] };
+	for (const pkg of all)
+		for (const [value, source] of [
+			...pkg.metadata.sourceDirectories.map((value) => [value, true] as const),
+			...pkg.metadata.inputPaths.map((value) => [value, false] as const),
+		]) {
+			const real = await canonicalToolPath(path.resolve(pkg.directory, value));
+			const stat = await fs.stat(real);
+			if (source ? !stat.isDirectory() : !stat.isDirectory() && !stat.isFile())
+				throw new Error(`Unsupported Lake ${source ? "srcDir" : "input target"}: ${value}`);
+			if (
+				hashedRoots.some(
+					(root) =>
+						inside(root.path, real) &&
+						!root.exclude?.some((excluded) => inside(path.resolve(root.path, excluded), real)),
+				)
+			)
+				continue;
+			if (!inside(projectRoot, real) || excludedPaths.some((excluded) => inside(excluded, real)))
+				throw new Error(`Lake ${source ? "srcDir" : "input target"} resolves outside hashed input roots: ${value}`);
+			const relative = path.relative(projectRoot, real).split(path.sep).join("/") || ".";
+			(stat.isDirectory() ? sourceRequirements.directories : sourceRequirements.files).push(relative);
+		}
+	sourceRequirements.directories = [...new Set(sourceRequirements.directories)].sort(utf8Compare);
+	sourceRequirements.files = [...new Set(sourceRequirements.files)].sort(utf8Compare);
 	for (const value of [...rootMetadata.initialLeanPath, ...rootMetadata.initialSourcePath]) {
 		const real = await directory(path.resolve(cwd, value));
 		if (inside(selected.home, real) || all.some((pkg) => inside(pkg.directory, real))) continue;
@@ -983,5 +1080,5 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 			addResult(native.roots, native.discovery!, next);
 		}
 	addResult(roots, discovery, native);
-	return { roots, packages: [], discovery, cacheNamespaces, sdk: native.sdk };
+	return { roots, packages: [], discovery, cacheNamespaces, sdk: native.sdk, sourceRequirements };
 }

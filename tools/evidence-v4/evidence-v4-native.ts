@@ -10,6 +10,7 @@ import type { Writable } from "node:stream";
 import { Socket } from "node:net";
 import type { SocketConnectOpts } from "node:net";
 import { C, D, H, parseJSON, utf8Compare, validateOwnerRecord, validatePendingResult } from "./evidence-v4-model.ts";
+import { canonicalToolPath } from "./evidence-v4-toolchain-common.ts";
 import type {
 	OwnedProcess,
 	SpawnWindow,
@@ -24,6 +25,7 @@ const OWNER = `${BASE}/locks/publication.lock`;
 const CONTROL = "DOSSIER_QUINT_OWNERSHIP_FDS";
 const TRANSPORT_CONTROL = "BUN_BE_BUN";
 const MAX_GRACE = 5000;
+const FORCED_WAITER = Object.hasOwn(process.env, "BUN_FEATURE_FLAG_FORCE_WAITER_THREAD");
 const GATE = String.raw`
 const fs = require("node:fs"), ffi = require("bun:ffi");
 const libc = process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : fs.readFileSync("/proc/self/maps", "utf8").split("\n").map(line => line.trim().split(/\s+/).at(-1) || "").find(file => /\/(?:libc\.so(?:\.[0-9]+)*|libc-[^/]+\.so|ld-musl-[^/]+\.so\.[0-9]+)$/.test(file));
@@ -136,7 +138,9 @@ interface NativeSubprocess {
 	stderr: ReadableStream<Uint8Array>;
 	stdio: readonly unknown[];
 	exited: Promise<number>;
+	exitCode: number | null;
 	signalCode: string | number | null;
+	unref(): void;
 }
 interface NativeRuntime {
 	spawn(options: {
@@ -481,12 +485,16 @@ export async function readProcessIdentity(pid: number): Promise<OwnedProcess | n
 		};
 	}
 	if (process.platform !== "darwin") throw new Error("unsupported native process identity");
-	const lib = await darwin(),
-		info = Buffer.alloc(136);
+	return readDarwinProcessIdentity(pid, await darwin());
+}
+function readDarwinProcessIdentity(pid: number, lib: DarwinNativeABI): OwnedProcess | null {
+	const info = Buffer.alloc(136);
 	const count = lib.proc_pidinfo(pid, 3, 0, lib.ptr(info), info.length);
 	if (count <= 0) {
 		const errno = lib.currentErrno();
 		if (errno === osConstants.errno.ESRCH) return null;
+		if (errno === osConstants.errno.EPERM)
+			return restrictedDarwinProcess(pid, lib, Buffer.alloc(648), Buffer.alloc(8), new Int32Array([1, 14, 1, pid]));
 		throw new Error(`unavailable birth identity for PID ${pid}: bytes=${count} errno=${errno}`);
 	}
 	if (count !== info.length || info.readUInt32LE(12) !== pid)
@@ -505,7 +513,85 @@ export async function readProcessIdentity(pid: number): Promise<OwnedProcess | n
 		process_start_id: `darwin-proc-start:${info.readBigUInt64LE(120)}:${info.readBigUInt64LE(128)}`,
 	};
 }
-function processTable(): ProcessRow[] {
+function restrictedDarwinProcess(
+	pid: number,
+	lib: DarwinNativeABI,
+	info: Buffer,
+	length: Buffer,
+	mib: Int32Array,
+	owned: readonly OwnedProcess[] = [],
+): OwnedProcess | null {
+	if (process.arch !== "arm64" && process.arch !== "x64") throw new Error("unsupported Darwin restricted census ABI");
+	let ppid = 0,
+		pgid = 0,
+		sid = 0,
+		session = 0n,
+		startSeconds = 0n,
+		startMicros = 0;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		mib[3] = pid;
+		length.writeBigUInt64LE(BigInt(info.length));
+		if (lib.sysctl(lib.ptr(mib), mib.length, lib.ptr(info), lib.ptr(length), null, 0) !== 0) {
+			const errno = lib.currentErrno();
+			if (errno === osConstants.errno.ESRCH) return null;
+			throw new Error(`unavailable Darwin restricted census for PID ${pid}: errno=${errno}`);
+		}
+		// LP64 SDK kinfo_proc: sizeof=648, p_pid=40, e_sess=304, e_ppid=560, e_pgid=564.
+		if (length.readBigUInt64LE() !== 648n || info.readInt32LE(40) !== pid)
+			throw new Error(`incomplete Darwin restricted census for PID ${pid}`);
+		const currentParent = info.readInt32LE(560),
+			currentGroup = info.readInt32LE(564),
+			currentSession = info.readBigUInt64LE(304),
+			currentSeconds = info.readBigInt64LE(0),
+			currentMicros = info.readInt32LE(8);
+		if (
+			currentParent < 0 ||
+			currentGroup <= 0 ||
+			currentSeconds < 0n ||
+			currentMicros < 0 ||
+			currentMicros >= 1_000_000
+		)
+			throw new Error(`invalid Darwin restricted census for PID ${pid}`);
+		if (attempt === 0) {
+			sid = lib.getsid(pid);
+			if (sid <= 0) {
+				const errno = lib.currentErrno();
+				if (errno === osConstants.errno.ESRCH) return null;
+				throw new Error(`unavailable Darwin restricted session for PID ${pid}: errno=${errno}`);
+			}
+		} else {
+			// A shared session token binds getsid across both observations, including foreign PID reuse.
+			const foreign =
+				owned.length > 0 &&
+				currentSession === session &&
+				owned.every(
+					(process) =>
+						process.process_group !== pgid && process.process_group !== currentGroup && process.session_id !== sid,
+				);
+			if (
+				!foreign &&
+				(currentGroup !== pgid ||
+					currentSession !== session ||
+					currentSeconds !== startSeconds ||
+					currentMicros !== startMicros)
+			)
+				throw new Error(`changed Darwin restricted census identity for PID ${pid}`);
+		}
+		ppid = currentParent;
+		pgid = currentGroup;
+		session = currentSession;
+		startSeconds = currentSeconds;
+		startMicros = currentMicros;
+	}
+	return {
+		pid,
+		parent_pid: ppid,
+		process_group: pgid,
+		session_id: sid,
+		process_start_id: `darwin-proc-start:${startSeconds}:${startMicros}`,
+	};
+}
+function processTable(owned: readonly OwnedProcess[] = []): ProcessRow[] {
 	const rows: ProcessRow[] = [];
 	if (process.platform === "linux") {
 		for (const entry of syncFs.readdirSync("/proc")) {
@@ -543,12 +629,31 @@ function processTable(): ProcessRow[] {
 		if (used < buffer.length) break;
 		size *= 2;
 	}
-	const info = Buffer.alloc(136);
+	const info = Buffer.alloc(136),
+		restricted = Buffer.alloc(648),
+		length = Buffer.alloc(8),
+		mib = new Int32Array([1, 14, 1, 0]);
 	for (let offset = 0; offset < used; offset += 4) {
 		const pid = buffer.readInt32LE(offset);
 		if (pid <= 0) continue;
 		const count = lib.proc_pidinfo(pid, 3, 0, lib.ptr(info), info.length);
-		if (count === 0) continue;
+		if (count <= 0) {
+			const errno = lib.currentErrno();
+			if (errno === osConstants.errno.ESRCH) continue;
+			if (errno === osConstants.errno.EPERM) {
+				const identity = restrictedDarwinProcess(pid, lib, restricted, length, mib, owned);
+				if (!identity) continue;
+				const row: ProcessRow & { sid: number } = {
+					pid: identity.pid,
+					ppid: identity.parent_pid,
+					pgid: identity.process_group,
+					sid: identity.session_id,
+				};
+				rows.push(row);
+				continue;
+			}
+			throw new Error(`unavailable Darwin process census identity for PID ${pid}: bytes=${count} errno=${errno}`);
+		}
 		if (count !== info.length || info.readUInt32LE(12) !== pid)
 			throw new Error("incomplete Darwin process census identity");
 		rows.push({ pid, ppid: info.readUInt32LE(16), pgid: info.readUInt32LE(100) });
@@ -558,15 +663,31 @@ function processTable(): ProcessRow[] {
 function sameProcess(a: OwnedProcess, b: OwnedProcess): boolean {
 	return a.pid === b.pid && a.process_start_id === b.process_start_id;
 }
+async function requireGroupAnchor(identity: OwnedProcess, known: readonly OwnedProcess[]): Promise<void> {
+	for (const previous of known) {
+		if (previous.process_group !== identity.process_group || previous.session_id !== identity.session_id) continue;
+		const current = await readProcessIdentity(previous.pid);
+		if (!current) continue;
+		if (
+			!sameProcess(previous, current) ||
+			current.process_group !== previous.process_group ||
+			current.session_id !== previous.session_id
+		)
+			throw new Error("owned process birth or group identity changed");
+		return;
+	}
+	throw new Error("no original live birth identity anchors the surviving group");
+}
 async function groupStopped(identity: OwnedProcess): Promise<boolean> {
 	const leader = await readProcessIdentity(identity.pid);
 	if (leader && !sameProcess(leader, identity)) throw new Error("owned PID was reused before termination proof");
-	return !processTable().some((row) => row.pgid === identity.process_group);
+	return !processTable([identity]).some((row) => row.pgid === identity.process_group);
 }
 async function signalOwned(
 	identity: OwnedProcess,
 	signal: NodeJS.Signals,
 	known: readonly OwnedProcess[],
+	native?: NativeSubprocess,
 ): Promise<void> {
 	const leader = await readProcessIdentity(identity.pid);
 	if (
@@ -576,30 +697,37 @@ async function signalOwned(
 			leader.session_id !== identity.session_id)
 	)
 		throw new Error("refusing signal to changed process identity");
-	const members = processTable().filter((row) => row.pgid === identity.process_group);
+	const members = processTable(known).filter((row) => row.pgid === identity.process_group);
 	if (!members.length) return;
-	if (!leader) {
-		let anchor = false;
-		for (const member of members) {
-			const actual = await readProcessIdentity(member.pid);
-			if (!actual || actual.session_id !== identity.session_id)
-				throw new Error("group ownership cannot be proven after leader exit");
-			if (
-				known.some(
-					(previous) =>
-						sameProcess(previous, actual) &&
-						previous.process_group === actual.process_group &&
-						previous.session_id === actual.session_id,
-				)
-			)
-				anchor = true;
-		}
-		if (!anchor) throw new Error("no original live birth identity anchors the surviving group");
-	}
+	await requireGroupAnchor(identity, known);
+	// Bun 1.3.14 process.zig: waitPosix/onWaitPid update Darwin status on the JS thread.
+	if (
+		process.platform !== "darwin" ||
+		process.versions.bun !== "1.3.14" ||
+		FORCED_WAITER ||
+		Object.hasOwn(process.env, "BUN_FEATURE_FLAG_FORCE_WAITER_THREAD") ||
+		!darwinSymbols ||
+		!native ||
+		native.pid !== identity.pid ||
+		identity.pid !== identity.process_group ||
+		identity.parent_pid !== process.pid
+	)
+		throw new Error("refusing group signal without a retained process-lifetime capability");
+	const current = readDarwinProcessIdentity(identity.pid, darwinSymbols);
+	if (
+		!current ||
+		!sameProcess(current, identity) ||
+		current.process_group !== identity.process_group ||
+		current.session_id !== identity.session_id ||
+		native.exitCode !== null ||
+		native.signalCode !== null
+	)
+		throw new Error("refusing group signal without the original unreaped direct child");
+	// No await: the original leader stays live or unreaped through kill(-pgid).
 	try {
 		process.kill(-identity.process_group, signal);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+	} catch (failure) {
+		if ((failure as NodeJS.ErrnoException).code !== "ESRCH") throw failure;
 	}
 }
 async function resolveCommand(
@@ -917,7 +1045,8 @@ export class NativeSession {
 		let endGate: ((bytes?: Uint8Array) => Promise<void>) | undefined;
 		let directRegistered = false,
 			stdoutEnded = false,
-			stderrEnded = false;
+			stderrEnded = false,
+			escaped = false;
 		const extraStreams: (Readable | Writable)[] = [];
 		const extraClosures: Promise<void>[] = [];
 		const interruption = Promise.withResolvers<never>();
@@ -1093,8 +1222,29 @@ export class NativeSession {
 			});
 			return entry;
 		};
+		const stopped = async (identity: OwnedProcess) => {
+			try {
+				return await groupStopped(identity);
+			} catch (failure) {
+				escaped = true;
+				throw failure;
+			}
+		};
+		const signal = async (identity: OwnedProcess, value: NodeJS.Signals) => {
+			try {
+				await signalOwned(
+					identity,
+					value,
+					owned.map((item) => item.process),
+					direct && sameProcess(identity, direct) ? child?.native : undefined,
+				);
+			} catch (failure) {
+				escaped = true;
+				throw failure;
+			}
+		};
 		const terminated = async (entry: OwnedRegistration) => {
-			if (!(await groupStopped(entry.process))) throw new Error("owned process group has surviving descendants");
+			if (!(await stopped(entry.process))) throw new Error("owned process group has surviving descendants");
 			const finished = owned.filter(
 				(item) =>
 					!item.terminated_at &&
@@ -1123,12 +1273,10 @@ export class NativeSession {
 					const targets = [...groups.values()];
 					const until = performance.now() + MAX_GRACE;
 					for (const entry of targets) {
+						// Give the collector the existing grace to stop its own registered groups.
+						if (!direct || !sameProcess(entry.process, direct)) continue;
 						try {
-							await signalOwned(
-								entry.process,
-								"SIGTERM",
-								owned.map((item) => item.process),
-							);
+							await signal(entry.process, "SIGTERM");
 						} catch (failure) {
 							error ??= message(failure);
 						}
@@ -1137,7 +1285,7 @@ export class NativeSession {
 						const remaining = await Promise.all(
 							targets.map(async (entry) => {
 								try {
-									return !(await groupStopped(entry.process));
+									return !(await stopped(entry.process));
 								} catch (failure) {
 									error ??= message(failure);
 									return true;
@@ -1149,12 +1297,7 @@ export class NativeSession {
 					}
 					for (const entry of targets) {
 						try {
-							if (!(await groupStopped(entry.process)))
-								await signalOwned(
-									entry.process,
-									"SIGKILL",
-									owned.map((item) => item.process),
-								);
+							if (!(await stopped(entry.process))) await signal(entry.process, "SIGKILL");
 						} catch (failure) {
 							error ??= message(failure);
 						}
@@ -1234,7 +1377,6 @@ export class NativeSession {
 		};
 		let deadline: NodeJS.Timeout | undefined;
 		let observer: NodeJS.Timeout | undefined;
-		let escaped = false;
 		let observationWork = Promise.resolve();
 		const possibleHosted = new Set<number>();
 		let exitPromise: Promise<void> | undefined;
@@ -1430,11 +1572,30 @@ export class NativeSession {
 				});
 
 			const observe = async () => {
-				const rows = processTable();
+				let rows: ProcessRow[];
+				try {
+					rows = processTable(owned.filter((entry) => !entry.terminated_at).map((entry) => entry.process));
+				} catch (failure) {
+					escaped = true;
+					throw failure;
+				}
 				const groups = new Map(
 					owned.filter((entry) => !entry.terminated_at).map((entry) => [entry.process.process_group, entry]),
 				);
-				const descendants = new Set(owned.map((entry) => entry.process.pid));
+				const descendants = new Set<number>();
+				for (const entry of owned) {
+					const current = await readProcessIdentity(entry.process.pid);
+					if (!current) continue;
+					if (
+						!sameProcess(current, entry.process) ||
+						current.process_group !== entry.process.process_group ||
+						current.session_id !== entry.process.session_id
+					) {
+						escaped = true;
+						throw new Error("owned process birth or group identity changed during enumeration");
+					}
+					descendants.add(current.pid);
+				}
 				let changed = true;
 				while (changed) {
 					changed = false;
@@ -1452,6 +1613,15 @@ export class NativeSession {
 						if (!identity) continue;
 						if (identity.process_group !== row.pgid || identity.session_id !== group.process.session_id)
 							throw new Error("descendant session changed during enumeration");
+						try {
+							await requireGroupAnchor(
+								group.process,
+								owned.filter((entry) => !entry.terminated_at).map((entry) => entry.process),
+							);
+						} catch (failure) {
+							escaped = true;
+							throw failure;
+						}
 						await register(identity, windows.find((item) => item.window_id === group.window_id)!);
 					} else if (descendants.has(row.pid)) {
 						if (protocol && row.ppid === direct!.pid) possibleHosted.add(row.pid);
@@ -1481,27 +1651,21 @@ export class NativeSession {
 			await Promise.race([exitPromise, interruption.promise]);
 			clearInterval(observer);
 			await observationWork;
-			await observe();
+			await observe().catch((failure) => {
+				escaped = true;
+				throw failure;
+			});
 			if (killWork) await killWork;
 			for (const entry of owned) {
 				if (entry.terminated_at) continue;
-				if (!(await groupStopped(entry.process))) {
-					await signalOwned(
-						entry.process,
-						"SIGTERM",
-						owned.map((item) => item.process),
-					);
+				if (!(await stopped(entry.process))) {
+					await signal(entry.process, "SIGTERM");
 					const until = performance.now() + MAX_GRACE;
-					while (performance.now() < until && !(await groupStopped(entry.process))) await sleep(25);
-					if (!(await groupStopped(entry.process)))
-						await signalOwned(
-							entry.process,
-							"SIGKILL",
-							owned.map((item) => item.process),
-						);
+					while (performance.now() < until && !(await stopped(entry.process))) await sleep(25);
+					if (!(await stopped(entry.process))) await signal(entry.process, "SIGKILL");
 				}
 				const until = performance.now() + 5000;
-				while (performance.now() < until && !(await groupStopped(entry.process))) await sleep(25);
+				while (performance.now() < until && !(await stopped(entry.process))) await sleep(25);
 				await terminated(entry);
 			}
 			if (!(await waitWithin(drainPromise!, MAX_GRACE)))
@@ -1554,7 +1718,7 @@ export class NativeSession {
 			for (const entry of owned)
 				if (!entry.terminated_at) {
 					try {
-						if (await groupStopped(entry.process)) await terminated(entry);
+						if (await stopped(entry.process)) await terminated(entry);
 					} catch (cleanup) {
 						retainError(cleanup);
 					}
@@ -1607,7 +1771,9 @@ export class NativeSession {
 			}
 			await controlChain;
 			if (log) await log.close();
+			// Retained ownership blocks release; a live child must not block error reporting.
 			if (exited && streamsClosed) this.rawSubprocesses.delete(window.window_id);
+			else if (!exited) child?.native.unref();
 		}
 		const out = Buffer.concat(stdout),
 			err = Buffer.concat(stderr);
@@ -1654,8 +1820,11 @@ async function verifyCollectorGate(pid: number, collectorPid: number, admittedEx
 		return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, buffer.indexOf(0)));
 	};
 	const command = async (selectedPid: number): Promise<string[]> => {
-		if (process.platform === "linux")
-			return (await fs.readFile(`/proc/${selectedPid}/cmdline`)).toString("utf8").split("\0").filter(Boolean);
+		if (process.platform === "linux") {
+			const bytes = await fs.readFile(`/proc/${selectedPid}/cmdline`);
+			if (!bytes.length || bytes.at(-1) !== 0) throw new Error("incomplete collector gate argv");
+			return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, -1)).split("\0");
+		}
 		const lib = await darwin(),
 			buffer = Buffer.alloc(1024 * 1024),
 			length = Buffer.alloc(8),
@@ -1681,19 +1850,29 @@ async function verifyCollectorGate(pid: number, collectorPid: number, admittedEx
 		collectorArgs = await command(collectorPid);
 	const childExecutable = await executable(pid),
 		collectorExecutable = await executable(collectorPid);
-	let matched = childExecutable === collectorExecutable;
+	const [childImage, collectorImage] = await Promise.all([
+		fs.stat(childExecutable, { bigint: true }),
+		fs.stat(collectorExecutable, { bigint: true }),
+	]);
+	let matched =
+		childImage.isFile() &&
+		collectorImage.isFile() &&
+		childImage.dev === collectorImage.dev &&
+		childImage.ino === collectorImage.ino;
 	let admittedCanonical: string | null = null,
 		argvCanonical: string | null = null;
-	if (!matched) {
-		const [childCanonical, collectorCanonical] = await Promise.all([
-			fs.realpath(childExecutable),
-			fs.realpath(collectorExecutable),
+	if (!matched && process.platform === "darwin" && path.isAbsolute(args[0] ?? "")) {
+		[admittedCanonical, argvCanonical] = await Promise.all([
+			canonicalToolPath(admittedExecutable),
+			canonicalToolPath(args[0]),
 		]);
-		matched = childCanonical === collectorCanonical;
-		if (!matched && process.platform === "darwin" && path.isAbsolute(args[0] ?? "")) {
-			[admittedCanonical, argvCanonical] = await Promise.all([fs.realpath(admittedExecutable), fs.realpath(args[0])]);
-			matched = childCanonical === admittedCanonical && argvCanonical === admittedCanonical;
-		}
+		const admittedImage = await fs.stat(admittedCanonical, { bigint: true });
+		matched =
+			childImage.isFile() &&
+			admittedImage.isFile() &&
+			childImage.dev === admittedImage.dev &&
+			childImage.ino === admittedImage.ino &&
+			argvCanonical === admittedCanonical;
 	}
 	if (!matched)
 		throw new Error(
@@ -1709,7 +1888,8 @@ async function verifyCollectorGate(pid: number, collectorPid: number, admittedEx
 				}),
 		);
 	if (
-		args.length < 8 ||
+		args.length < 7 ||
+		args.some((value) => !value || value.includes("\0")) ||
 		args[1] !== "-I" ||
 		args[2] !== "-B" ||
 		args[3] !== "-c" ||

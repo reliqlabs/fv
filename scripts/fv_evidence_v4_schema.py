@@ -212,6 +212,7 @@ CMD = "command"
 UINT = "uint"
 POS = "positive"
 TEXT = "text"
+NONEMPTY = "nonempty"
 STR = "string"
 BOOL = "boolean"
 REF = "FileRef"
@@ -251,7 +252,7 @@ S["Check"] = {
     "id": ID,
     "command": CMD,
     "cwd": CWD,
-    "resources": array(TEXT),
+    "resources": array("resource"),
     "toolchain": array(ID),
     "timeout_seconds": nullable(POS),
 }
@@ -262,23 +263,23 @@ S["ToolDeclaration"] = {
     "version_command": nullable(CMD),
     "version_cwd": nullable(CWD),
     "requires": array(ID),
-    "accept": {"sha256": array(HASH), "version_contains": array(TEXT)},
+    "accept": {"sha256": array(HASH), "version_contains": array(NONEMPTY)},
 }
 S["Recipe"] = {
     "recipe_id": ID,
     "command": CMD,
     "cwd": CWD,
     "evidence_class": enum(*CLASSES),
-    "pass_marker": nullable(TEXT),
+    "pass_marker": nullable(NONEMPTY),
     "timeout_seconds": nullable(POS),
-    "determinism": {"mode": enum("fixed", "distinct"), "rationale": TEXT},
+    "determinism": {"mode": enum("fixed", "distinct"), "rationale": NONEMPTY},
     "source_closure": {
         "mode": enum("prefixes", "verified-inputs"),
         "prefixes": array("prefix"),
         "basis": array(PATH),
     },
     "toolchain": array(ID),
-    "resources": array(TEXT),
+    "resources": array("resource"),
     "exclusive": BOOL,
     "bounds": {
         "samples": nullable(POS),
@@ -293,7 +294,7 @@ S["Recipe"] = {
             "mode": enum("upstream-integrity"),
             "system": enum("cargo", "lake", "node", "replay"),
             "configuration": array(PATH),
-            "resources": array(TEXT),
+            "resources": array("resource"),
         }
     ),
     "ownership_protocol": nullable(enum("dossier-quint-private-pipes/v1")),
@@ -303,7 +304,7 @@ S["PolicyRecord"] = {
     "claim_id": ID,
     "required": BOOL,
     "evidence_class": enum(*CLASSES),
-    "scope": TEXT,
+    "scope": NONEMPTY,
     "executions": array(
         {
             "slot_id": ID,
@@ -380,11 +381,11 @@ S["ToolFile"] = union(
     },
 )
 S["PackageIdentity"] = {
-    "name": TEXT,
-    "version": TEXT,
+    "name": NONEMPTY,
+    "version": NONEMPTY,
     "source": union(
-        {"kind": enum("registry"), "id": TEXT, "checksum": "hex64"},
-        {"kind": enum("git"), "id": TEXT, "revision": "revision"},
+        {"kind": enum("registry"), "id": NONEMPTY, "checksum": "hex64"},
+        {"kind": enum("git"), "id": NONEMPTY, "revision": "revision"},
         {"kind": enum("path"), "path": CWD},
     ),
 }
@@ -564,7 +565,7 @@ S["ClaimRecord"] = {
     "claim_id": ID,
     "required": BOOL,
     "evidence_class": enum(*CLASSES),
-    "scope": TEXT,
+    "scope": NONEMPTY,
     "common": "CommonBindings",
     "executions": array(
         {
@@ -722,7 +723,7 @@ S["PlanResult"] = {
             "distinct_slot": nullable(SLOT),
             "members": array(MEMBER, 1),
             "execution_key": nullable(HASH),
-            "resources": array(TEXT),
+            "resources": array("resource"),
             "exclusive": BOOL,
             "cache": enum("eligible", "miss", "corrupt", "not-checked"),
         }
@@ -775,6 +776,8 @@ def _validate(shape, value, label):
     if shape in (
         STR,
         TEXT,
+        NONEMPTY,
+        "resource",
         ID,
         HASH,
         PATH,
@@ -791,6 +794,10 @@ def _validate(shape, value, label):
         scalar(value)
         if shape == TEXT:
             valid = bool(value) and "\0" not in value
+        elif shape == NONEMPTY:
+            valid = bool(value)
+        elif shape == "resource":
+            valid = bool(value) and re.search(r"[\x00-\x1f\x7f-\x9f]", value) is None
         elif shape in (ID, "tool", HASH, "uuid", "envname", "hex64", "revision"):
             patterns = {
                 ID: r"[A-Za-z0-9][A-Za-z0-9._-]*",

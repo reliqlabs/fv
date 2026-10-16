@@ -741,10 +741,11 @@ const unique =
 		const ids = (v as T[]).map(identify);
 		if (new Set(ids).size !== ids.length) error(w, "duplicate identity");
 	};
-const command = array((v, w) => {
+const osString: Validator = (v, w) => {
 	nonempty(v, w);
-	if ((v as string).includes("\0")) error(w, "NUL in argv");
-}, 1);
+	if ((v as string).includes("\0")) error(w, "NUL in OS string");
+};
+const command = array(osString, 1);
 const resource: Validator = (v, w) => {
 	nonempty(v, w);
 	if (/[\x00-\x1f\x7f-\x9f]/.test(v as string)) error(w, "control in resource");
@@ -780,8 +781,8 @@ const check = object({
 	timeout_seconds: nullable(positive),
 });
 const locator = union(
-	object({ mode: literal("command", "path"), value: nonempty }),
-	object({ mode: literal("command-relative"), value: nonempty, parent_levels: integer, subpath: cwd }),
+	object({ mode: literal("command", "path"), value: osString }),
+	object({ mode: literal("command-relative"), value: osString, parent_levels: integer, subpath: cwd }),
 	object({
 		mode: literal("adapter"),
 		value: literal(
@@ -860,7 +861,7 @@ const policyRecord = object({
 const environmentPolicy = object({
 	mode: literal("sanitized"),
 	platforms: set<Policy["environment"]["platforms"][number]>(
-		object({ os: nonempty, arch: nonempty }),
+		object({ os: osString, arch: osString }),
 		(v) => `${v.os}\0${v.arch}`,
 		1,
 	),
@@ -927,9 +928,9 @@ const cacheIdentity = nullable(
 	}),
 );
 const environmentIdentity = object({
-	os: nonempty,
-	arch: nonempty,
-	release: nonempty,
+	os: osString,
+	arch: osString,
+	release: osString,
 	variables: set<EnvironmentIdentity["variables"][number]>(
 		object({ name: envName, present: bool, value_hash: nullable(hash) }),
 		(v) => v.name,
@@ -941,13 +942,13 @@ const toolFile = union(
 	object({
 		path: cwd,
 		kind: literal("symlink-file"),
-		target: nonempty,
+		target: osString,
 		resolved_path: cwd,
 		resolved_hash: hash,
 		resolved_size: integer,
 		executable: bool,
 	}),
-	object({ path: cwd, kind: literal("symlink-directory"), target: nonempty, resolved_path: cwd, resolved_hash: hash }),
+	object({ path: cwd, kind: literal("symlink-directory"), target: osString, resolved_path: cwd, resolved_hash: hash }),
 );
 const packageIdentity = object({
 	name: nonempty,
@@ -969,10 +970,10 @@ const toolIdentity = object({
 	version: nullable(object({ command, cwd, stdout_hash: hash, stderr_hash: hash, text: str, exit_code: signed })),
 	discovery: array(toolDiscovery),
 	system_dependencies: object({
-		os: nonempty,
-		arch: nonempty,
-		release: nonempty,
-		sdk: nullable(object({ version: nonempty, settings_hash: hash })),
+		os: osString,
+		arch: osString,
+		release: osString,
+		sdk: nullable(object({ version: osString, settings_hash: hash })),
 	}),
 	requires: set(id),
 });
@@ -1010,13 +1011,13 @@ const producer = object({
 });
 const termination = object({
 	exit_code: nullable(signed),
-	signal: nullable(nonempty),
+	signal: nullable(osString),
 	timed_out: bool,
 	cancelled: bool,
 });
 const ownedProcess = object({
 	pid: positive,
-	process_start_id: nonempty,
+	process_start_id: osString,
 	process_group: positive,
 	session_id: positive,
 	parent_pid: positive,
@@ -1043,7 +1044,7 @@ const owner = object({
 	host_id: hash,
 	boot_id: hash,
 	pid: positive,
-	process_start_id: nonempty,
+	process_start_id: osString,
 	run_id: uuid,
 	created_at: utc,
 	children: array(ownedProcess),
@@ -1335,8 +1336,6 @@ export function validateToolIdentity(v: unknown): ToolIdentity {
 				throw new Error(`tool path has missing/non-directory parent: ${file.path}`);
 			parent = parent.includes("/") ? parent.slice(0, parent.lastIndexOf("/")) : null;
 		}
-		if ((file.kind === "symlink-file" || file.kind === "symlink-directory") && file.target.includes("\0"))
-			throw new Error("NUL symlink target");
 	}
 	const visiting = new Set<string>();
 	const done = new Set<string>();

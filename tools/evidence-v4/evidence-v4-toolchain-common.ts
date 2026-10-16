@@ -27,6 +27,7 @@ export type AdapterResult = {
 	preDispatch?: () => Promise<void>;
 	resourceRequirements?: readonly string[];
 	fileRequirements?: readonly { ids: readonly string[]; files: readonly string[] }[];
+	sourceRequirements?: { directories: readonly string[]; files: readonly string[] };
 };
 export type AdapterContext = {
 	root: string;
@@ -40,7 +41,11 @@ export type AdapterContext = {
 	applicationContexts: readonly { recipe: Recipe; subject: readonly string[]; cwd: string }[];
 	commandContexts?: readonly { subject: readonly string[]; cwd: string; toolchain: readonly string[] }[];
 	probe(command: readonly string[], options?: { cwd?: string; env?: Record<string, string> }): Promise<ProbeResult>;
-	resolveCommand(command: string, cwd?: string): Promise<{ invoked: string; realpath: string }>;
+	resolveCommand(
+		command: string,
+		cwd?: string,
+		environment?: Record<string, string>,
+	): Promise<{ invoked: string; realpath: string }>;
 	native(subject: readonly string[], options?: NativeAdapterOptions): Promise<AdapterResult>;
 };
 
@@ -54,6 +59,49 @@ export function probeJSON<T = unknown>(result: ProbeResult): T {
 export function inside(root: string, value: string): boolean {
 	return value === root || value.startsWith(root + path.sep);
 }
+async function canonicalDirectory(value: string): Promise<string> {
+	const parts = value.split(path.sep);
+	if (!parts.includes("..")) return fs.realpath(value);
+	let directory = path.isAbsolute(value) ? path.parse(value).root : ".",
+		pending: string[] = [];
+	for (const part of parts) {
+		if (!part || part === ".") continue;
+		if (part === "..") {
+			// Resolve preceding symlinks before applying the parent traversal.
+			directory = path.dirname(await fs.realpath(path.join(directory, ...pending)));
+			pending = [];
+		} else pending.push(part);
+	}
+	return fs.realpath(path.join(directory, ...pending));
+}
+
+export async function canonicalToolPath(value: string): Promise<string> {
+	let current = value,
+		links: Set<string> | undefined;
+	for (;;) {
+		if (!current) return fs.realpath(current);
+		const directory = await canonicalDirectory(path.dirname(current)),
+			file = path.join(directory, path.basename(current)),
+			stat = await fs.lstat(file);
+		if (stat.isDirectory()) return fs.realpath(file);
+		// Darwin realpath can return another hardlink spelling for developer shims.
+		if (!stat.isSymbolicLink()) {
+			if (current.endsWith(path.sep)) {
+				const error = new Error("Tool path is not a directory: " + current) as NodeJS.ErrnoException;
+				error.code = "ENOTDIR";
+				throw error;
+			}
+			return file;
+		}
+		links ??= new Set<string>();
+		if (links.has(file)) throw new Error("Tool symlink cycle: " + file);
+		links.add(file);
+		const target = await fs.readlink(file);
+		current =
+			(path.isAbsolute(target) ? target : directory + path.sep + target) + (current.endsWith(path.sep) ? path.sep : "");
+	}
+}
+
 export function toolPath(value: string): string {
 	if (value === ".") return value;
 	if (
@@ -314,7 +362,7 @@ export class ToolHasher {
 		const labels = new Map<string, string>();
 		for (const root of roots) {
 			toolPath(root.label);
-			const real = await fs.realpath(root.path);
+			const real = await canonicalToolPath(root.path);
 			const stat = await fs.stat(real);
 			if (!stat.isDirectory() && !stat.isFile()) throw new Error(`Unsupported tool root: ${root.path}`);
 			if (labels.has(root.label)) {
@@ -351,7 +399,7 @@ export class ToolHasher {
 						await fs.readlink(actual, { encoding: "buffer" }),
 					);
 					if (target.includes("\0")) throw new Error(`Invalid tool symlink target: ${actual}`);
-					const real = await fs.realpath(actual);
+					const real = await canonicalToolPath(actual);
 					const resolved = await fs.stat(real);
 					if (!resolved.isFile() && !resolved.isDirectory())
 						throw new Error(`Invalid tool symlink target kind: ${actual}`);
@@ -401,7 +449,11 @@ export class ToolHasher {
 			const selected = candidates[0];
 			if (!selected) throw new Error(`Tool symlink escapes declared roots: ${link.virtual}`);
 			const relative = path.relative(selected.real, link.real).split(path.sep).join("/");
-			const resolvedPath = relative ? (selected.label === "." ? relative : `${selected.label}/${relative}`) : selected.label;
+			const resolvedPath = relative
+				? selected.label === "."
+					? relative
+					: `${selected.label}/${relative}`
+				: selected.label;
 			const targetEntry = entries.get(resolvedPath);
 			if (link.directory) {
 				if (targetEntry?.kind !== "directory") throw new Error(`Missing canonical tool directory: ${resolvedPath}`);
@@ -480,7 +532,7 @@ export async function resolvePackage(name: string, from: string): Promise<string
 	for (;;) {
 		const candidate = path.join(cursor, "node_modules", name);
 		try {
-			const real = await fs.realpath(candidate);
+			const real = await canonicalToolPath(candidate);
 			if ((await fs.stat(path.join(real, "package.json"))).isFile()) return real;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTDIR")
@@ -496,7 +548,7 @@ export async function packageRoots(context: AdapterContext, entryRoots: readonly
 		visited = new Set<string>(),
 		labels = new Map<string, string>();
 	const visit = async (directory: string): Promise<void> => {
-		const real = await fs.realpath(directory);
+		const real = await canonicalToolPath(directory);
 		if (visited.has(real)) return;
 		visited.add(real);
 		const manifest = await readPackage(real);

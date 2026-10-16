@@ -43,6 +43,7 @@ import {
 	captureInputState,
 	sameInputState,
 	materializeDescriptor,
+	assertSourceRequirements,
 	descriptorKeys,
 	type SanitizedEnvironment,
 } from "./evidence-v4-source";
@@ -187,7 +188,7 @@ async function runNative(
 	const loaded = await loadPolicy(root, call.policy);
 	const expanded = expandPolicy(loaded.policy);
 	const records = loaded.policy.records.map((record) => record.claim_id);
-	const selected = call.records ?? records;
+	const selected = call.records ?? records.sort(utf8Compare);
 	for (const claim of selected) if (!records.includes(claim)) throw new Error(`unknown policy record: ${claim}`);
 	const jobs = call.jobs ?? loaded.policy.jobs.default;
 	if (jobs > loaded.policy.jobs.max) throw new Error(`jobs exceeds reviewed maximum ${loaded.policy.jobs.max}`);
@@ -208,6 +209,7 @@ class Invocation {
 	private readonly physical: Physical[];
 	private readonly assessments = new Map<string, SlotAssessment>();
 	private readonly checkpoint = new Serial();
+	private readonly observationAbort = new AbortController();
 	private session: NativeSession | null = null;
 	private store: Store | null = null;
 	private tools: ToolchainSession | null = null;
@@ -412,7 +414,8 @@ class Invocation {
 				reason: this.operationalError ?? this.preflight.reason ?? (this.cancelled() ? "invocation cancelled" : null),
 				required_records: this.loaded.policy.records
 					.filter((record) => record.required)
-					.map((record) => record.claim_id),
+					.map((record) => record.claim_id)
+					.sort(utf8Compare),
 				selected_records: this.selected,
 				canonical_required_targets: this.loaded.common.required_targets,
 				jobs: this.jobs,
@@ -472,6 +475,12 @@ class Invocation {
 		}
 		const result = await this.publish();
 		await this.finishSession();
+		if (this.observationAbort.signal.aborted)
+			return validateRunResult({
+				...result,
+				result: "ERROR",
+				reason: this.operationalError ?? message(this.observationAbort.signal.reason),
+			});
 		if (this.operationalError && result.result === "PASS")
 			return validateRunResult({ ...result, result: "ERROR", reason: this.operationalError });
 		if (this.cancelled() && result.result === "PASS")
@@ -514,6 +523,7 @@ class Invocation {
 					toolchains: allTools,
 					buildCache: await tools.buildCache(recipe),
 				});
+				await assertSourceRequirements(this.root, physical.descriptor.closure, await tools.sourceRequirements(recipe));
 				physical.work.execution_key = descriptorKeys(physical.descriptor).execution_key;
 			}
 		});
@@ -947,7 +957,11 @@ class Invocation {
 			operationFailure: OperationFailure | null = null,
 			pending: PendingResult | null = null;
 		try {
-			resources = await session.acquireResources(checker.resources, this.requireEnvironment().env, this.signal);
+			resources = await session.acquireResources(
+				checker.resources,
+				this.requireEnvironment().env,
+				this.signal ? AbortSignal.any([this.signal, this.observationAbort.signal]) : this.observationAbort.signal,
+			);
 			const tools = await this.requireTools().revalidate(checker.toolchain);
 			this.environmentAfter();
 			const before = await this.stableInput();
@@ -1130,11 +1144,14 @@ class Invocation {
 				return reference;
 			});
 			Object.assign(assessment, { state: result, reason, observation: observationRef(checkRef, receipt) });
+			if (pending !== null) throw new Error("observation ownership or pending history remains unresolved");
 		} catch (error) {
 			operationFailure = { error };
 			assessment.state = this.cancellationCause(error) ? "CANCELLED" : "ERROR";
 			assessment.reason = message(error);
 			this.fail(error);
+			if (pending !== null || !this.cancellationCause(error)) this.observationAbort.abort(error);
+			throw error;
 		} finally {
 			if (resources && pending === null) {
 				const failure =
@@ -1142,7 +1159,12 @@ class Invocation {
 					(assessment.state === "FAIL" || assessment.state === "ERROR" || assessment.state === "CANCELLED"
 						? { error: new Error(assessment.reason ?? `observation ${assessment.state}`) }
 						: null);
-				await releaseNativeLock(resources, failure);
+				try {
+					await releaseNativeLock(resources, failure);
+				} catch (error) {
+					this.observationAbort.abort(error);
+					throw error;
+				}
 			}
 		}
 	}
@@ -1289,7 +1311,7 @@ class Invocation {
 				finished_at: now(),
 				jobs: this.jobs,
 				selected_records: this.selected,
-				required_records: required.map((claim) => claim.claim_id),
+				required_records: required.map((claim) => claim.claim_id).sort(utf8Compare),
 				source_before: this.baseline,
 				source_after: this.finalSource,
 				preflight: this.preflight,

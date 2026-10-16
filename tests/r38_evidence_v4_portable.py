@@ -25,6 +25,7 @@ from evidence_v4_fixture import (
     reidentify_claim,
     rewrite_json,
 )
+from r38_evidence_v4_lifecycle import direct_group_signals_supported
 
 sys.path.insert(0, str(REPO / "scripts"))
 import fv_evidence_v4 as portable
@@ -851,6 +852,10 @@ class PortableReviewRegressions(unittest.TestCase):
             self.assertEqual(code, 0, report)
             self.assertEqual(rows(report)["A"]["executions"][0]["blocking_events"], [])
 
+    @unittest.skipUnless(
+        direct_group_signals_supported(),
+        "fully accounted cancellation requires the Darwin Bun 1.3.14 signal capability",
+    )
     def test_ca04_fully_accounted_cancellation_is_not_an_indeterminate_barrier(self):
         with EvidenceV4Fixture(claims=("A",)) as fixture:
             first = self.produce_pass(fixture)

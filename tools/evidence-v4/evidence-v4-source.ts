@@ -35,8 +35,7 @@ export type SourceProbe = (
 ) => Promise<{ stdout: Buffer; stderr: Buffer; exit_code: number | null }>;
 export type SanitizedEnvironment = { env: Record<string, string>; identity: EnvironmentIdentity };
 export function prefixSelects(relative: string, prefix: string): boolean {
-	const base = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
-	return relative === base || relative.startsWith(base + "/");
+	return prefix.endsWith("/") ? relative.startsWith(prefix) : relative === prefix || relative.startsWith(prefix + "/");
 }
 export function commonBindingPaths(loaded: LoadedPolicy): string[] {
 	return [
@@ -209,6 +208,7 @@ export async function captureInputState(
 				current = path.join(current, component);
 				const stat = await fs.lstat(current);
 				if (stat.isSymbolicLink()) throw new Error(`symlink closure prefix: ${prefix}`);
+				if (prefix.endsWith("/") && !stat.isDirectory()) throw new Error(`non-directory closure prefix: ${prefix}`);
 			}
 		}
 	}
@@ -243,6 +243,28 @@ export function sourceClosure(input: InputState, recipe: Recipe, commonPaths: re
 		if (!files.some((file) => file.path === relative)) throw new Error(`missing closure binding: ${relative}`);
 	const value = { mode, prefixes, basis: [...basis], files };
 	return { ...value, hash: D("source-closure", value) };
+}
+// Lake resolves modules as <srcDir>/**/*.lean; `.lake` holds only Lake's own build outputs.
+export async function assertSourceRequirements(
+	root: string,
+	closure: Closure,
+	required: { readonly directories: readonly string[]; readonly files: readonly string[] },
+): Promise<void> {
+	const bound = new Set(closure.files.map((file) => file.path));
+	const require = (relative: string): void => {
+		if (!bound.has(relative)) throw new Error(`tool source input outside recipe closure: ${relative}`);
+	};
+	required.files.forEach(require);
+	const walk = async (relative: string): Promise<void> => {
+		for (const entry of await fs.readdir(path.join(root, relative), { withFileTypes: true })) {
+			const child = relative === "." ? entry.name : `${relative}/${entry.name}`;
+			if (entry.isSymbolicLink()) throw new Error(`symlink inside tool source directory: ${child}`);
+			if (entry.isDirectory()) {
+				if (entry.name !== ".lake") await walk(child);
+			} else if (entry.name.endsWith(".lean")) require(child);
+		}
+	};
+	for (const directory of required.directories) await walk(directory);
 }
 export function buildEnvironment(
 	policy: Policy,

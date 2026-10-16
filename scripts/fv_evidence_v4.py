@@ -2975,15 +2975,6 @@ def assess_v4(
                     )
                 elif row["result"] != "PASS":
                     report["incomplete"].append(row["claim_id"] + ": " + row["status"])
-            for slot in row["executions"]:
-                count = {
-                    "MISSING": "missing_associations",
-                    "FAIL": "failed_associations",
-                    "ERROR": "error_associations",
-                    "CANCELLED": "cancelled_associations",
-                }.get(slot["state"])
-                if count:
-                    report["counts"][count] += 1
         if not required:
             report["incomplete"].append("required claim set is empty")
         if recompute and current is not None:
@@ -3034,3 +3025,17 @@ def assess_v4(
                     report["failed"].append(message)
         report["verdict"] = "FAILED" if report["failed"] else "ERROR"
         return report, 1 if report["failed"] else 2
+    finally:
+        association_counts = {
+            "MISSING": "missing_associations",
+            "FAIL": "failed_associations",
+            "ERROR": "error_associations",
+            "CANCELLED": "cancelled_associations",
+        }
+        for count in association_counts.values():
+            report["counts"][count] = 0
+        for row in report["per_claim"]:
+            for slot in row["executions"]:
+                count = association_counts.get(slot["state"])
+                if count:
+                    report["counts"][count] += 1

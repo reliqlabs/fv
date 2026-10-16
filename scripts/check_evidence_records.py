@@ -4,6 +4,7 @@
 # dependencies = []
 # ///
 """Gate B: validate hash-bound execution evidence and aggregate G2 verdicts."""
+
 from __future__ import annotations
 
 import argparse
@@ -86,7 +87,15 @@ PRODUCER_PROFILE = "producer-trusted-execution"
 PRODUCER_ARTIFACT = ".fv/evidence/raw/{claim_id}-{run_id}.log"
 DIRTY_SUFFIX = "+dirty"
 RESULTS = {"PASS", "FAIL", "INCOMPLETE"}
-TOP_FIELDS = ("claim_id", "required", "evidence_class", "result", "scope", "bindings", "waiver")
+TOP_FIELDS = (
+    "claim_id",
+    "required",
+    "evidence_class",
+    "result",
+    "scope",
+    "bindings",
+    "waiver",
+)
 BINDING_FIELDS = (
     "source_snapshot",
     "intent_hash",
@@ -140,7 +149,9 @@ def _valid_toolchain(toolchain: object) -> bool:
     )
 
 
-def _contained_path_defect(repo_root: Path, value: object, field: str, label: str) -> str | None:
+def _contained_path_defect(
+    repo_root: Path, value: object, field: str, label: str
+) -> str | None:
     """A repo-relative path that stays inside the repository, or a defect."""
     if not isinstance(value, str) or not value.strip():
         return f"{label}{field} is not a repo-relative path: {value!r}"
@@ -152,15 +163,18 @@ def _contained_path_defect(repo_root: Path, value: object, field: str, label: st
     return None
 
 
-def _read_artifact(repo_root: Path, relative: object, expected: object,
-                   label: str = "") -> tuple[list[str], str | None]:
+def _read_artifact(
+    repo_root: Path, relative: object, expected: object, label: str = ""
+) -> tuple[list[str], str | None]:
     """Resolve a raw artifact inside the repository and recompute its digest.
 
     Returns its decoded text only when the stored hash is the file's actual hash,
     so no later check can read bytes the record does not commit to.
     """
     if not isinstance(relative, str) or not relative.strip():
-        return [f"{label}unresolvable raw artifact: missing binding raw_output_path"], None
+        return [
+            f"{label}unresolvable raw artifact: missing binding raw_output_path"
+        ], None
     raw_path = (repo_root / relative).resolve()
     if Path(relative).is_absolute() or not _inside(repo_root.resolve(), raw_path):
         return [f"{label}unresolvable raw artifact: path escapes repository root"], None
@@ -169,41 +183,58 @@ def _read_artifact(repo_root: Path, relative: object, expected: object,
     raw = raw_path.read_bytes()
     actual = hashlib.sha256(raw).hexdigest()
     if expected != actual:
-        return [f"{label}raw output hash mismatch: stored={expected!r} recomputed={actual}"], None
+        return [
+            f"{label}raw output hash mismatch: stored={expected!r} recomputed={actual}"
+        ], None
     return [], raw.decode(errors="replace")
 
 
-def _pass_artifact_defects(text: str, evidence_class: object, pass_marker: object,
-                           label: str = "") -> list[str]:
+def _pass_artifact_defects(
+    text: str, evidence_class: object, pass_marker: object, label: str = ""
+) -> list[str]:
     """A PASS artifact carries exactly one canonical exit=0 trailer, last, plus its marker."""
     canonical = "--- fv-evidence: exit=0 ---"
     lines = text.splitlines()
-    trailers = [line for line in lines
-                if re.fullmatch(r"--- fv-evidence: exit=\d+ ---", line)]
+    trailers = [
+        line for line in lines if re.fullmatch(r"--- fv-evidence: exit=\d+ ---", line)
+    ]
     if trailers != [canonical] or not lines or lines[-1] != canonical:
-        return [f"{label}PASS artifact must end with one unique canonical exit=0 trailer"]
+        return [
+            f"{label}PASS artifact must end with one unique canonical exit=0 trailer"
+        ]
     if isinstance(pass_marker, str) and pass_marker:
         missing = pass_marker not in text
     else:
-        marker = EVIDENCE_CLASS_PASS_MARKERS.get(evidence_class) if isinstance(evidence_class, str) else None
+        marker = (
+            EVIDENCE_CLASS_PASS_MARKERS.get(evidence_class)
+            if isinstance(evidence_class, str)
+            else None
+        )
         if marker is None:
             return [f"{label}unknown evidence class {evidence_class!r}"]
         try:
             missing = re.search(marker, text) is None
         except re.error as error:
             return [f"{label}invalid evidence-class marker regex: {error}"]
-    return [f"{label}PASS marker absent for evidence class {evidence_class}"] if missing else []
+    return (
+        [f"{label}PASS marker absent for evidence class {evidence_class}"]
+        if missing
+        else []
+    )
 
 
 def _raw_artifact_defects(record: dict, repo_root: Path) -> list[str]:
     """The record-level artifact: the sole, or a cohort's first, execution's output."""
     bindings = record["bindings"]
-    defects, text = _read_artifact(repo_root, bindings.get("raw_output_path"),
-                                   bindings.get("raw_output_hash"))
+    defects, text = _read_artifact(
+        repo_root, bindings.get("raw_output_path"), bindings.get("raw_output_hash")
+    )
     if text is None:
         return defects
     configuration = bindings.get("configuration")
-    override = configuration.get("pass_marker") if isinstance(configuration, dict) else None
+    override = (
+        configuration.get("pass_marker") if isinstance(configuration, dict) else None
+    )
     return _pass_artifact_defects(text, record["evidence_class"], override)
 
 
@@ -219,11 +250,22 @@ class _Cohort:
     where dataclasses' deferred annotation resolution breaks.
     """
 
-    __slots__ = ("claim_id", "record_pass", "producer", "obligation_kind",
-                 "seen_tools", "seen_paths")
+    __slots__ = (
+        "claim_id",
+        "record_pass",
+        "producer",
+        "obligation_kind",
+        "seen_tools",
+        "seen_paths",
+    )
 
-    def __init__(self, claim_id: str, record_pass: bool, producer: bool,
-                 obligation_kind: str | None = None) -> None:
+    def __init__(
+        self,
+        claim_id: str,
+        record_pass: bool,
+        producer: bool,
+        obligation_kind: str | None = None,
+    ) -> None:
         self.claim_id = claim_id
         self.record_pass = record_pass
         self.producer = producer
@@ -232,8 +274,9 @@ class _Cohort:
         self.seen_paths: dict[str, int] = {}
 
 
-def _execution_defects(execution: object, index: int, repo_root: Path,
-                       cohort: _Cohort) -> list[str]:
+def _execution_defects(
+    execution: object, index: int, repo_root: Path, cohort: _Cohort
+) -> list[str]:
     """One cohort entry: tool identity, argv, contained cwd, executable identity, artifact."""
     label = f"executions[{index}] "
     if not isinstance(execution, dict):
@@ -246,7 +289,9 @@ def _execution_defects(execution: object, index: int, repo_root: Path,
     if not isinstance(tool, str) or EVIDENCE_TOOL_ID.fullmatch(tool) is None:
         defects.append(f"{label}malformed evidence tool id {tool!r}")
     elif tool in cohort.seen_tools:
-        defects.append(f"{label}duplicate evidence tool {tool!r}: cohort coverage is ambiguous")
+        defects.append(
+            f"{label}duplicate evidence tool {tool!r}: cohort coverage is ambiguous"
+        )
     else:
         cohort.seen_tools.add(tool)
     evidence_class = execution["evidence_class"]
@@ -255,14 +300,23 @@ def _execution_defects(execution: object, index: int, repo_root: Path,
     elif cohort.obligation_kind is not None:
         # The record's declared class is not the strength of the evidence: each
         # execution has to be admissible for the obligation it helps discharge.
-        compatible = OBLIGATION_EVIDENCE_COMPATIBILITY.get(cohort.obligation_kind, frozenset())
+        compatible = OBLIGATION_EVIDENCE_COMPATIBILITY.get(
+            cohort.obligation_kind, frozenset()
+        )
         if evidence_class not in compatible:
-            defects.append(f"{label}incompatible evidence class {evidence_class!r} "
-                           f"for obligation kind {cohort.obligation_kind!r}")
+            defects.append(
+                f"{label}incompatible evidence class {evidence_class!r} "
+                f"for obligation kind {cohort.obligation_kind!r}"
+            )
     command = execution["command"]
-    if (not isinstance(command, list) or not command
-            or any(not isinstance(part, str) or not part for part in command)):
-        defects.append(f"{label}command is not a nonempty argv array of nonempty strings: {command!r}")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(part, str) or not part for part in command)
+    ):
+        defects.append(
+            f"{label}command is not a nonempty argv array of nonempty strings: {command!r}"
+        )
     cwd_defect = _contained_path_defect(repo_root, execution["cwd"], "cwd", label)
     if cwd_defect is not None:
         defects.append(cwd_defect)
@@ -280,27 +334,34 @@ def _execution_defects(execution: object, index: int, repo_root: Path,
     if isinstance(raw_relative, str) and raw_relative:
         first = cohort.seen_paths.setdefault(raw_relative, index)
         if first != index:
-            defects.append(f"{label}raw_output_path {raw_relative!r} duplicates "
-                           f"executions[{first}]: one artifact cannot discharge two executions")
+            defects.append(
+                f"{label}raw_output_path {raw_relative!r} duplicates "
+                f"executions[{first}]: one artifact cannot discharge two executions"
+            )
         if cohort.producer and isinstance(run_id, str):
             expected = PRODUCER_ARTIFACT.format(claim_id=cohort.claim_id, run_id=run_id)
             if raw_relative != expected:
-                defects.append(f"{label}raw_output_path {raw_relative!r} is not this run's "
-                               f"producer artifact {expected!r}")
+                defects.append(
+                    f"{label}raw_output_path {raw_relative!r} is not this run's "
+                    f"producer artifact {expected!r}"
+                )
     marker = execution.get("pass_marker")
     if "pass_marker" in execution and (not isinstance(marker, str) or not marker):
         defects.append(f"{label}pass_marker is empty")
     if defects:
         return defects
-    artifact_defects, text = _read_artifact(repo_root, execution["raw_output_path"],
-                                            execution["raw_output_hash"], label)
+    artifact_defects, text = _read_artifact(
+        repo_root, execution["raw_output_path"], execution["raw_output_hash"], label
+    )
     defects.extend(artifact_defects)
     if text is not None and result == "PASS":
         defects.extend(_pass_artifact_defects(text, evidence_class, marker, label))
     return defects
 
 
-def _cohort_defects(record: dict, repo_root: Path, obligation_kind: str | None = None) -> list[str]:
+def _cohort_defects(
+    record: dict, repo_root: Path, obligation_kind: str | None = None
+) -> list[str]:
     """Every execution of a v3 cohort, and the legacy bindings derived from its first."""
     bindings = record["bindings"]
     executions = bindings.get("executions")
@@ -320,8 +381,10 @@ def _cohort_defects(record: dict, repo_root: Path, obligation_kind: str | None =
     # A record whose legacy fields describe a different run than its cohort would
     # gate as two different claims depending on which half a reader trusts.
     primary = executions[0]
-    if (bindings.get("raw_output_path") != primary["raw_output_path"]
-            or bindings.get("raw_output_hash") != primary["raw_output_hash"]):
+    if (
+        bindings.get("raw_output_path") != primary["raw_output_path"]
+        or bindings.get("raw_output_hash") != primary["raw_output_hash"]
+    ):
         defects.append("legacy raw-output bindings are not derived from executions[0]")
     command = bindings.get("command")
     if isinstance(command, str):
@@ -334,19 +397,33 @@ def _cohort_defects(record: dict, repo_root: Path, obligation_kind: str | None =
     configuration = bindings.get("configuration")
     declared_cwd = configuration.get("cwd") if isinstance(configuration, dict) else None
     if declared_cwd != primary["cwd"]:
-        defects.append("legacy configuration.cwd binding is not derived from executions[0]")
-    declared_marker = configuration.get("pass_marker") if isinstance(configuration, dict) else None
+        defects.append(
+            "legacy configuration.cwd binding is not derived from executions[0]"
+        )
+    declared_marker = (
+        configuration.get("pass_marker") if isinstance(configuration, dict) else None
+    )
     if declared_marker != primary.get("pass_marker"):
-        defects.append("legacy configuration.pass_marker binding is not derived from executions[0]")
+        defects.append(
+            "legacy configuration.pass_marker binding is not derived from executions[0]"
+        )
     return defects
 
 
 def _coverage_defects(record: dict, required_evidence: list[str]) -> list[str]:
     """A system claim PASSes only when every required tool ID is a PASS execution."""
     executions = record["bindings"].get("executions")
-    passing = {execution["tool"] for execution in executions
-               if isinstance(execution, dict) and execution.get("result") == "PASS"
-               and isinstance(execution.get("tool"), str)} if isinstance(executions, list) else set()
+    passing = (
+        {
+            execution["tool"]
+            for execution in executions
+            if isinstance(execution, dict)
+            and execution.get("result") == "PASS"
+            and isinstance(execution.get("tool"), str)
+        }
+        if isinstance(executions, list)
+        else set()
+    )
     uncovered = [tool for tool in required_evidence if tool not in passing]
     if not uncovered:
         return []
@@ -365,12 +442,17 @@ def _waiver_defects(waiver: object) -> list[str]:
         return []
     if not isinstance(waiver, dict):
         return [f"waiver is not an object: {waiver!r}"]
-    missing = [field for field in WAIVER_FIELDS
-               if not isinstance(waiver.get(field), str) or not waiver[field].strip()]
+    missing = [
+        field
+        for field in WAIVER_FIELDS
+        if not isinstance(waiver.get(field), str) or not waiver[field].strip()
+    ]
     if missing:
-        return [f"waiver is not attributable: {missing} missing or blank; an "
-                f"assumed claim is waived only by a nonempty id, approver, and "
-                f"scope: {waiver!r}"]
+        return [
+            f"waiver is not attributable: {missing} missing or blank; an "
+            f"assumed claim is waived only by a nonempty id, approver, and "
+            f"scope: {waiver!r}"
+        ]
     return []
 
 
@@ -393,17 +475,31 @@ def _asserted_field_defects(bindings: dict, schema_v3: bool) -> list[str]:
     if not isinstance(profile, str) or PROFILE_ID.fullmatch(profile) is None:
         defects.append(f"malformed profile {profile!r}")
     targets = bindings.get("required_targets")
-    if (not isinstance(targets, list) or not targets
-            or any(not isinstance(target, str) or OBLIGATION_ID.fullmatch(target) is None
-                   for target in targets)):
-        defects.append(f"required_targets is not a nonempty array of obligation ids: {targets!r}")
-    asserted = ("intent_hash", "obligation_manifest_hash", "environment_policy",
-                "parser_schema_version", "run_id")
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or any(
+            not isinstance(target, str) or OBLIGATION_ID.fullmatch(target) is None
+            for target in targets
+        )
+    ):
+        defects.append(
+            f"required_targets is not a nonempty array of obligation ids: {targets!r}"
+        )
+    asserted = (
+        "intent_hash",
+        "obligation_manifest_hash",
+        "environment_policy",
+        "parser_schema_version",
+        "run_id",
+    )
     # intent_path is the cohort schema's; a pre-cohort record never carried one.
     for name in asserted + (("intent_path",) if schema_v3 else ()):
         value = bindings.get(name)
         if not isinstance(value, str) or not value.strip():
-            defects.append(f"binding field {name!r} is not a nonempty string: {value!r}")
+            defects.append(
+                f"binding field {name!r} is not a nonempty string: {value!r}"
+            )
     return defects
 
 
@@ -453,8 +549,9 @@ def manifest_binding_defects(bindings: dict, expect_manifest: str | None) -> lis
     ]
 
 
-def v3_producer_defects(bindings: dict,
-                        expect_required_targets: tuple[str, ...] | None) -> list[str]:
+def v3_producer_defects(
+    bindings: dict, expect_required_targets: tuple[str, ...] | None
+) -> list[str]:
     """A cohort-schema record is producer-written: hold it to the producer's scope.
 
     Only ``fv_evidence_run`` writes ``fv-evidence-run/v3``, and every rule that binds
@@ -471,8 +568,10 @@ def v3_producer_defects(bindings: dict,
     defects: list[str] = []
     profile = bindings.get("profile")
     if profile != PRODUCER_PROFILE:
-        defects.append(f"cohort-schema record declares profile {profile!r}, not the "
-                       f"producer profile {PRODUCER_PROFILE!r}")
+        defects.append(
+            f"cohort-schema record declares profile {profile!r}, not the "
+            f"producer profile {PRODUCER_PROFILE!r}"
+        )
     declared = bindings.get("required_targets")
     if expect_required_targets is None or not isinstance(declared, list):
         return defects
@@ -482,8 +581,10 @@ def v3_producer_defects(bindings: dict,
     missing = sorted(expected - set(declared))
     unexpected = sorted(set(declared) - expected)
     if missing or unexpected:
-        defects.append("required_targets is not the obligation manifest's required "
-                       f"set: missing {missing}, unexpected {unexpected}")
+        defects.append(
+            "required_targets is not the obligation manifest's required "
+            f"set: missing {missing}, unexpected {unexpected}"
+        )
     return defects
 
 
@@ -492,7 +593,10 @@ def is_schema_v3(record: object) -> bool:
     bindings = record.get("bindings") if isinstance(record, dict) else None
     if not isinstance(bindings, dict):
         return False
-    return bindings.get("parser_schema_version") == EVIDENCE_SCHEMA_V3 or "executions" in bindings
+    return (
+        bindings.get("parser_schema_version") == EVIDENCE_SCHEMA_V3
+        or "executions" in bindings
+    )
 
 
 def validate_record(
@@ -534,7 +638,9 @@ def validate_record(
     for field in expected_fields:
         if field not in bindings:
             defects.append(f"missing binding field {field!r}")
-        elif bindings[field] in ("", [], {}) or (bindings[field] is None and field not in NULLABLE):
+        elif bindings[field] in ("", [], {}) or (
+            bindings[field] is None and field not in NULLABLE
+        ):
             defects.append(f"empty binding field {field!r}")
     if bindings.get("profile") == PRODUCER_PROFILE and not _valid_toolchain(
         bindings.get("toolchain_digests")
@@ -548,12 +654,16 @@ def validate_record(
     defects.extend(dirty_snapshot_defects(record))
     if expect_snapshot:
         matched = isinstance(snapshot, str) and (
-            snapshot == expect_snapshot if snapshot_exact else snapshot.startswith(expect_snapshot)
+            snapshot == expect_snapshot
+            if snapshot_exact
+            else snapshot.startswith(expect_snapshot)
         )
         if not matched:
             qualifier = "exactly " if snapshot_exact else ""
             hint = ""
-            if fv_project.is_content_snapshot(expect_snapshot) and not fv_project.is_content_snapshot(snapshot):
+            if fv_project.is_content_snapshot(
+                expect_snapshot
+            ) and not fv_project.is_content_snapshot(snapshot):
                 hint = (
                     f" (record schema {bindings.get('parser_schema_version')!r} predates verified-input"
                     " snapshots; pass --expect-snapshot or --allow-unbound to validate it)"
@@ -576,11 +686,15 @@ def validate_record(
         # Repository-free producer rules, applied wherever a v3 record is read.
         defects.extend(v3_producer_defects(bindings, expect_required_targets))
     if schema_v3 and repo_root is not None:
-        intent_path_defect = _contained_path_defect(repo_root, bindings.get("intent_path"),
-                                                    "intent_path", "")
+        intent_path_defect = _contained_path_defect(
+            repo_root, bindings.get("intent_path"), "intent_path", ""
+        )
         if intent_path_defect is not None:
             defects.append(intent_path_defect)
-        elif expect_intent_path is not None and bindings.get("intent_path") != expect_intent_path:
+        elif (
+            expect_intent_path is not None
+            and bindings.get("intent_path") != expect_intent_path
+        ):
             # The hash is already compared; without this the path beside it is the one
             # provenance field a reader would trust and nothing checks.
             defects.append(
@@ -590,8 +704,12 @@ def validate_record(
         defects.extend(_cohort_defects(record, repo_root, obligation_kind))
     # A v3 record's legacy artifact is its first execution's, already judged by the
     # class that produced it and pinned to these bindings by the derivation check.
-    if (not schema_v3 and record["result"] == "PASS"
-            and record["evidence_class"] in EVIDENCE_CLASSES and repo_root is not None):
+    if (
+        not schema_v3
+        and record["result"] == "PASS"
+        and record["evidence_class"] in EVIDENCE_CLASSES
+        and repo_root is not None
+    ):
         defects.extend(_raw_artifact_defects(record, repo_root))
     # Coverage is a PASS condition: a FAIL record already reports as FAIL.
     if required_evidence and record["result"] == "PASS":
@@ -616,7 +734,10 @@ def load_records(path: Path) -> list[dict]:
 
 def infer_repo_root(records_path: Path) -> Path:
     resolved = records_path.resolve()
-    for parent in (resolved if resolved.is_dir() else resolved.parent, *resolved.parents):
+    for parent in (
+        resolved if resolved.is_dir() else resolved.parent,
+        *resolved.parents,
+    ):
         if (parent / ".fv").is_dir():
             return parent
     return Path.cwd().resolve()
@@ -649,22 +770,29 @@ def _obligation_entries(manifest: dict, collection: str) -> list[tuple[str, dict
     return entries
 
 
-def _id_list(claim_id: str, field: str, value: object, pattern: re.Pattern[str]) -> list[str]:
+def _id_list(
+    claim_id: str, field: str, value: object, pattern: re.Pattern[str]
+) -> list[str]:
     """A nonempty, duplicate-free list of well-formed IDs, or a defect."""
     if not isinstance(value, list) or not value:
-        raise ManifestError(f"system_claim {claim_id!r} {field} is not a nonempty array")
+        raise ManifestError(
+            f"system_claim {claim_id!r} {field} is not a nonempty array"
+        )
     ids: list[str] = []
     for index, entry in enumerate(value):
         if not isinstance(entry, str) or pattern.fullmatch(entry) is None:
-            raise ManifestError(f"system_claim {claim_id!r} {field}[{index}] is malformed: {entry!r}")
+            raise ManifestError(
+                f"system_claim {claim_id!r} {field}[{index}] is malformed: {entry!r}"
+            )
         if entry in ids:
             raise ManifestError(f"system_claim {claim_id!r} {field} repeats {entry!r}")
         ids.append(entry)
     return ids
 
 
-def _validate_system_claim(claim_id: str, claim: dict,
-                           kinds: dict[str, str]) -> tuple[list[str], list[str]]:
+def _validate_system_claim(
+    claim_id: str, claim: dict, kinds: dict[str, str]
+) -> tuple[list[str], list[str]]:
     """depends_on names declared invariants/witnesses; required_evidence names tool IDs.
 
     Confining dependencies to non-claim obligations is what makes a dependency
@@ -672,7 +800,9 @@ def _validate_system_claim(claim_id: str, claim: dict,
     claim, including itself), so the gate needs no cycle search. Widening
     depends_on to nested claims would require one.
     """
-    dependencies = _id_list(claim_id, "depends_on", claim.get("depends_on"), OBLIGATION_ID)
+    dependencies = _id_list(
+        claim_id, "depends_on", claim.get("depends_on"), OBLIGATION_ID
+    )
     for dependency in dependencies:
         kind = kinds.get(dependency)
         if kind is None:
@@ -684,8 +814,9 @@ def _validate_system_claim(claim_id: str, claim: dict,
                 f"system_claim {claim_id!r} depends on {dependency!r} of kind {kind!r}: "
                 "depends_on names invariants and witnesses only"
             )
-    evidence = _id_list(claim_id, "required_evidence", claim.get("required_evidence"),
-                        EVIDENCE_TOOL_ID)
+    evidence = _id_list(
+        claim_id, "required_evidence", claim.get("required_evidence"), EVIDENCE_TOOL_ID
+    )
     return dependencies, evidence
 
 
@@ -716,7 +847,8 @@ def load_manifest(
     claim_depends: dict[str, list[str]] = {}
     for claim_id, item in system_claims:
         claim_depends[claim_id], claim_evidence[claim_id] = _validate_system_claim(
-            claim_id, item, kinds)
+            claim_id, item, kinds
+        )
     return required, kinds, claim_evidence, claim_depends
 
 
@@ -728,7 +860,9 @@ def current_source_snapshot(repo_root: Path) -> str:
 def current_intent_binding(repo_root: Path) -> tuple[str, str]:
     """Canonical target's repo-relative path and content hash."""
     target = fv_project.resolve_target(repo_root)
-    return fv_project.repo_relative(repo_root, target), fv_project.target_hash(repo_root)
+    return fv_project.repo_relative(repo_root, target), fv_project.target_hash(
+        repo_root
+    )
 
 
 def _cited_artifacts(record: object) -> list[str]:
@@ -739,13 +873,17 @@ def _cited_artifacts(record: object) -> list[str]:
     paths = [bindings.get("raw_output_path")]
     executions = bindings.get("executions")
     if isinstance(executions, list):
-        paths.extend(execution.get("raw_output_path") for execution in executions
-                     if isinstance(execution, dict))
+        paths.extend(
+            execution.get("raw_output_path")
+            for execution in executions
+            if isinstance(execution, dict)
+        )
     return list(dict.fromkeys(path for path in paths if isinstance(path, str) and path))
 
 
-def cited_artifact_index(required: list[str],
-                         by_claim: dict[str, dict]) -> dict[str, set[str]]:
+def cited_artifact_index(
+    required: list[str], by_claim: dict[str, dict]
+) -> dict[str, set[str]]:
     """Which required claims cite each raw artifact, over the whole judged run."""
     cited: dict[str, set[str]] = {}
     for claim_id in required:
@@ -754,8 +892,9 @@ def cited_artifact_index(required: list[str],
     return cited
 
 
-def shared_artifact_defects(claim_id: str, record: object,
-                            cited: dict[str, set[str]]) -> list[str]:
+def shared_artifact_defects(
+    claim_id: str, record: object, cited: dict[str, set[str]]
+) -> list[str]:
     """Artifacts this record cites that another required claim cites too.
 
     One artifact cannot discharge two claims: whichever claim reads it second is
@@ -770,8 +909,10 @@ def shared_artifact_defects(claim_id: str, record: object,
     for relative in _cited_artifacts(record):
         shared = sorted(cited.get(relative, set()) - {claim_id})
         if shared:
-            defects.append(f"raw artifact {relative!r} is also cited by claim(s) "
-                           f"{shared}: evidence cannot be shared between claims")
+            defects.append(
+                f"raw artifact {relative!r} is also cited by claim(s) "
+                f"{shared}: evidence cannot be shared between claims"
+            )
     return defects
 
 
@@ -789,9 +930,16 @@ def _assumed_evidence(record: dict) -> list[str]:
     executions = bindings.get("executions") if isinstance(bindings, dict) else None
     if isinstance(executions, list):
         for index, execution in enumerate(executions):
-            if not isinstance(execution, dict) or execution.get("evidence_class") not in ASSUMED_CLASSES:
+            if (
+                not isinstance(execution, dict)
+                or execution.get("evidence_class") not in ASSUMED_CLASSES
+            ):
                 continue
-            tool = execution.get("tool") if isinstance(execution.get("tool"), str) else index
+            tool = (
+                execution.get("tool")
+                if isinstance(execution.get("tool"), str)
+                else index
+            )
             sources.append(f"{tool}={execution['evidence_class']}")
     return sources
 
@@ -809,13 +957,18 @@ def main() -> int:
     parser.add_argument("--allow-unbound", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    # Keep symlink components visible to v4 validation.
+    args.records = args.records.absolute()
 
     import fv_evidence_v4
+
     repo_root_v4 = args.root.resolve() if args.root else infer_repo_root(args.records)
     try:
         is_v4 = fv_evidence_v4.detect_v4(repo_root_v4, args.records)
     except fv_evidence_v4.V4Error as error:
-        report = fv_evidence_v4._report(repo_root_v4, args.records, not args.allow_unbound)
+        report = fv_evidence_v4._report(
+            repo_root_v4, args.records, not args.allow_unbound
+        )
         report["errors"].append(str(error))
         if args.json:
             print(json.dumps(report, indent=2))
@@ -829,27 +982,52 @@ def main() -> int:
     if is_v4:
         pinned_v4 = args.expect_snapshot is not None or args.expect_intent is not None
         recompute_v4 = not args.allow_unbound and not pinned_v4
-        report, code = fv_evidence_v4.assess_v4(repo_root_v4, args.records, args.manifest,
-                                              args.require, recompute=recompute_v4,
-                                              recheck_observations=recompute_v4)
-        overrides = (("source_snapshot", args.expect_snapshot, report.get("captured_source_snapshot")),
-                     ("intent_hash", args.expect_intent, report.get("common", {}).get("intent_hash")),
-                     ("manifest_hash", args.expect_manifest, report.get("common", {}).get("manifest_hash")))
+        report, code = fv_evidence_v4.assess_v4(
+            repo_root_v4,
+            args.records,
+            args.manifest,
+            args.require,
+            recompute=recompute_v4,
+            recheck_observations=recompute_v4,
+        )
+        overrides = (
+            (
+                "source_snapshot",
+                args.expect_snapshot,
+                report.get("captured_source_snapshot"),
+            ),
+            (
+                "intent_hash",
+                args.expect_intent,
+                report.get("common", {}).get("intent_hash"),
+            ),
+            (
+                "manifest_hash",
+                args.expect_manifest,
+                report.get("common", {}).get("manifest_hash"),
+            ),
+        )
         for field, expected, actual in overrides:
             if expected is not None and expected != actual:
                 report["errors"].append(f"pinned {field} mismatch")
                 if not report["failed"]:
                     report["verdict"], code = "ERROR", 2
-        binding_v4 = "unbound" if args.allow_unbound else "pinned" if pinned_v4 else "recomputed"
+        binding_v4 = (
+            "unbound" if args.allow_unbound else "pinned" if pinned_v4 else "recomputed"
+        )
         if binding_v4 != "recomputed":
             report["binding"] = binding_v4
-            report["verdict"] = report["verdict"].replace("binding=not-recomputed", "binding=" + binding_v4)
+            report["verdict"] = report["verdict"].replace(
+                "binding=not-recomputed", "binding=" + binding_v4
+            )
         if args.json:
             print(json.dumps(report, indent=2))
         else:
             print("required claims: " + ",".join(report["required_claims"]))
             for entry in report["per_claim"]:
-                print(f"  [{entry['status']:>18}] {entry['claim_id']} ({entry.get('evidence_class', '-')})")
+                print(
+                    f"  [{entry['status']:>18}] {entry['claim_id']} ({entry.get('evidence_class', '-')})"
+                )
             for message in report["failed"] + report["incomplete"] + report["errors"]:
                 print(f"  ! {message}")
         print(f"\nVERDICT: {report['verdict']}", file=sys.stderr)
@@ -866,8 +1044,9 @@ def main() -> int:
         # the expectation comes from the manifest and not from the record.
         expected_targets: tuple[str, ...] | None = None
         if args.manifest:
-            (manifest_required, obligation_kinds, claim_evidence,
-             claim_depends) = load_manifest(args.manifest)
+            (manifest_required, obligation_kinds, claim_evidence, claim_depends) = (
+                load_manifest(args.manifest)
+            )
             expected_targets = tuple(manifest_required)
             # --expect-manifest is an operator override for judging records against
             # a manifest this run is not holding; absent it the expectation is the
@@ -875,7 +1054,9 @@ def main() -> int:
             if args.expect_manifest is None:
                 args.expect_manifest = manifest_binding(args.manifest)
         if args.require is not None:
-            required = [claim.strip() for claim in args.require.split(",") if claim.strip()]
+            required = [
+                claim.strip() for claim in args.require.split(",") if claim.strip()
+            ]
             if not required:
                 print("ERROR: --require names no claims")
                 print("\nVERDICT: ERROR")
@@ -886,7 +1067,9 @@ def main() -> int:
             print("ERROR: pass --require or --manifest")
             print("\nVERDICT: ERROR")
             return 2
-        unknown_required = sorted(set(required) - set(obligation_kinds)) if args.manifest else []
+        unknown_required = (
+            sorted(set(required) - set(obligation_kinds)) if args.manifest else []
+        )
         if unknown_required:
             print(f"ERROR: required claims absent from manifest: {unknown_required}")
             print("\nVERDICT: ERROR")
@@ -899,8 +1082,11 @@ def main() -> int:
             for claim_id in list(required):
                 if obligation_kinds.get(claim_id) != "system_claim":
                     continue
-                added = [dependency for dependency in claim_depends.get(claim_id, ())
-                         if dependency not in required]
+                added = [
+                    dependency
+                    for dependency in claim_depends.get(claim_id, ())
+                    if dependency not in required
+                ]
                 if added:
                     dependency_expansion[claim_id] = added
                     required.extend(added)
@@ -919,7 +1105,9 @@ def main() -> int:
     # The report always names the freshness discipline that produced it: a pinned
     # or unbound run is not the same claim as a recomputed one.
     pinned = args.expect_snapshot is not None or args.expect_intent is not None
-    binding = "unbound" if args.allow_unbound else ("pinned" if pinned else DEFAULT_BINDING)
+    binding = (
+        "unbound" if args.allow_unbound else ("pinned" if pinned else DEFAULT_BINDING)
+    )
     if not args.allow_unbound:
         try:
             if args.expect_snapshot is None:
@@ -972,23 +1160,44 @@ def main() -> int:
         defects.extend(shared_artifact_defects(claim_id, record, cited))
         if defects:
             incomplete.append(f"{claim_id}: invalid record ({'; '.join(defects)})")
-            per_claim.append({"claim_id": claim_id, "status": "invalid", "defects": defects})
+            per_claim.append(
+                {"claim_id": claim_id, "status": "invalid", "defects": defects}
+            )
             continue
         evidence_class = record["evidence_class"]
         result = record["result"]
         assumed = _assumed_evidence(record)
         if result == "FAIL":
             failed.append(f"{claim_id}: {evidence_class} FAIL - {record['scope']}")
-            per_claim.append({"claim_id": claim_id, "status": "FAIL", "evidence_class": evidence_class})
+            per_claim.append(
+                {
+                    "claim_id": claim_id,
+                    "status": "FAIL",
+                    "evidence_class": evidence_class,
+                }
+            )
         elif result == "INCOMPLETE":
             incomplete.append(f"{claim_id}: record result INCOMPLETE")
-            per_claim.append({"claim_id": claim_id, "status": "INCOMPLETE", "evidence_class": evidence_class})
+            per_claim.append(
+                {
+                    "claim_id": claim_id,
+                    "status": "INCOMPLETE",
+                    "evidence_class": evidence_class,
+                }
+            )
         elif assumed and not record["waiver"]:
-            incomplete.append(f"{claim_id}: assumed or unverified evidence cannot PASS "
-                              f"without a waiver ({', '.join(assumed)})")
-            per_claim.append({"claim_id": claim_id, "status": "unwaived-assumption",
-                              "evidence_class": evidence_class,
-                              "assumed_evidence": assumed})
+            incomplete.append(
+                f"{claim_id}: assumed or unverified evidence cannot PASS "
+                f"without a waiver ({', '.join(assumed)})"
+            )
+            per_claim.append(
+                {
+                    "claim_id": claim_id,
+                    "status": "unwaived-assumption",
+                    "evidence_class": evidence_class,
+                    "assumed_evidence": assumed,
+                }
+            )
         else:
             if record["waiver"]:
                 waived.append(claim_id)
@@ -1006,7 +1215,9 @@ def main() -> int:
     elif incomplete:
         verdict, code = "INCOMPLETE", 3
     else:
-        profiles = sorted({by_claim[claim]["bindings"]["profile"] for claim in required})
+        profiles = sorted(
+            {by_claim[claim]["bindings"]["profile"] for claim in required}
+        )
         # The default discipline keeps the established token byte for byte; only a
         # weaker one qualifies it. A consumer pinned to VERIFIED[profile=...] thus
         # keeps reading recomputed runs and stops matching pinned or unbound ones,
@@ -1028,10 +1239,16 @@ def main() -> int:
         "binding": binding,
         "dependency_expansion": dependency_expansion,
         "required_claims": required,
-        "obligation_kinds": {claim: obligation_kinds[claim] for claim in required
-                             if claim in obligation_kinds},
-        "required_evidence": {claim: claim_evidence[claim] for claim in required
-                              if claim in claim_evidence},
+        "obligation_kinds": {
+            claim: obligation_kinds[claim]
+            for claim in required
+            if claim in obligation_kinds
+        },
+        "required_evidence": {
+            claim: claim_evidence[claim]
+            for claim in required
+            if claim in claim_evidence
+        },
         "per_claim": per_claim,
         "failed": failed,
         "incomplete": incomplete,
@@ -1042,7 +1259,9 @@ def main() -> int:
     else:
         print("required claims: " + ",".join(required))
         for entry in per_claim:
-            print(f"  [{entry['status']:>18}] {entry['claim_id']} ({entry.get('evidence_class', '-')})")
+            print(
+                f"  [{entry['status']:>18}] {entry['claim_id']} ({entry.get('evidence_class', '-')})"
+            )
         for message in failed + incomplete:
             print(f"  ! {message}")
     print(f"\nVERDICT: {verdict}", file=sys.stderr)

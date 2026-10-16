@@ -249,8 +249,20 @@ function ids(value: unknown, label: string, pattern = idPattern): string[] {
 		throw new Error(`${label} must be unique nonempty IDs`);
 	return value as string[];
 }
+async function canonicalTargetPath(realRoot: string, spec: string): Promise<string> {
+	const first = spec.split("/").find((component) => component !== "" && component !== ".");
+	if (!path.isAbsolute(spec) && first?.startsWith("~")) throw new Error("target_spec must not start with '~'");
+	const candidate = path.resolve(realRoot, spec);
+	const relative = path.relative(realRoot, candidate);
+	if (!validPath(relative)) throw new Error(`unsafe or escaping target_spec: ${spec}`);
+	if ((await fs.lstat(candidate)).isSymbolicLink()) throw new Error(`target_spec is a symlink: ${spec}`);
+	const canonical = path.relative(realRoot, await fs.realpath(candidate));
+	await safeSourcePath(realRoot, canonical);
+	return canonical;
+}
 export async function loadPolicy(root: string, policyPath: string, targetPath?: string): Promise<LoadedPolicy> {
 	const absolute = await safeSourcePath(root, policyPath);
+	const realRoot = await fs.realpath(root);
 	const policy = validatePolicy(parseJSON(await fs.readFile(absolute)));
 	const directories = new Set([
 		".",
@@ -281,7 +293,8 @@ export async function loadPolicy(root: string, policyPath: string, targetPath?: 
 			}
 		}
 	}
-	if (targetPath !== undefined && targetPath !== canonical)
+	canonical = await canonicalTargetPath(realRoot, canonical);
+	if (targetPath !== undefined && (await canonicalTargetPath(realRoot, targetPath)) !== canonical)
 		throw new Error("caller target differs from canonical dispatch target");
 	if (policy.intent_path !== canonical) throw new Error("policy intent_path differs from canonical dispatch target");
 	const intentBytes = await fs.readFile(await safeSourcePath(root, canonical));

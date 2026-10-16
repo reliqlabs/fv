@@ -29,6 +29,14 @@ from evidence_v4_fixture import (
     rewrite_json,
 )
 from fv_evidence_v4 import H
+from r38_evidence_v4_lifecycle import (
+    CANCEL_STDOUT,
+    CANCEL_STDERR,
+    cleanup_native_processes,
+    direct_group_signals_supported,
+    emit_before_cancellation,
+    owner_path,
+)
 
 DASHBOARD = REPO / "scripts" / "coverage_dashboard.py"
 
@@ -256,46 +264,97 @@ class CoverageV4(unittest.TestCase):
 
     def test_cancelled_actual_work_is_retained_and_counted_separately(self):
         with EvidenceV4Fixture() as fixture:
+            emit_before_cancellation(fixture)
             fixture.set_control(wait_for_gate="dashboard-cancel")
+            can_signal = direct_group_signals_supported()
             process = fixture.start_call(jobs=1)
-            deadline = time.monotonic() + 60
-            while not any(event["event"] == "started" for event in fixture.events()):
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    self.fail("actual gated recipe did not start")
-                time.sleep(0.01)
-            fixture.cancel(process)
-            result = fixture.finish_call(process)
-            self.assertEqual(result["result"], "CANCELLED", result)
-            self.assertIsNotNone(result["run"], result)
-            report, code = view(fixture, fixture.root / result["run"]["path"])
-            self.assertNotEqual(code, 0, report)
-            self.assertEqual(report["counts"]["logical_associations"], 2)
-            self.assertEqual(report["counts"]["unique_physical_executions"], 1)
-            self.assertEqual(report["counts"]["actual_dispatches"], 1)
-            diagnostic = {
-                "counts": report["counts"],
-                "verdict": report["verdict"],
-                "errors": report.get("errors"),
-                "per_claim": report["per_claim"],
-                "producer_work": result["manifest"]["work"],
-                "saved_claims": [
-                    {
-                        "claim_id": claim["claim_id"],
-                        "result": claim["result"],
-                        "executions": claim["executions"],
-                    }
-                    for claim in fixture.claims(result)
-                ],
-            }
-            self.assertEqual(
-                report["counts"]["cancelled_associations"],
-                2,
-                json.dumps(diagnostic, indent=2),
-            )
-            self.assertEqual(report["counts"]["failed_associations"], 0)
-            self.assertEqual(report["counts"]["error_associations"], 0)
-            self.assertTrue(all(row["status"] != "PASS" for row in report["rows"]))
-            self.assertEqual(fixture.count(), 1)
+            try:
+                deadline = time.monotonic() + 60
+                while not any(
+                    event["event"] == "started" for event in fixture.events()
+                ):
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        self.fail("actual gated recipe did not start")
+                    time.sleep(0.01)
+                fixture.cancel(process)
+                result = fixture.finish_call(process)
+                self.assertEqual(
+                    result["result"], "CANCELLED" if can_signal else "ERROR", result
+                )
+                self.assertIsNotNone(result["run"], result)
+                artifact = fixture.artifacts()[-1][1]
+                self.assertTrue(artifact["termination"]["cancelled"], artifact)
+                self.assertEqual(
+                    (fixture.root / artifact["stdout"]["path"]).read_bytes(),
+                    CANCEL_STDOUT,
+                )
+                self.assertEqual(
+                    (fixture.root / artifact["stderr"]["path"]).read_bytes(),
+                    CANCEL_STDERR,
+                )
+                if not can_signal:
+                    self.assertIn(
+                        "process-lifetime capability", result["reason"], result
+                    )
+                    self.assertTrue(
+                        any(
+                            window["state"] == "indeterminate"
+                            for window in artifact["ownership"]["spawn_windows"]
+                        ),
+                        artifact,
+                    )
+                    retained = load_json(owner_path(fixture.root))
+                    self.assertTrue(
+                        any(
+                            window["state"] == "indeterminate"
+                            for window in retained["spawn_windows"]
+                        ),
+                        retained,
+                    )
+                report, code = view(fixture, fixture.root / result["run"]["path"])
+                self.assertNotEqual(code, 0, report)
+                self.assertEqual(report["counts"]["logical_associations"], 2)
+                self.assertEqual(
+                    report["counts"]["unique_physical_executions"],
+                    1,
+                    {"report": report, "artifact": artifact, "result": result},
+                )
+                self.assertEqual(report["counts"]["actual_dispatches"], 1)
+                diagnostic = {
+                    "counts": report["counts"],
+                    "verdict": report["verdict"],
+                    "errors": report.get("errors"),
+                    "per_claim": report["per_claim"],
+                    "producer_work": result["manifest"]["work"],
+                    "saved_claims": [
+                        {
+                            "claim_id": claim["claim_id"],
+                            "result": claim["result"],
+                            "executions": claim["executions"],
+                        }
+                        for claim in fixture.claims(result)
+                    ],
+                }
+                self.assertEqual(
+                    report["counts"]["cancelled_associations"],
+                    2 if can_signal else 0,
+                    json.dumps(diagnostic, indent=2),
+                )
+                self.assertEqual(report["counts"]["failed_associations"], 0)
+                self.assertEqual(
+                    report["counts"]["error_associations"], 0 if can_signal else 2
+                )
+                self.assertTrue(all(row["status"] != "PASS" for row in report["rows"]))
+                self.assertEqual(fixture.count(), 1)
+            finally:
+                cleanup_native_processes(fixture.root)
+                if process.poll() is None:
+                    fixture.cancel(process)
+                    try:
+                        process.communicate(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
     def test_later_history_failure_blocks_an_older_stored_pass_for_all_members(self):
         with EvidenceV4Fixture() as fixture:

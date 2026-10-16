@@ -1,9 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { D, parseJSON, utf8Compare } from "./evidence-v4-model";
+import { D, H, parseJSON, utf8Compare } from "./evidence-v4-model";
 import type { PackageIdentity, ToolDiscovery } from "./evidence-v4-model";
 import type { AdapterContext, AdapterResult, CacheNamespaceSelection, ToolRoot } from "./evidence-v4-toolchain-common";
-import { probeText } from "./evidence-v4-toolchain-common";
+import { canonicalToolPath, probeText } from "./evidence-v4-toolchain-common";
 
 type Table = { [key: string]: Value };
 type Value = string | number | boolean | Value[] | Table;
@@ -208,7 +208,7 @@ async function exists(filename: string): Promise<boolean> {
 }
 async function requiredReal(filename: string): Promise<string> {
 	try {
-		return await fs.realpath(filename);
+		return await canonicalToolPath(filename);
 	} catch {
 		return fail(`missing installed path ${filename}`);
 	}
@@ -222,7 +222,7 @@ async function canonicalNamespace(filename: string): Promise<string> {
 		if (next === parent) fail("cannot canonicalize cache namespace");
 		parent = next;
 	}
-	return path.join(await fs.realpath(parent), ...missing);
+	return path.join(await canonicalToolPath(parent), ...missing);
 }
 function beneath(root: string, filename: string): boolean {
 	const rel = path.relative(root, filename);
@@ -285,7 +285,8 @@ function selection(subject: readonly string[]): Selection {
 	result.operation = subject[i++];
 	if (!["test", "build", "check", "run", "bench", "kani"].includes(result.operation))
 		fail(`unsupported Cargo subject operation ${result.operation}`);
-	if (result.operation === "test" || result.operation === "bench") result.profile = "test";
+	if (result.operation === "test") result.profile = "test";
+	if (result.operation === "bench") result.profile = "bench";
 	for (; i < subject.length; i++) {
 		const argument = subject[i];
 		if (argument === "--") break;
@@ -549,6 +550,7 @@ type MetadataPackage = {
 	dependencies: { name: string; kind: string | null }[];
 	attestationFeatures?: string[];
 	attestationDependencies?: string[];
+	attestationHost?: boolean;
 };
 type Metadata = {
 	packages: MetadataPackage[];
@@ -556,7 +558,10 @@ type Metadata = {
 	target_directory: string;
 	workspace_members: string[];
 	workspace_default_members: string[];
-	resolve: { root: string | null; nodes?: { id: string; deps: { pkg: string; dep_kinds: { kind: string | null }[] }[] }[] } | null;
+	resolve: {
+		root: string | null;
+		nodes?: { id: string; deps: { pkg: string; dep_kinds: { kind: string | null }[] }[] }[];
+	} | null;
 };
 function metadata(bytes: Buffer): Metadata {
 	const value = parseJSON(bytes) as Metadata;
@@ -732,7 +737,9 @@ async function applicationGraph(
 		"--edges",
 		selected.operation === "test" ||
 		selected.operation === "bench" ||
-		selected.selectors.some((x) => ["--tests", "--examples", "--benches", "--all-targets"].includes(x))
+		selected.selectors.some((x) =>
+			["--test", "--example", "--bench", "--tests", "--examples", "--benches", "--all-targets"].includes(x),
+		)
 			? "normal,build,dev"
 			: "normal,build",
 	];
@@ -757,11 +764,27 @@ async function applicationGraph(
 		graph.set(pkg.id, pkg);
 	}
 	if (!graph.size) fail("empty selected Cargo application graph");
-	const resolvedNodes = new Map((full.resolve?.nodes || []).map(node => [node.id, node]));
+	const resolvedNodes = new Map((full.resolve?.nodes || []).map((node) => [node.id, node]));
 	for (const pkg of graph.values()) {
 		const node = resolvedNodes.get(pkg.id);
-		if (node) pkg.attestationDependencies = node.deps.filter(dependency => graph.has(dependency.pkg) && dependency.dep_kinds.some(kind => kind.kind === null)).map(dependency => dependency.pkg).sort(utf8Compare);
+		if (node)
+			pkg.attestationDependencies = node.deps
+				.filter((dependency) => graph.has(dependency.pkg) && dependency.dep_kinds.some((kind) => kind.kind === null))
+				.map((dependency) => dependency.pkg)
+				.sort(utf8Compare);
 	}
+	const hostPackages = new Set<string>();
+	for (const pkg of graph.values()) {
+		if (pkg.targets.some((item) => item.kind.includes("proc-macro"))) hostPackages.add(pkg.id);
+		for (const dependency of resolvedNodes.get(pkg.id)?.deps || [])
+			if (graph.has(dependency.pkg) && dependency.dep_kinds.some((kind) => kind.kind === "build"))
+				hostPackages.add(dependency.pkg);
+	}
+	for (const id of hostPackages)
+		for (const dependency of resolvedNodes.get(id)?.deps || [])
+			if (graph.has(dependency.pkg) && dependency.dep_kinds.some((kind) => kind.kind === null || kind.kind === "build"))
+				hostPackages.add(dependency.pkg);
+	for (const id of hostPackages) graph.get(id)!.attestationHost = true;
 	const packages: PackageIdentity[] = [];
 	const packageDigests = new Map<PackageIdentity, string>();
 	const targetDirectory = path.resolve(full.target_directory);
@@ -949,7 +972,7 @@ const OPTIONAL_PROCESS_ABSENCE_PROBE = [
 	"if(!['darwin','linux'].includes(process.platform))throw Error('unsupported executable-search platform');",
 	"if(process.getuid()!==process.geteuid()||process.getgid()!==process.getegid())throw Error('indeterminate executable access identity');",
 	"if(!Object.hasOwn(process.env,'PATH'))throw Error('undeclared executable search path');",
-	"const name=process.argv[1];if(!/^[A-Za-z0-9_.+-]+$/.test(name)||name==='.'||name==='..')throw Error('unsupported optional process name');",
+	"if(!/^[A-Za-z0-9_.+-]+$/.test(name)||name==='.'||name==='..')throw Error('unsupported optional process name');",
 	"const hash=value=>'sha256:'+crypto.createHash('sha256').update(value,'utf8').digest('hex');",
 	"const cwd=process.cwd(),search=process.env.PATH,candidates=[];",
 	"for(const directory of search.split(':')){",
@@ -959,22 +982,56 @@ const OPTIONAL_PROCESS_ABSENCE_PROBE = [
 	"candidates.push({path_hash:hash(candidate),absent:true});}",
 	"console.log(JSON.stringify({platform:process.platform,cwd_hash:hash(cwd),path_hash:hash(search),candidates}));",
 ].join("\n");
-const OPTIONAL_PROCESS_OUTPUT = /^(?:\s*\.\s*arg\s*\(\s*"(?:[^"\\]|\\.)*"\s*\))*\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/;
+const OPTIONAL_PROCESS_OUTPUT =
+	/^(?:\s*\.\s*arg\s*\(\s*"(?:[^"\\]|\\.)*"\s*\))*\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/;
 
 async function bindOptionalProcessAbsence(
 	context: AdapterContext,
 	source: string,
 	command: string,
+	directory: string,
+	rustc: string,
 	executables: string[],
 	discovery: ToolDiscovery[],
 ): Promise<void> {
-	if (/\b(?:set_var|remove_var|set_current_dir)\s*\(/.test(source))
+	if (/\b(?:set_var|remove_var|set_current_dir)\b/.test(source))
 		fail("optional process lookup is changed by its build script");
 	if (!/^[A-Za-z0-9_.+-]+$/.test(command) || command === "." || command === "..")
 		fail("unsupported optional executable search selection");
 	if (!Object.hasOwn(context.effectiveEnv, "PATH")) fail("optional executable search requires a declared PATH");
-	const result = await context.probe([process.execPath, "-e", OPTIONAL_PROCESS_ABSENCE_PROBE, command]);
+	const packageCwd = beneath(context.root, directory);
+	if (!packageCwd && context.effectiveEnv.PATH.split(path.delimiter).some((entry) => !path.isAbsolute(entry)))
+		fail("external build-script optional process lookup requires absolute nonempty PATH entries");
+	// External cwd cannot be recorded; absolute PATH entries make lookup cwd-independent.
+	// Keep the selector inside the evaluated program, not in an executable operand.
+	const script = "const name=" + JSON.stringify(command) + ";\n" + OPTIONAL_PROCESS_ABSENCE_PROBE;
+	const result = await context.probe([process.execPath, "-e", script], {
+		cwd: packageCwd ? directory : context.cwd,
+		env: { ...context.effectiveEnv, RUSTC: rustc, CARGO_MANIFEST_DIR: directory },
+	});
 	if (result.code !== 0) fail("optional executable absence could not be established");
+	const cwd = packageCwd ? directory : context.cwd,
+		search = context.effectiveEnv.PATH;
+	const expected = {
+		platform: process.platform,
+		cwd_hash: H(Buffer.from(cwd)),
+		path_hash: H(Buffer.from(search)),
+		candidates: search.split(path.delimiter).map((directory) => ({
+			path_hash: H(
+				Buffer.from(
+					directory.startsWith("/")
+						? directory + "/" + command
+						: cwd + "/" + (directory ? directory + "/" : "") + command,
+				),
+			),
+			absent: true,
+		})),
+	};
+	if (
+		!result.stdout.length ||
+		D("optional-process-search", parseJSON(result.stdout)) !== D("optional-process-search", expected)
+	)
+		fail("optional executable absence probe did not report the selected search context");
 	discovery.push(result.identity);
 	if (!executables.includes(process.execPath)) executables.push(process.execPath);
 }
@@ -982,17 +1039,22 @@ function cargoRustcSelector(source: string, selector: string, offset: number): b
 	const prefix = source.slice(0, offset);
 	const consumer = "\\s*;\\s*let\\s+(?:mut\\s+)?[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*$";
 	const binding = "\\blet\\s+" + selector + "\\s*=\\s*";
-	if (new RegExp(binding + "(?:std::)?env::var(?:_os)?\\(\\s*\"RUSTC\"\\s*\\)\\s*\\?" + consumer).test(prefix))
+	if (new RegExp(binding + '(?:std::)?env::var(?:_os)?\\(\\s*"RUSTC"\\s*\\)\\s*\\?' + consumer).test(prefix))
 		return true;
-	const accessor = new RegExp(binding + "([A-Za-z_][A-Za-z0-9_]*)\\(\\s*\"RUSTC\"\\s*\\)" + consumer).exec(prefix);
+	const accessor = new RegExp(binding + '([A-Za-z_][A-Za-z0-9_]*)\\(\\s*"RUSTC"\\s*\\)' + consumer).exec(prefix);
 	if (!accessor) return false;
 	const name = accessor[1];
-	if ([...source.matchAll(new RegExp("\\bfn\\s+" + name + "\\s*\\(", "g"))].length !== 1 ||
-		new RegExp("\\blet\\s+(?:mut\\s+)?" + name + "\\b").test(source)) return false;
+	if (
+		[...source.matchAll(new RegExp("\\bfn\\s+" + name + "\\s*\\(", "g"))].length !== 1 ||
+		new RegExp("\\blet\\s+(?:mut\\s+)?" + name + "\\b").test(source)
+	)
+		return false;
 	// The accessor's successful result is exactly the requested Cargo variable.
 	// Its closure is reached only when that mandatory variable is absent.
 	const definition = new RegExp(
-		"\\bfn\\s+" + name + "\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*&\\s*str\\s*\\)\\s*->\\s*(?:std::ffi::)?OsString\\s*\\{\\s*(?:std::)?env::var_os\\(\\s*\\1\\s*\\)\\s*\\.\\s*unwrap_or_else\\(\\s*\\|\\s*\\|\\s*\\{[\\s\\S]*?\\}\\s*\\)\\s*\\}",
+		"\\bfn\\s+" +
+			name +
+			"\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*&\\s*str\\s*\\)\\s*->\\s*(?:std::ffi::)?OsString\\s*\\{\\s*(?:std::)?env::var_os\\(\\s*\\1\\s*\\)\\s*\\.\\s*unwrap_or_else\\(\\s*\\|\\s*\\|\\s*\\{[\\s\\S]*?\\}\\s*\\)\\s*\\}",
 	);
 	return definition.test(source);
 }
@@ -1002,18 +1064,31 @@ function rebuildOnlyScript(source: string): boolean {
 	const token = /[A-Za-z_][A-Za-z0-9_]*|[(){}!;,]|"(?:[^"\\\r\n]|\\.)*"/y;
 	function next(): string | null {
 		while (offset < source.length) {
-			if (/\s/.test(source[offset])) { offset++; continue; }
+			if (/\s/.test(source[offset])) {
+				offset++;
+				continue;
+			}
 			if (source.startsWith("//", offset)) {
-				const end = source.indexOf("\n", offset + 2); offset = end < 0 ? source.length : end + 1; continue;
+				const end = source.indexOf("\n", offset + 2);
+				offset = end < 0 ? source.length : end + 1;
+				continue;
 			}
 			if (source.startsWith("/*", offset)) {
-				let depth = 1; offset += 2;
+				let depth = 1;
+				offset += 2;
 				while (offset < source.length && depth) {
-					if (source.startsWith("/*", offset)) { depth++; offset += 2; }
-					else if (source.startsWith("*/", offset)) { depth--; offset += 2; }
-					else offset++;
+					if (source.startsWith("/*", offset)) {
+						depth++;
+						offset += 2;
+					} else if (source.startsWith("*/", offset)) {
+						depth--;
+						offset += 2;
+					} else offset++;
 				}
-				if (depth) { valid = false; return null; }
+				if (depth) {
+					valid = false;
+					return null;
+				}
 				continue;
 			}
 			break;
@@ -1021,7 +1096,10 @@ function rebuildOnlyScript(source: string): boolean {
 		if (offset === source.length) return null;
 		token.lastIndex = offset;
 		const match = token.exec(source);
-		if (!match) { valid = false; return null; }
+		if (!match) {
+			valid = false;
+			return null;
+		}
 		offset = token.lastIndex;
 		return match[0];
 	}
@@ -1032,9 +1110,17 @@ function rebuildOnlyScript(source: string): boolean {
 		const literal = next();
 		if (!literal?.startsWith('"')) return false;
 		let directive: unknown;
-		try { directive = parseJSON(Buffer.from(literal, "utf8")); } catch { return false; }
-		if (typeof directive !== "string" || /[{}\x00-\x1f\x7f]/.test(directive) ||
-			!/^cargo::?rerun-if-(?:changed|env-changed)=.+$/.test(directive)) return false;
+		try {
+			directive = parseJSON(Buffer.from(literal, "utf8"));
+		} catch {
+			return false;
+		}
+		if (
+			typeof directive !== "string" ||
+			/[{}\x00-\x1f\x7f]/.test(directive) ||
+			!/^cargo::?rerun-if-(?:changed|env-changed)=.+$/.test(directive)
+		)
+			return false;
 		current = next();
 		if (current === ",") current = next();
 		if (current !== ")" || next() !== ";") return false;
@@ -1043,72 +1129,123 @@ function rebuildOnlyScript(source: string): boolean {
 	return next() === null && valid && offset === source.length;
 }
 
-function hasNativeSourceLinkage(source: string): boolean {
+function rustSourceCode(source: string): string | null {
 	const rawString = /(?:b|c)?r(#{0,255})"/y;
 	const character = /'(?:[^'\\\r\n]|\\(?:[nrt0\\'"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}))'/uy;
-	const linkage = /\b(?:link|link_args)\s*(?:\(|=)|\binclude\s*!|#\s*\[\s*path\s*=/y;
-	let offset = 0;
+	let offset = 0,
+		copied = 0,
+		code = "";
 	while (offset < source.length) {
+		const start = offset;
 		if (source.startsWith("//", offset)) {
-			const end = source.indexOf("\n", offset + 2); offset = end < 0 ? source.length : end + 1; continue;
-		}
-		if (source.startsWith("/*", offset)) {
-			let depth = 1; offset += 2;
+			const end = source.indexOf("\n", offset + 2);
+			offset = end < 0 ? source.length : end + 1;
+		} else if (source.startsWith("/*", offset)) {
+			let depth = 1;
+			offset += 2;
 			while (offset < source.length && depth) {
-				if (source.startsWith("/*", offset)) { depth++; offset += 2; }
-				else if (source.startsWith("*/", offset)) { depth--; offset += 2; }
-				else offset++;
+				if (source.startsWith("/*", offset)) {
+					depth++;
+					offset += 2;
+				} else if (source.startsWith("*/", offset)) {
+					depth--;
+					offset += 2;
+				} else offset++;
 			}
-			if (depth) return true;
-			continue;
-		}
-		const value = source[offset];
-		if (value === "r" || value === "b" || value === "c") {
+			if (depth) return null;
+		} else {
 			rawString.lastIndex = offset;
-			const start = rawString.exec(source);
-			if (start) {
-				const closing = '"' + start[1]; const end = source.indexOf(closing, rawString.lastIndex);
-				if (end < 0) return true;
-				offset = end + closing.length; continue;
+			const raw = rawString.exec(source);
+			if (raw) {
+				const closing = '"' + raw[1],
+					end = source.indexOf(closing, rawString.lastIndex);
+				if (end < 0) return null;
+				offset = end + closing.length;
+			} else if (source[offset] === '"') {
+				offset++;
+				while (offset < source.length && source[offset] !== '"') offset += source[offset] === "\\" ? 2 : 1;
+				if (offset >= source.length) return null;
+				offset++;
+			} else if (source[offset] === "'" && ((character.lastIndex = offset), character.test(source))) {
+				offset = character.lastIndex;
+			} else {
+				offset++;
+				continue;
 			}
 		}
-		if (value === '"') {
-			offset++;
-			while (offset < source.length && source[offset] !== '"') offset += source[offset] === "\\" ? 2 : 1;
-			if (offset >= source.length) return true;
-			offset++; continue;
-		}
-		if (value === "'") {
-			character.lastIndex = offset;
-			if (character.test(source)) { offset = character.lastIndex; continue; }
-		}
-		if (value === "l" || value === "i" || value === "#") {
-			linkage.lastIndex = offset;
-			if (linkage.test(source)) return true;
-		}
-		offset++;
+		code += source.slice(copied, start) + " ".repeat(offset - start);
+		copied = offset;
+	}
+	return code + source.slice(copied);
+}
+function hasNativeSourceLinkage(source: string, sourceLinksOnly = false, target = ""): boolean {
+	const code = rustSourceCode(source);
+	if (code === null) return true;
+	for (const match of code.matchAll(/\b(?:link|link_args)\s*(?:\(|=)|\binclude\s*!|#\s*\[\s*path\s*=/g)) {
+		if (!sourceLinksOnly) return true;
+		if (!/^link(?:_args)?\b/.test(match[0])) continue;
+		const attribute =
+			/^link\s*\(\s*name\s*=\s*"([A-Za-z0-9_.+-]+)"\s*(?:,\s*kind\s*=\s*"(framework|dylib)"\s*)?\)/.exec(
+				source.slice(match.index),
+			);
+		if (!attribute) return true;
+		if (attribute[2] === "framework" && target.endsWith("-apple-darwin")) continue;
+		if (
+			["c", "m", "pthread", "dl", "rt", "util", "resolv", "objc", "c++"].includes(attribute[1]) &&
+			(!attribute[2] || attribute[2] === "dylib")
+		)
+			continue;
+		return true;
 	}
 	return false;
 }
-async function assertNoPackageLinkDirectives(pkg: MetadataPackage, roots: readonly ToolRoot[]): Promise<void> {
+// These complete source snapshots place their Windows imports behind cfg(windows).
+const REVIEWED_NONWINDOWS_LINK_SOURCES: Record<string, string> = {
+	"find-msvc-tools@0.1.9": "sha256:ef2beb3ec38bff67c6b8ef8a70d6a28818e73f7a4cc3abd0df7b008f03f7c874",
+	"find-msvc-tools@0.1.14": "sha256:22a3bba4a8a60d3a521757fdfa5cd9891d73695f65ab18da8ec9c549732902ad",
+	"jobserver@0.1.34": "sha256:059bd857a7d7234832e7e498693765a9cdd3cf3f1c296701452b6fbd0fc23d5f",
+	"jobserver@0.1.35": "sha256:a63c9defad34cac7f2d136298777c0a5709f905bcbe0bfb2089e76a96feb1ea5",
+	"cmake@0.1.58": "sha256:1a8c1153c631ffd5a0ca9ebbf73d1a6dcda592e978824b85cbbde94eacea2864",
+};
+async function assertNoPackageLinkDirectives(
+	pkg: MetadataPackage,
+	roots: readonly ToolRoot[],
+	sourceLinksOnly = false,
+	target = "",
+	unmodifiedTargetCfg = true,
+): Promise<void> {
 	const directory = await requiredReal(path.dirname(pkg.manifest_path));
-	const view = roots.find(root => root.label.startsWith("packages/") && root.path === directory);
+	const view = roots.find((root) => root.label.startsWith("packages/") && root.path === directory);
 	if (!view) fail("missing source root for links-only package " + pkg.name);
+	const reviewed =
+		sourceLinksOnly &&
+		unmodifiedTargetCfg &&
+		pkg.source === "registry+https://github.com/rust-lang/crates.io-index" &&
+		/(?:-apple-darwin|-unknown-linux-(?:gnu|musl))$/.test(target)
+			? REVIEWED_NONWINDOWS_LINK_SOURCES[pkg.name + "@" + pkg.version]
+			: undefined;
+	const files: [string, string][] = reviewed ? [["Cargo.toml", H(await fs.readFile(pkg.manifest_path))]] : [];
 	const pending = [{ directory, relative: "" }];
 	while (pending.length) {
 		const current = pending.pop()!;
 		for (const entry of await fs.readdir(current.directory, { withFileTypes: true })) {
 			const relative = current.relative ? current.relative + "/" + entry.name : entry.name;
-			if (view.exclude?.some(excluded => relative === excluded || relative.startsWith(excluded + "/"))) continue;
+			if (view.exclude?.some((excluded) => relative === excluded || relative.startsWith(excluded + "/"))) continue;
 			const filename = path.join(current.directory, entry.name);
 			if (entry.isSymbolicLink()) fail("indeterminate links-only package source alias in " + pkg.name);
 			if (entry.isDirectory()) pending.push({ directory: filename, relative });
 			else if (entry.isFile() && entry.name.endsWith(".rs")) {
 				const rust = await readText(filename);
-				if (hasNativeSourceLinkage(rust))
+				if (reviewed) files.push([relative, H(Buffer.from(rust))]);
+				if (hasNativeSourceLinkage(rust, sourceLinksOnly, target) && !reviewed)
 					fail("unresolved Rust-source native linkage in " + pkg.name);
 			}
 		}
+	}
+	if (reviewed) {
+		files.sort((a, b) => utf8Compare(a[0], b[0]));
+		if (H(Buffer.from(JSON.stringify(files))) !== reviewed)
+			fail("unreviewed cfg-gated native linkage source in " + pkg.name);
 	}
 }
 type MetadataToken = { text: string; literal?: string };
@@ -1118,24 +1255,41 @@ function metadataScriptTokens(source: string): MetadataToken[] | null {
 	const pattern = /"(?:[^"\\\r\n]|\\.)*"|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|::|->|==|!=|&&|\|\||=>|[{}()[\].,:;!&|=<>+?*-]/y;
 	let offset = 0;
 	while (offset < source.length) {
-		if (/\s/.test(source[offset])) { offset++; continue; }
-		if (source.startsWith("//", offset)) { const end = source.indexOf("\n", offset + 2); offset = end < 0 ? source.length : end + 1; continue; }
+		if (/\s/.test(source[offset])) {
+			offset++;
+			continue;
+		}
+		if (source.startsWith("//", offset)) {
+			const end = source.indexOf("\n", offset + 2);
+			offset = end < 0 ? source.length : end + 1;
+			continue;
+		}
 		if (source.startsWith("/*", offset)) {
-			let depth = 1; offset += 2;
+			let depth = 1;
+			offset += 2;
 			while (offset < source.length && depth) {
-				if (source.startsWith("/*", offset)) { depth++; offset += 2; }
-				else if (source.startsWith("*/", offset)) { depth--; offset += 2; }
-				else offset++;
+				if (source.startsWith("/*", offset)) {
+					depth++;
+					offset += 2;
+				} else if (source.startsWith("*/", offset)) {
+					depth--;
+					offset += 2;
+				} else offset++;
 			}
 			if (depth) return null;
 			continue;
 		}
 		pattern.lastIndex = offset;
-		const match = pattern.exec(source); if (!match) return null;
+		const match = pattern.exec(source);
+		if (!match) return null;
 		offset = pattern.lastIndex;
 		if (match[0].startsWith('"')) {
 			let literal: unknown;
-			try { literal = parseJSON(Buffer.from(match[0], "utf8")); } catch { return null; }
+			try {
+				literal = parseJSON(Buffer.from(match[0], "utf8"));
+			} catch {
+				return null;
+			}
 			if (typeof literal !== "string" || /[\x00-\x1f\x7f]/.test(literal)) return null;
 			tokens.push({ text: JSON.stringify(literal), literal });
 		} else tokens.push({ text: match[0] });
@@ -1146,8 +1300,12 @@ function tokenPattern(tokens: readonly MetadataToken[], pattern: readonly string
 	if (tokens.length !== pattern.length) return null;
 	const captured = new Map<string, MetadataToken>();
 	for (let index = 0; index < pattern.length; index++) {
-		const expected = pattern[index], actual = tokens[index];
-		if (!expected.startsWith("$")) { if (actual.text !== expected) return null; continue; }
+		const expected = pattern[index],
+			actual = tokens[index];
+		if (!expected.startsWith("$")) {
+			if (actual.text !== expected) return null;
+			continue;
+		}
 		const previous = captured.get(expected);
 		if (previous && previous.text !== actual.text) return null;
 		captured.set(expected, actual);
@@ -1162,39 +1320,131 @@ function tokenBlockEnd(tokens: readonly MetadataToken[], start: number): number 
 	}
 	return -1;
 }
+function targetConditionValue(
+	tokens: readonly MetadataToken[],
+	configuration: ReadonlyMap<string, string[]>,
+): boolean | undefined {
+	let position = 0;
+	let valid = true;
+	function primary(): boolean | undefined {
+		const current = tokens[position]?.text;
+		if (current === "true" || current === "false") {
+			position++;
+			return current === "true";
+		}
+		if (current === "(") {
+			position++;
+			const result = disjunction();
+			if (tokens[position++]?.text !== ")") valid = false;
+			return result;
+		}
+		const start = position;
+		if (tokens[position]?.text === "std" && tokens[position + 1]?.text === "::") position += 2;
+		const comparison = tokenPattern(tokens.slice(position, position + 15), [
+			"env",
+			"::",
+			"var",
+			"(",
+			"$name",
+			")",
+			".",
+			"as_deref",
+			"(",
+			")",
+			"==",
+			"Ok",
+			"(",
+			"$value",
+			")",
+		]);
+		const name = comparison?.get("$name")?.literal,
+			value = comparison?.get("$value")?.literal;
+		if (!name || value === undefined || !/^CARGO_CFG_TARGET_(?:OS|ENV|ARCH|VENDOR|ENDIAN|POINTER_WIDTH)$/.test(name)) {
+			position = start;
+			valid = false;
+			return undefined;
+		}
+		position += 15;
+		const values = configuration.get(name.slice("CARGO_CFG_".length).toLowerCase());
+		return values?.length === 1 ? values[0] === value : undefined;
+	}
+	function unary(): boolean | undefined {
+		if (tokens[position]?.text !== "!") return primary();
+		position++;
+		const result = unary();
+		return result === undefined ? undefined : !result;
+	}
+	function equality(): boolean | undefined {
+		let result = unary();
+		while (valid && ["==", "!="].includes(tokens[position]?.text)) {
+			const operator = tokens[position++].text,
+				right = unary();
+			result =
+				result === undefined || right === undefined
+					? undefined
+					: operator === "=="
+						? result === right
+						: result !== right;
+		}
+		return result;
+	}
+	function conjunction(): boolean | undefined {
+		let result = equality();
+		while (valid && tokens[position]?.text === "&&") {
+			position++;
+			const right = equality();
+			result = result === undefined || right === undefined ? undefined : result && right;
+		}
+		return result;
+	}
+	function disjunction(): boolean | undefined {
+		let result = conjunction();
+		while (valid && tokens[position]?.text === "||") {
+			position++;
+			const right = conjunction();
+			result = result === undefined || right === undefined ? undefined : result || right;
+		}
+		return result;
+	}
+	const result = disjunction();
+	return valid && position === tokens.length ? result : undefined;
+}
 async function metadataForwardingProvider(
-	context: AdapterContext, pkg: MetadataPackage, source: string, packages: ReadonlyMap<string, MetadataPackage>,
-	rustc: string, target: string, discovery: ToolDiscovery[],
+	context: AdapterContext,
+	pkg: MetadataPackage,
+	source: string,
+	packages: ReadonlyMap<string, MetadataPackage>,
+	rustc: string,
+	target: string,
+	discovery: ToolDiscovery[],
 ): Promise<string | null> {
-	if (!pkg.attestationDependencies || Object.keys(context.effectiveEnv).some(name => name.startsWith("DEP_"))) return null;
-	const original = metadataScriptTokens(source); if (!original) return null;
+	if (!pkg.attestationDependencies || Object.keys(context.effectiveEnv).some((name) => name.startsWith("DEP_")))
+		return null;
+	const original = metadataScriptTokens(source);
+	if (!original) return null;
 	const disabled = new Set<number>();
 	let targetConfiguration: Map<string, string[]> | undefined;
 	for (let index = 0; index < original.length; index++) {
 		if (original[index].text !== "if") continue;
-		let opening = index + 1; while (opening < original.length && original[opening].text !== "{") opening++;
+		let opening = index + 1;
+		while (opening < original.length && original[opening].text !== "{") opening++;
 		if (opening === original.length) return null;
 		const condition = original.slice(index + 1, opening);
-		if (condition.some(token => token.text === "||" || token.text === "!")) continue;
-		let impossible = false;
-		for (let offset = 0; offset + 13 < condition.length; offset++) {
-			const equality = tokenPattern(condition.slice(offset, offset + 14), ["env", "::", "var", "(", "$name", ")", ".", "as_deref", "(", ")", "==", "Ok", "(", "$value"]);
-			if (!equality || condition[offset + 14]?.text !== ")") continue;
-			const name = equality.get("$name")?.literal, value = equality.get("$value")?.literal;
-			if (!name || value === undefined || !/^CARGO_CFG_TARGET_(?:OS|ENV|ARCH|VENDOR|ENDIAN|POINTER_WIDTH)$/.test(name)) continue;
-			if (!targetConfiguration) {
-				const actual = await context.probe([rustc, "--print", "cfg", "--target", target]); discovery.push(actual.identity);
-				targetConfiguration = new Map();
-				for (const line of probeText(actual).split(/\r?\n/)) {
-					const field = /^([a-z_]+)="([^"]*)"$/.exec(line); if (!field) continue;
-					const values = targetConfiguration.get(field[1]); if (values) values.push(field[2]); else targetConfiguration.set(field[1], [field[2]]);
-				}
+		if (!targetConfiguration) {
+			const actual = await context.probe([rustc, "--print", "cfg", "--target", target]);
+			discovery.push(actual.identity);
+			targetConfiguration = new Map();
+			for (const line of probeText(actual).split(/\r?\n/)) {
+				const field = /^([a-z_]+)="([^"]*)"$/.exec(line);
+				if (!field) continue;
+				const values = targetConfiguration.get(field[1]);
+				if (values) values.push(field[2]);
+				else targetConfiguration.set(field[1], [field[2]]);
 			}
-			const values = targetConfiguration.get(name.slice("CARGO_CFG_".length).toLowerCase());
-			if (values?.length === 1 && values[0] !== value) impossible = true;
 		}
-		if (impossible) {
-			const closing = tokenBlockEnd(original, opening); if (closing < 0) return null;
+		if (targetConditionValue(condition, targetConfiguration) === false) {
+			const closing = tokenBlockEnd(original, opening);
+			if (closing < 0) return null;
 			for (let offset = opening + 1; offset < closing; offset++) disabled.add(offset);
 			index = closing;
 		}
@@ -1203,78 +1453,588 @@ async function metadataForwardingProvider(
 	const functions: MetadataFunction[] = [];
 	let position = 0;
 	while (position < tokens.length) {
-		if (tokenPattern(tokens.slice(position, position + 5), ["use", "std", "::", "env", ";"])) { position += 5; continue; }
+		if (tokenPattern(tokens.slice(position, position + 5), ["use", "std", "::", "env", ";"])) {
+			position += 5;
+			continue;
+		}
 		if (tokens[position++].text !== "fn") return null;
-		const name = tokens[position++]?.text; if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || tokens[position++]?.text !== "(") return null;
+		const name = tokens[position++]?.text;
+		if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || tokens[position++]?.text !== "(") return null;
 		const parameters: string[] = [];
 		while (tokens[position]?.text !== ")") {
 			const argument = tokens[position++]?.text;
-			if (!argument || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(argument) || tokens[position++]?.text !== ":" || tokens[position++]?.text !== "&" || tokens[position++]?.text !== "str") return null;
+			if (
+				!argument ||
+				!/^[A-Za-z_][A-Za-z0-9_]*$/.test(argument) ||
+				tokens[position++]?.text !== ":" ||
+				tokens[position++]?.text !== "&" ||
+				tokens[position++]?.text !== "str"
+			)
+				return null;
 			parameters.push(argument);
-			if (tokens[position]?.text === ",") position++; else if (tokens[position]?.text !== ")") return null;
+			if (tokens[position]?.text === ",") position++;
+			else if (tokens[position]?.text !== ")") return null;
 		}
-		position++; if (tokens[position]?.text !== "{") return null;
-		const end = tokenBlockEnd(tokens, position); if (end < 0) return null;
-		functions.push({ name, parameters, body: tokens.slice(position + 1, end) }); position = end + 1;
+		position++;
+		if (tokens[position]?.text !== "{") return null;
+		const end = tokenBlockEnd(tokens, position);
+		if (end < 0) return null;
+		functions.push({ name, parameters, body: tokens.slice(position + 1, end) });
+		position = end + 1;
 	}
-	if (functions.length !== 3 || new Set(functions.map(fn => fn.name)).size !== 3) return null;
-	const main = functions.find(fn => fn.name === "main" && !fn.parameters.length);
-	const collector = functions.find(fn => fn.parameters.length === 1);
-	const forwarder = functions.find(fn => fn.parameters.length === 3);
+	if (functions.length !== 3 || new Set(functions.map((fn) => fn.name)).size !== 3) return null;
+	const main = functions.find((fn) => fn.name === "main" && !fn.parameters.length);
+	const collector = functions.find((fn) => fn.parameters.length === 1);
+	const forwarder = functions.find((fn) => fn.parameters.length === 3);
 	if (!main || !collector || !forwarder) return null;
 	const [selectedParameter, nameParameter, valueParameter] = forwarder.parameters;
-	const forwardedKey = forwarder.body[17]?.text, diagnostic = forwarder.body[10];
+	const forwardedKey = forwarder.body[17]?.text,
+		diagnostic = forwarder.body[10];
 	if (!forwardedKey || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(forwardedKey) || diagnostic?.literal === undefined) return null;
-	const forwarding = ["assert", "!", "(", "!", selectedParameter, ".", "is_empty", "(", ")", ",", diagnostic.text, ")", ";", "if", "let", "Some", "(", forwardedKey, ")", "=", nameParameter, ".", "strip_prefix", "(", selectedParameter, ")", "{", "eprintln", "!", "(", JSON.stringify("cargo:rerun-if-env-changed={" + nameParameter + "}"), ")", ";", "let", forwardedKey, "=", forwardedKey, ".", "to_lowercase", "(", ")", ";", "println", "!", "(", JSON.stringify("cargo:{" + forwardedKey + "}={" + valueParameter + "}"), ")", ";", "}"];
+	const forwarding = [
+		"assert",
+		"!",
+		"(",
+		"!",
+		selectedParameter,
+		".",
+		"is_empty",
+		"(",
+		")",
+		",",
+		diagnostic.text,
+		")",
+		";",
+		"if",
+		"let",
+		"Some",
+		"(",
+		forwardedKey,
+		")",
+		"=",
+		nameParameter,
+		".",
+		"strip_prefix",
+		"(",
+		selectedParameter,
+		")",
+		"{",
+		"eprintln",
+		"!",
+		"(",
+		JSON.stringify("cargo:rerun-if-env-changed={" + nameParameter + "}"),
+		")",
+		";",
+		"let",
+		forwardedKey,
+		"=",
+		forwardedKey,
+		".",
+		"to_lowercase",
+		"(",
+		")",
+		";",
+		"println",
+		"!",
+		"(",
+		JSON.stringify("cargo:{" + forwardedKey + "}={" + valueParameter + "}"),
+		")",
+		";",
+		"}",
+	];
 	if (!tokenPattern(forwarder.body, forwarding)) return null;
-	const carrier = tokenPattern(collector.body, ["let", "$prefix", "=", "if", collector.parameters[0], "==", "$dependency", "{", "$firstPrefix", "}", "else", "{", "$secondPrefix", "}", ";", "let", "mut", "$selected", "=", "String", "::", "default", "(", ")", ";", "let", "mut", "$candidates", "=", "vec", "!", "[", "]", ";", "for", "(", "$name", ",", "$value", ")", "in", "std", "::", "env", "::", "vars", "(", ")", "{", "if", "!", "$selected", ".", "is_empty", "(", ")", "{", forwarder.name, "(", "&", "$selected", ",", "&", "$name", ",", "&", "$value", ")", ";", "continue", ";", "}", "if", "let", "Some", "(", "$version", ")", "=", "$name", ".", "strip_prefix", "(", "$prefix", ")", "{", "if", "let", "Some", "(", "$version", ")", "=", "$version", ".", "strip_suffix", "(", JSON.stringify("_INCLUDE"), ")", "{", "$selected", "=", "format", "!", "(", "$selectedFormat", ")", ";", forwarder.name, "(", "&", "$selected", ",", "&", "$name", ",", "&", "$value", ")", ";", "}", "else", "{", "$candidates", ".", "push", "(", "(", "$name", ",", "$value", ")", ")", ";", "}", "}", "}", "assert", "!", "(", "!", "$selected", ".", "is_empty", "(", ")", ",", "$missing", ")", ";", "for", "(", "$name", ",", "$value", ")", "in", "$candidates", "{", forwarder.name, "(", "&", "$selected", ",", "&", "$name", ",", "&", "$value", ")", ";", "}"]);
+	const carrier = tokenPattern(collector.body, [
+		"let",
+		"$prefix",
+		"=",
+		"if",
+		collector.parameters[0],
+		"==",
+		"$dependency",
+		"{",
+		"$firstPrefix",
+		"}",
+		"else",
+		"{",
+		"$secondPrefix",
+		"}",
+		";",
+		"let",
+		"mut",
+		"$selected",
+		"=",
+		"String",
+		"::",
+		"default",
+		"(",
+		")",
+		";",
+		"let",
+		"mut",
+		"$candidates",
+		"=",
+		"vec",
+		"!",
+		"[",
+		"]",
+		";",
+		"for",
+		"(",
+		"$name",
+		",",
+		"$value",
+		")",
+		"in",
+		"std",
+		"::",
+		"env",
+		"::",
+		"vars",
+		"(",
+		")",
+		"{",
+		"if",
+		"!",
+		"$selected",
+		".",
+		"is_empty",
+		"(",
+		")",
+		"{",
+		forwarder.name,
+		"(",
+		"&",
+		"$selected",
+		",",
+		"&",
+		"$name",
+		",",
+		"&",
+		"$value",
+		")",
+		";",
+		"continue",
+		";",
+		"}",
+		"if",
+		"let",
+		"Some",
+		"(",
+		"$version",
+		")",
+		"=",
+		"$name",
+		".",
+		"strip_prefix",
+		"(",
+		"$prefix",
+		")",
+		"{",
+		"if",
+		"let",
+		"Some",
+		"(",
+		"$version",
+		")",
+		"=",
+		"$version",
+		".",
+		"strip_suffix",
+		"(",
+		JSON.stringify("_INCLUDE"),
+		")",
+		"{",
+		"$selected",
+		"=",
+		"format",
+		"!",
+		"(",
+		"$selectedFormat",
+		")",
+		";",
+		forwarder.name,
+		"(",
+		"&",
+		"$selected",
+		",",
+		"&",
+		"$name",
+		",",
+		"&",
+		"$value",
+		")",
+		";",
+		"}",
+		"else",
+		"{",
+		"$candidates",
+		".",
+		"push",
+		"(",
+		"(",
+		"$name",
+		",",
+		"$value",
+		")",
+		")",
+		";",
+		"}",
+		"}",
+		"}",
+		"assert",
+		"!",
+		"(",
+		"!",
+		"$selected",
+		".",
+		"is_empty",
+		"(",
+		")",
+		",",
+		"$missing",
+		")",
+		";",
+		"for",
+		"(",
+		"$name",
+		",",
+		"$value",
+		")",
+		"in",
+		"$candidates",
+		"{",
+		forwarder.name,
+		"(",
+		"&",
+		"$selected",
+		",",
+		"&",
+		"$name",
+		",",
+		"&",
+		"$value",
+		")",
+		";",
+		"}",
+	]);
 	if (!carrier) return null;
-	for (const name of ["$prefix", "$selected", "$candidates", "$name", "$value", "$version"]) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(carrier.get(name)!.text)) return null;
-	if (carrier.get("$selectedFormat")?.literal !== "{" + carrier.get("$prefix")!.text + "}{" + carrier.get("$version")!.text + "}_" || carrier.get("$missing")?.literal === undefined) return null;
-	const permittedCalls: Record<string, true> = { cfg: true, assert: true, panic: true, println: true, eprintln: true, var: true, contains: true, as_deref: true, is_ok_and: true, Some: true, Ok: true, unwrap: true, if: true, while: true, match: true };
+	for (const name of ["$prefix", "$selected", "$candidates", "$name", "$value", "$version"])
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(carrier.get(name)!.text)) return null;
+	if (
+		carrier.get("$selectedFormat")?.literal !==
+			"{" + carrier.get("$prefix")!.text + "}{" + carrier.get("$version")!.text + "}_" ||
+		carrier.get("$missing")?.literal === undefined
+	)
+		return null;
+	const permittedCalls: Record<string, true> = {
+		cfg: true,
+		assert: true,
+		panic: true,
+		println: true,
+		eprintln: true,
+		var: true,
+		contains: true,
+		as_deref: true,
+		is_ok_and: true,
+		Some: true,
+		Ok: true,
+		unwrap: true,
+		if: true,
+		while: true,
+		match: true,
+	};
 	let dependencyName: string | undefined;
 	let dependencyVariable: string | undefined;
 	for (let index = 0; index < main.body.length; index++) {
 		const item = main.body[index];
-		if (item.text === "fn" || item.text === "use" || ["unsafe", "extern", "mod", "impl", "trait", "struct", "enum", "type", "static"].includes(item.text)) return null;
-		if (item.text === "let" && main.body[index + 2]?.text === "=" && main.body[index + 3]?.text === "if" && main.body[index + 4]?.text === "cfg") {
-			const variable = main.body[index + 1].text; let cursor = index + 3, chosen: string | undefined;
+		if (
+			item.text === "fn" ||
+			item.text === "use" ||
+			["unsafe", "extern", "mod", "impl", "trait", "struct", "enum", "type", "static"].includes(item.text)
+		)
+			return null;
+		if (
+			item.text === "let" &&
+			main.body[index + 2]?.text === "=" &&
+			main.body[index + 3]?.text === "if" &&
+			main.body[index + 4]?.text === "cfg"
+		) {
+			const variable = main.body[index + 1].text;
+			let cursor = index + 3,
+				chosen: string | undefined;
 			while (true) {
-				const branch = tokenPattern(main.body.slice(cursor, cursor + 11), ["if", "cfg", "!", "(", "feature", "=", "$feature", ")", "{", "$dependency", "}"]);
-				if (!branch || branch.get("$feature")?.literal === undefined || branch.get("$dependency")?.literal === undefined) return null;
-				if (chosen === undefined && pkg.attestationFeatures?.includes(branch.get("$feature")!.literal!)) chosen = branch.get("$dependency")!.literal!;
-				cursor += 11; if (main.body[cursor++]?.text !== "else") return null;
+				const branch = tokenPattern(main.body.slice(cursor, cursor + 11), [
+					"if",
+					"cfg",
+					"!",
+					"(",
+					"feature",
+					"=",
+					"$feature",
+					")",
+					"{",
+					"$dependency",
+					"}",
+				]);
+				if (
+					!branch ||
+					branch.get("$feature")?.literal === undefined ||
+					branch.get("$dependency")?.literal === undefined
+				)
+					return null;
+				if (chosen === undefined && pkg.attestationFeatures?.includes(branch.get("$feature")!.literal!))
+					chosen = branch.get("$dependency")!.literal!;
+				cursor += 11;
+				if (main.body[cursor++]?.text !== "else") return null;
 				if (main.body[cursor]?.text === "if") continue;
 				if (main.body[cursor]?.text !== "{" || main.body[cursor + 1]?.text !== "panic") return null;
-				const closing = tokenBlockEnd(main.body, cursor); if (closing < 0 || main.body[closing + 1]?.text !== ";") return null;
+				const closing = tokenBlockEnd(main.body, cursor);
+				if (closing < 0 || main.body[closing + 1]?.text !== ";") return null;
 				break;
 			}
-			const calls = main.body.filter((token, offset) => token.text === collector.name && main.body[offset + 1]?.text === "(" && main.body[offset + 2]?.text === variable && main.body[offset + 3]?.text === ")");
+			const calls = main.body.filter(
+				(token, offset) =>
+					token.text === collector.name &&
+					main.body[offset + 1]?.text === "(" &&
+					main.body[offset + 2]?.text === variable &&
+					main.body[offset + 3]?.text === ")",
+			);
 			if (calls.length !== 1 || !chosen || dependencyName !== undefined) return null;
-			dependencyName = chosen; dependencyVariable = variable;
+			dependencyName = chosen;
+			dependencyVariable = variable;
 		}
-		if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(item.text) && (main.body[index + 1]?.text === "(" || (main.body[index + 1]?.text === "!" && ["(", "[", "{"].includes(main.body[index + 2]?.text)))) {
+		if (
+			/^[A-Za-z_][A-Za-z0-9_]*$/.test(item.text) &&
+			(main.body[index + 1]?.text === "(" ||
+				(main.body[index + 1]?.text === "!" && ["(", "[", "{"].includes(main.body[index + 2]?.text)))
+		) {
 			if (!permittedCalls[item.text] && item.text !== collector.name) return null;
-			if (item.text === collector.name && (!dependencyVariable || main.body[index + 1]?.text !== "(" || main.body[index + 2]?.text !== dependencyVariable || main.body[index + 3]?.text !== ")")) return null;
-			if (main.body[index - 1]?.text === "::" && !(item.text === "var" && main.body[index - 2]?.text === "env")) return null;
+			if (
+				item.text === collector.name &&
+				(!dependencyVariable ||
+					main.body[index + 1]?.text !== "(" ||
+					main.body[index + 2]?.text !== dependencyVariable ||
+					main.body[index + 3]?.text !== ")")
+			)
+				return null;
+			if (main.body[index - 1]?.text === "::" && !(item.text === "var" && main.body[index - 2]?.text === "env"))
+				return null;
 		}
 		if (item.text === "println") {
 			const output = main.body[index + 3]?.literal;
-			if (!output || !/^cargo::?(?:rustc-check-cfg|rustc-cfg|rerun-if-env-changed|rerun-if-changed|warning)=/.test(output)) return null;
+			if (
+				!output ||
+				!/^cargo::?(?:rustc-check-cfg|rustc-cfg|rerun-if-env-changed|rerun-if-changed|warning)=/.test(output)
+			)
+				return null;
 		}
 		if (item.text === "var" && main.body[index + 1]?.text === "(") {
-			const name = main.body[index + 2]?.literal; if (name === undefined || /[\x00-\x1f\x7f]/.test(context.effectiveEnv[name] || "")) return null;
+			const name = main.body[index + 2]?.literal;
+			if (name === undefined || /[\x00-\x1f\x7f]/.test(context.effectiveEnv[name] || "")) return null;
 		}
 	}
 	if (!dependencyName) return null;
-	const providers = pkg.attestationDependencies.map(id => packages.get(id)).filter((provider): provider is MetadataPackage => Boolean(provider?.links));
-	const chosen = providers.filter(provider => provider.name === dependencyName); if (chosen.length !== 1) return null;
+	const providers = pkg.attestationDependencies
+		.map((id) => packages.get(id))
+		.filter((provider): provider is MetadataPackage => Boolean(provider?.links));
+	const chosen = providers.filter((provider) => provider.name === dependencyName);
+	if (chosen.length !== 1) return null;
 	const comparison = carrier.get("$dependency")?.literal;
-	const prefix = dependencyName === comparison ? carrier.get("$firstPrefix")?.literal : carrier.get("$secondPrefix")?.literal;
+	const prefix =
+		dependencyName === comparison ? carrier.get("$firstPrefix")?.literal : carrier.get("$secondPrefix")?.literal;
 	if (!prefix || !/^DEP_[A-Z0-9_]+_$/.test(prefix)) return null;
-	const matching = providers.filter(provider => ("DEP_" + provider.links!.toUpperCase().replaceAll("-", "_") + "_").startsWith(prefix));
+	const matching = providers.filter((provider) =>
+		("DEP_" + provider.links!.toUpperCase().replaceAll("-", "_") + "_").startsWith(prefix),
+	);
 	if (matching.length !== 1 || matching[0].id !== chosen[0].id) return null;
 	return chosen[0].id;
+}
+// Exact installed build programs, not package names, select the bounded native/compiler cases.
+const REVIEWED_BUILD_SCRIPTS: Record<
+	string,
+	{ kind: "native" | "compiler" | "framework"; hash: string; files?: Record<string, string> }
+> = {
+	"blst@0.3.16": { kind: "native", hash: "sha256:3b0a6eea2bf5c4d0c327fbe48f81b900e6896bdf92d4cfafcc1010d999b0fea7" },
+	"blst@0.3.17": { kind: "native", hash: "sha256:3b0a6eea2bf5c4d0c327fbe48f81b900e6896bdf92d4cfafcc1010d999b0fea7" },
+	"ring@0.17.14": { kind: "native", hash: "sha256:9d1928ffb1d8e15766c1c1b9ead73e4b81a21703dd25f7c27b87842a2e6e9cee" },
+	"blake3@1.8.5": { kind: "native", hash: "sha256:680019541096959dba4e1b6795ecf1b17233f18d7d2450fe1c5d446d71c9cca5" },
+	"system-configuration-sys@0.5.0": {
+		kind: "framework",
+		hash: "sha256:cf4c21c898e9671345d4684c75014189623574f9ec96414999a9db2d73b1e40f",
+	},
+	"system-configuration-sys@0.6.0": {
+		kind: "framework",
+		hash: "sha256:cf4c21c898e9671345d4684c75014189623574f9ec96414999a9db2d73b1e40f",
+	},
+	"anyhow@1.0.102": {
+		kind: "compiler",
+		hash: "sha256:89d1baedcff59822ed692d3a33f131c211a213bdec33c83f68b54110d9c64223",
+	},
+	"anyhow@1.0.104": {
+		kind: "compiler",
+		hash: "sha256:89d1baedcff59822ed692d3a33f131c211a213bdec33c83f68b54110d9c64223",
+	},
+	"proc-macro2@1.0.106": {
+		kind: "compiler",
+		hash: "sha256:baeb20b52f6b536be8657a566591a507bb2e34a45cf8baa42b135510a0c3c729",
+	},
+	"proc-macro2@1.0.107": {
+		kind: "compiler",
+		hash: "sha256:baeb20b52f6b536be8657a566591a507bb2e34a45cf8baa42b135510a0c3c729",
+	},
+	"libc@0.2.186": { kind: "compiler", hash: "sha256:4b348c53d0a0cd0067ef9887b50f60a1fffdc5d00dda5c0e27fae6aa0ce3dee8" },
+	"getrandom@0.3.4": {
+		kind: "compiler",
+		hash: "sha256:d542c9c3bbc2f64a26c758eac8af16178aab52464bdd8bf0b9a767ba87665021",
+	},
+	"httparse@1.10.1": {
+		kind: "compiler",
+		hash: "sha256:eba8e341d746a6cf54249c62afe9eb237e7c21fcf9937223e894549e3a34d489",
+	},
+	"rustix@1.1.4": { kind: "compiler", hash: "sha256:74cb32e64aa6fe99c2496a425b016e22f4e43c438a8237966b8acae04a98eaf9" },
+	"eyre@0.6.14": { kind: "compiler", hash: "sha256:85f97f403d25be35c6984f83248795cdd7fa68241a5a6f839216b33570b81469" },
+	"thiserror@1.0.69": {
+		kind: "compiler",
+		hash: "sha256:275d0ddbb22d5f015fba360f51a48da10b6309410efe8c6ca678412b1e8c9288",
+	},
+	"thiserror@2.0.18": {
+		kind: "compiler",
+		hash: "sha256:18bf4b4af0f507c7fdfe4dbfc98b5ac3d6a5ef924f46ee56125fd8b22fd61b4c",
+	},
+	"rustversion@1.0.22": {
+		kind: "compiler",
+		hash: "sha256:6d869d2230fa9c4f8ae0df956b06438a070df276649135d4309f56eac72ddbe3",
+		files: { "build/rustc.rs": "sha256:faf67033ec831d968406f5a66c475df337f7221e9d1ab3477fed3a629e1ec5bc" },
+	},
+	"crossbeam-utils@0.8.21": {
+		kind: "compiler",
+		hash: "sha256:7a7f9e56ea7fb4f78c4e532b84b9d27be719d600e85eaeb3a2f4b79a4f0b419c",
+		files: {
+			"build-common.rs": "sha256:502cb7494549bed6fa10ac7bea36e880eeb60290dc69b679ac5c92b376469562",
+			"no_atomic.rs": "sha256:fc1baa4489d9842988bacaaa545a7d7d0e2f8b93cfa0b7d1ae31f21256e4cb0a",
+		},
+	},
+};
+async function reviewedBuildScript(
+	pkg: MetadataPackage,
+	source: string,
+	target: string,
+): Promise<"native" | "compiler" | "framework" | undefined> {
+	if (
+		pkg.source !== "registry+https://github.com/rust-lang/crates.io-index" ||
+		!/(?:-apple-darwin|-unknown-linux-(?:gnu|musl))$/.test(target)
+	)
+		return undefined;
+	if (pkg.name === "aws-lc-sys" && pkg.version === "0.44.0") {
+		const directory = path.join(path.dirname(pkg.manifest_path), "builder");
+		const files: [string, string][] = [];
+		async function collect(parent: string, relative = ""): Promise<void> {
+			for (const entry of await fs.readdir(parent, { withFileTypes: true })) {
+				const name = relative ? relative + "/" + entry.name : entry.name,
+					filename = path.join(parent, entry.name);
+				if (entry.isSymbolicLink()) fail("aliased AWS-LC build source");
+				if (entry.isDirectory()) await collect(filename, name);
+				else if (entry.isFile() && entry.name.endsWith(".rs")) files.push([name, H(await fs.readFile(filename))]);
+			}
+		}
+		await collect(directory);
+		files.sort((a, b) => utf8Compare(a[0], b[0]));
+		if (
+			H(Buffer.from(JSON.stringify(files))) ===
+				"sha256:1ed89edc8d2710e7eba0275fad396237d3dad9b52d29db24222d82349c0fac86" &&
+			source === (await readText(path.join(directory, "main.rs")))
+		)
+			return "native";
+		return undefined;
+	}
+	const reviewed = REVIEWED_BUILD_SCRIPTS[pkg.name + "@" + pkg.version];
+	if (!reviewed || H(Buffer.from(source)) !== reviewed.hash) return undefined;
+	for (const [relative, hash] of Object.entries(reviewed.files || {}))
+		if (H(await fs.readFile(path.join(path.dirname(pkg.manifest_path), relative))) !== hash) return undefined;
+	return reviewed.kind;
+}
+async function assertBoundNativeFlags(
+	flags: readonly string[],
+	roots: readonly ToolRoot[],
+	directories: readonly string[],
+): Promise<void> {
+	let views: { root: ToolRoot; real: string; directory: boolean }[] | undefined;
+	async function bound(value: string): Promise<void> {
+		if (!value || /["'\\\x00-\x1f]/.test(value)) fail("unsupported native flag input path");
+		if (!views) {
+			views = [];
+			for (const root of roots) {
+				const real = await requiredReal(root.path);
+				views.push({ root, real, directory: (await fs.stat(real)).isDirectory() });
+			}
+		}
+		for (const directory of directories) {
+			const filename = await requiredReal(path.resolve(directory, value));
+			if (
+				!views.some((view) => {
+					if (view.directory ? !beneath(view.real, filename) : view.real !== filename) return false;
+					const relative = path.relative(view.real, filename).split(path.sep).join("/");
+					return !view.root.exclude?.some((excluded) => relative === excluded || relative.startsWith(excluded + "/"));
+				})
+			)
+				fail("native flag input is outside hashed roots: " + value);
+		}
+	}
+	const arguments_: string[] = [];
+	for (const flag of flags) {
+		if (flag.startsWith("-Wl,")) arguments_.push(...flag.slice(4).split(","));
+		else if (flag !== "-Xlinker" && flag !== "-Xclang") arguments_.push(flag);
+	}
+	const inputOptions = [
+		"-include-pch",
+		"-include",
+		"-imacros",
+		"-isystem",
+		"-iquote",
+		"-idirafter",
+		"-iprefix",
+		"-iwithprefixbefore",
+		"-iwithprefix",
+		"-isysroot",
+		"--sysroot",
+		"-iframework",
+		"-I",
+		"-L",
+		"-F",
+		"-T",
+		"--script",
+		"--version-script",
+		"-force_load",
+		"-filelist",
+		"-bundle_loader",
+		"-exported_symbols_list",
+		"-unexported_symbols_list",
+		"-reexport_library",
+		"-weak_library",
+		"-rpath",
+		"-specs",
+		"-fplugin",
+		"-fmodule-file",
+		"-fprofile-use",
+		"-fprofile-instr-use",
+	];
+	for (let index = 0; index < arguments_.length; index++) {
+		const argument = arguments_[index];
+		if (argument.startsWith("@") || /^-l.+/.test(argument) || argument === "-l" || argument === "-framework")
+			fail("unclassified native flag input: " + argument);
+		const option = inputOptions.find(
+			(option) =>
+				argument === option ||
+				argument.startsWith(option + "=") ||
+				(["-I", "-L", "-F", "-T", "-include", "-isystem", "-iquote"].includes(option) && argument.startsWith(option)),
+		);
+		if (option) {
+			const value = argument === option ? arguments_[++index] : argument.slice(option.length).replace(/^=/, "");
+			await bound(value);
+		} else if (!argument.startsWith("-")) await bound(argument);
+		else if (argument.includes("/") || argument.includes("\\") || /=.*\.(?:a|o|so|dylib|ld|h|pch|pcm)$/.test(argument))
+			fail("unclassified native flag input: " + argument);
+	}
 }
 async function nativeDependencies(
 	context: AdapterContext,
@@ -1305,6 +2065,20 @@ async function nativeDependencies(
 		: target.includes("apple-darwin") || target.includes("linux")
 			? "cc"
 			: "rust-lld";
+	const nativeDirectories = graph
+		.filter(
+			(pkg) =>
+				pkg.targets.some((item) => item.kind.includes("custom-build")) &&
+				pkg.dependencies.some((dep) => dep.kind === "build" && dep.name === "cc"),
+		)
+		.map((pkg) => path.dirname(pkg.manifest_path));
+	if (!nativeDirectories.length) nativeDirectories.push(context.cwd);
+	for (const variable of ["CFLAGS", "CXXFLAGS", "LDFLAGS"]) {
+		const value = targetEnvironment(context.effectiveEnv, variable, target, host);
+		if (!value) continue;
+		if (context.effectiveEnv.CC_SHELL_ESCAPED_FLAGS) fail("shell-escaped cc flags require a supported token parser");
+		await assertBoundNativeFlags(value.split(/\s+/).filter(Boolean), roots, nativeDirectories);
+	}
 	const flags: string[] = [];
 	const encoded = context.effectiveEnv.CARGO_ENCODED_RUSTFLAGS;
 	const rustflags: Value | undefined =
@@ -1325,6 +2099,8 @@ async function nativeDependencies(
 					: fail("unsupported rustflags value");
 	for (let index = 0; index < rustArguments.length; index++) {
 		const argument = rustArguments[index];
+		if (argument === "--sysroot" || argument.startsWith("--sysroot="))
+			fail("rustflags --sysroot requires an unsupported selected-sysroot closure");
 		const codegen =
 			argument === "-C" ? rustArguments[++index] : argument.startsWith("-C") ? argument.slice(2) : undefined;
 		if (codegen?.startsWith("linker=")) drivers.linker = codegen.slice(7);
@@ -1340,6 +2116,8 @@ async function nativeDependencies(
 		)
 			fail("external rustflags linkage needs an incorporated native source closure");
 	}
+	await assertBoundNativeFlags(flags, roots, [context.cwd]);
+	const rustFlagCount = flags.length;
 	for (const [key, environment, role] of [
 		["rustc-wrapper", "RUSTC_WRAPPER", "rust-wrapper"],
 		["rustc-workspace-wrapper", "RUSTC_WORKSPACE_WRAPPER", "workspace-wrapper"],
@@ -1359,58 +2137,159 @@ async function nativeDependencies(
 	const additionalDiscovery: ToolDiscovery[] = [];
 	const absenceExecutables: string[] = [];
 	let hostConfiguration: Set<string> | undefined;
-	const packagesById = new Map(graph.map(pkg => [pkg.id, pkg]));
+	const packagesById = new Map(graph.map((pkg) => [pkg.id, pkg]));
 	const nativeProviders = new Set<string>();
 	const forwardedProviders = new Map<string, string>();
 	for (const pkg of graph) {
 		const buildTargets = pkg.targets.filter((item) => item.kind.includes("custom-build"));
+		if (!buildTargets.length)
+			await assertNoPackageLinkDirectives(
+				pkg,
+				roots,
+				true,
+				target,
+				!rustArguments.some((argument) => argument === "--cfg" || argument.startsWith("--cfg=")),
+			);
 		for (const item of buildTargets) {
 			const source = await readText(item.src_path);
+			const reviewed = await reviewedBuildScript(pkg, source, target);
 			if (pkg.links && (Object.hasOwn(targetConfig, pkg.links) || Object.hasOwn(table(targets[host]), pkg.links)))
 				fail("Cargo links override requires a supported native closure in " + pkg.name);
 			const usesCC = pkg.dependencies.some((dep) => dep.kind === "build" && dep.name === "cc");
+			if (usesCC && target !== host && pkg.attestationHost)
+				fail("cross-target host build/proc-macro native compilation requires a distinct host context in " + pkg.name);
 			if (usesCC) {
-				if (!["blst", "ring", "blake3", "aws-lc-sys"].includes(pkg.name))
-					fail(`unresolved native build-script compiler selection in ${pkg.name}`);
+				if (reviewed !== "native") fail(`unresolved native build-script compiler selection in ${pkg.name}`);
 				if (pkg.name === "blst" && !(await exists(path.join(path.dirname(pkg.manifest_path), "blst"))))
 					fail("blst external source fallback requires an explicit source closure");
+				if (
+					pkg.name === "ring" &&
+					(context.effectiveEnv.RING_PREGENERATE_ASM !== undefined ||
+						(await exists(path.join(path.dirname(pkg.manifest_path), ".git"))))
+				)
+					fail("ring source generation requires an unsupported generator closure");
 				native = true;
 				nativeProviders.add(pkg.id);
 				if (pkg.name === "aws-lc-sys") {
 					await awsLCSelection(context, pkg, target, host, roots, drivers, flags, additionalDiscovery);
-					continue;
 				}
-			} else if (pkg.links && !["system-configuration-sys"].includes(pkg.name)) {
+				continue;
+			} else if (reviewed === "compiler") {
+				if (pkg.name === "libc") {
+					for (const command of ["freebsd-version", "emcc"])
+						await bindOptionalProcessAbsence(
+							context,
+							source,
+							command,
+							path.dirname(pkg.manifest_path),
+							rustc,
+							absenceExecutables,
+							additionalDiscovery,
+						);
+				}
+				continue;
+			} else if (reviewed === "framework") {
+				await assertNoPackageLinkDirectives(pkg, roots, true, target);
+				continue;
+			} else if (pkg.links) {
 				if (!rebuildOnlyScript(source)) {
-					const provider = await metadataForwardingProvider(context, pkg, source, packagesById, rustc, target, additionalDiscovery);
+					const provider = await metadataForwardingProvider(
+						context,
+						pkg,
+						source,
+						packagesById,
+						rustc,
+						target,
+						additionalDiscovery,
+					);
 					if (!provider) fail(`unresolved native linkage in ${pkg.name}`);
 					forwardedProviders.set(pkg.id, provider);
 				}
 				await assertNoPackageLinkDirectives(pkg, roots);
 			}
-			for (const match of source.matchAll(/\b(?:Command|ProcessBuilder)::new\s*\(\s*"([^"\\]+)"\s*\)/g)) {
-				if (["rustc", "clang", "clang-cl"].includes(match[1]) && (usesCC || match[1] === "rustc")) continue;
-				if (!OPTIONAL_PROCESS_OUTPUT.test(source.slice(match.index! + match[0].length)))
-					fail("unresolved build-script process " + match[1] + " in " + pkg.name);
-				await bindOptionalProcessAbsence(context, source, match[1], absenceExecutables, additionalDiscovery);
+			let processCode = rustSourceCode(source);
+			if (processCode === null) fail("unclassified build-script syntax in " + pkg.name);
+			const classifiedProcesses: { start: number; end: number }[] = [];
+			for (const match of source.matchAll(
+				/\b(?:(?:std\s*::\s*)?process\s*::\s*)?Command\s*::\s*new\s*\(\s*"([^"\\]+)"\s*\)/g,
+			)) {
+				const suffix = source.slice(match.index! + match[0].length);
+				if (match[1] === "rustc") {
+					const literal = await context.resolveCommand("rustc", path.dirname(pkg.manifest_path));
+					if (literal.realpath !== rustc) fail("literal rustc differs from Cargo's selected RUSTC in " + pkg.name);
+					if (!/^\s*\.\s*arg\s*\(\s*"--version"\s*\)\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/.test(suffix))
+						fail("unsupported literal rustc build-script query in " + pkg.name);
+					const version = await context.probe([rustc, "--version"]);
+					additionalDiscovery.push(version.identity);
+					if (version.code !== 0) fail("selected Cargo RUSTC version query failed");
+				} else {
+					if (!OPTIONAL_PROCESS_OUTPUT.test(suffix))
+						fail("unresolved build-script process " + match[1] + " in " + pkg.name);
+					await bindOptionalProcessAbsence(
+						context,
+						source,
+						match[1],
+						path.dirname(pkg.manifest_path),
+						rustc,
+						absenceExecutables,
+						additionalDiscovery,
+					);
+				}
+				classifiedProcesses.push({
+					start: match.index!,
+					end: match.index! + match[0].length + OPTIONAL_PROCESS_OUTPUT.exec(suffix)![0].length,
+				});
 			}
-			for (const match of source.matchAll(/\b(?:Command|ProcessBuilder)::new\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/g)) {
-				if (!OPTIONAL_PROCESS_OUTPUT.test(source.slice(match.index! + match[0].length))) continue;
+			for (const match of source.matchAll(
+				/\b(?:(?:std\s*::\s*)?process\s*::\s*)?Command\s*::\s*new\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/g,
+			)) {
+				if (!OPTIONAL_PROCESS_OUTPUT.test(source.slice(match.index! + match[0].length)))
+					fail("unresolved build-script process selector " + match[1] + " in " + pkg.name);
+				classifiedProcesses.push({
+					start: match.index!,
+					end:
+						match.index! +
+						match[0].length +
+						OPTIONAL_PROCESS_OUTPUT.exec(source.slice(match.index! + match[0].length))![0].length,
+				});
 				const selector = match[1];
 				if (cargoRustcSelector(source, selector, match.index!)) {
-					if (!/^\s*\.\s*arg\s*\(\s*"--version"\s*\)\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/.test(source.slice(match.index! + match[0].length)))
+					if (
+						!/^\s*\.\s*arg\s*\(\s*"--version"\s*\)\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/.test(
+							source.slice(match.index! + match[0].length),
+						)
+					)
 						fail("unsupported Cargo RUSTC build-script query in " + pkg.name);
 					const compilerVersion = await context.probe([rustc, "--version"]);
 					if (compilerVersion.code !== 0) fail("selected Cargo RUSTC version query failed");
 					additionalDiscovery.push(compilerVersion.identity);
 					continue;
 				}
-				const bindings = [...source.matchAll(new RegExp("\\blet\\s+" + selector + "\\s*=\\s*if\\s+cfg!\\(\\s*(target_[a-z_]+)\\s*=\\s*\"([A-Za-z0-9_-]+)\"\\s*\\)\\s*\\{\\s*\"([A-Za-z0-9_.+-]+)\"\\s*\\}\\s*else\\s*\\{\\s*\"([A-Za-z0-9_.+-]+)\"\\s*\\}\\s*;", "g"))];
+				const bindings = [
+					...source.matchAll(
+						new RegExp(
+							"\\blet\\s+" +
+								selector +
+								'\\s*=\\s*if\\s+cfg!\\(\\s*(target_[a-z_]+)\\s*=\\s*"([A-Za-z0-9_-]+)"\\s*\\)\\s*\\{\\s*"([A-Za-z0-9_.+-]+)"\\s*\\}\\s*else\\s*\\{\\s*"([A-Za-z0-9_.+-]+)"\\s*\\}\\s*;',
+							"g",
+						),
+					),
+				];
 				const assignments = [...source.matchAll(new RegExp("\\b" + selector + "\\s*=(?!=|>)", "g"))];
 				if (bindings.length !== 1 || assignments.length !== 1)
 					fail("unresolved optional build-script process selector " + selector + " in " + pkg.name);
 				const binding = bindings[0];
-				if (!["target_os", "target_arch", "target_env", "target_vendor", "target_family", "target_pointer_width", "target_endian"].includes(binding[1]))
+				if (
+					![
+						"target_os",
+						"target_arch",
+						"target_env",
+						"target_vendor",
+						"target_family",
+						"target_pointer_width",
+						"target_endian",
+					].includes(binding[1])
+				)
 					fail("unsupported optional process cfg selector " + binding[1]);
 				if (hostConfiguration === undefined) {
 					const configuration = await context.probe([rustc, "--print", "cfg", "--target", host]);
@@ -1418,8 +2297,27 @@ async function nativeDependencies(
 					hostConfiguration = new Set(probeText(configuration).split(/\r?\n/));
 				}
 				const command = hostConfiguration.has(binding[1] + '="' + binding[2] + '"') ? binding[3] : binding[4];
-				await bindOptionalProcessAbsence(context, source, command, absenceExecutables, additionalDiscovery);
+				await bindOptionalProcessAbsence(
+					context,
+					source,
+					command,
+					path.dirname(pkg.manifest_path),
+					rustc,
+					absenceExecutables,
+					additionalDiscovery,
+				);
 			}
+			for (const span of classifiedProcesses)
+				processCode =
+					processCode.slice(0, span.start) + " ".repeat(span.end - span.start) + processCode.slice(span.end);
+			processCode = processCode.replace(/\buse\s+std\s*::\s*process\s*::\s*Command\s*;/g, "");
+			if (
+				/\b(?:Command|ProcessBuilder|process|subprocess)\b|\b(?:struct|enum|type|trait)\s+env\b|\.\s*(?:spawn|status|output|exec)\s*\(|\bmod\s+[A-Za-z_][A-Za-z0-9_]*\s*;|\binclude\s*!/.test(
+					processCode,
+				) ||
+				(classifiedProcesses.length > 0 && /\b(?:mod|macro_rules|macro)\b/.test(processCode))
+			)
+				fail("unclassified build-script process/command form in " + pkg.name);
 			if (/\b(?:pkg_config|cmake|bindgen|vcpkg)::/.test(source))
 				fail(`unresolved native generator/configuration in ${pkg.name}`);
 		}
@@ -1430,7 +2328,10 @@ async function nativeDependencies(
 		if (visiting.has(id)) fail("cyclic native metadata forwarding dependency");
 		const provider = forwardedProviders.get(id);
 		if (!provider) fail("native metadata provider has no supported compiler/header/library closure");
-		visiting.add(id); requireNativeProvider(provider); visiting.delete(id); nativeProviders.add(id);
+		visiting.add(id);
+		requireNativeProvider(provider);
+		visiting.delete(id);
+		nativeProviders.add(id);
 	}
 	for (const id of forwardedProviders.keys()) requireNativeProvider(id);
 	if (native) {
@@ -1475,7 +2376,11 @@ async function nativeDependencies(
 		)
 			drivers["compiler-wrapper"] = fallback;
 	}
-	const result = await context.native(absenceExecutables.length ? [...executables, ...absenceExecutables] : executables, { target, host, drivers, flags, sdk: context.effectiveEnv.SDKROOT });
+	await assertBoundNativeFlags(flags.slice(rustFlagCount), roots, nativeDirectories);
+	const result = await context.native(
+		absenceExecutables.length ? [...executables, ...absenceExecutables] : executables,
+		{ target, host, drivers, flags, sdk: context.effectiveEnv.SDKROOT },
+	);
 	roots.push(
 		...result.roots.map((root) => ({
 			...root,
@@ -1586,6 +2491,7 @@ async function cacheNamespaces(
 	config: Configuration,
 	workspace: string,
 	metadataTarget: string,
+	selectedTarget: string | undefined,
 	kani: boolean,
 	roots: ToolRoot[],
 ): Promise<CacheNamespaceSelection[]> {
@@ -1611,7 +2517,11 @@ async function cacheNamespaces(
 			);
 	const buildDir = buildDirValue ? configuredPath(context, config, "build.build-dir", expand(buildDirValue)) : target;
 	if (/[{}]/.test(buildDir)) fail("unsupported Cargo build directory template");
-	const profile = ["test", "dev"].includes(selected.profile) ? "debug" : selected.profile;
+	const profile = ["test", "dev"].includes(selected.profile)
+		? "debug"
+		: selected.profile === "bench"
+			? "release"
+			: selected.profile;
 	const namespaces: CacheNamespaceSelection[] = [
 		{ role: "cargo-target", kind: "selected-path", path: await canonicalNamespace(target) },
 		{ role: "cargo-build", kind: "selected-path", path: await canonicalNamespace(buildDir) },
@@ -1619,7 +2529,7 @@ async function cacheNamespaces(
 			role: "cargo-incremental",
 			kind: "selected-path",
 			path: await canonicalNamespace(
-				path.join(buildDir, ...(selected.target ? [selected.target] : []), profile, "incremental"),
+				path.join(buildDir, ...(selectedTarget ? [selectedTarget] : []), profile, "incremental"),
 			),
 		},
 	];
@@ -1728,10 +2638,11 @@ export async function discoverRustAdapter(context: AdapterContext): Promise<Adap
 			{ label: "sysroot", path: runtime.sysroot, exclude: ["share/doc", "share/man", "share/zsh", "lib/rustlib/src"] },
 		);
 	else roots.push({ label: "config/pinned-cargo", path: runtime.cargo }, { label: "config/pinned-rustc", path: rustc });
-	const targetValue =
-		selected.target ?? context.effectiveEnv.CARGO_BUILD_TARGET ?? table(config.values.build).target ?? runtime.host;
-	if (typeof targetValue !== "string" || !/^[A-Za-z0-9._-]+$/.test(targetValue))
+	const selectedTarget =
+		selected.target ?? context.effectiveEnv.CARGO_BUILD_TARGET ?? table(config.values.build).target;
+	if (selectedTarget !== undefined && (typeof selectedTarget !== "string" || !/^[A-Za-z0-9._-]+$/.test(selectedTarget)))
 		fail("unsupported Cargo target selection");
+	const targetValue = typeof selectedTarget === "string" ? selectedTarget : runtime.host;
 	if (kani && selected.solver && selected.solver !== "kissat")
 		fail(`solver ${selected.solver} is not the installed pinned Kani solver selection`);
 	if (selected.runtimeOnly) {
@@ -1755,22 +2666,13 @@ export async function discoverRustAdapter(context: AdapterContext): Promise<Adap
 	}
 	const env = kani ? runtime.env! : { ...context.effectiveEnv, RUSTC: rustc };
 	const graph = await applicationGraph(context, selected, runtime.cargo, env, targetValue, roots, discovery);
-	const native = await nativeDependencies(
-		context,
-		config,
-		targetValue,
-		runtime.host,
-		rustc,
-		graph.selectedPackages,
-		roots,
-		runtime.nativeExecutables ?? [runtime.cargo],
-	);
 	const namespaces = await cacheNamespaces(
 		context,
 		selected,
 		config,
 		graph.metadata.workspace_root,
 		graph.metadata.target_directory,
+		typeof selectedTarget === "string" ? selectedTarget : undefined,
 		kani,
 		roots,
 	);
@@ -1786,6 +2688,16 @@ export async function discoverRustAdapter(context: AdapterContext): Promise<Adap
 				}
 			root.exclude = generated;
 		}
+	const native = await nativeDependencies(
+		context,
+		config,
+		targetValue,
+		runtime.host,
+		rustc,
+		graph.selectedPackages,
+		roots,
+		runtime.nativeExecutables ?? [runtime.cargo],
+	);
 	return {
 		roots,
 		packages: graph.packages,

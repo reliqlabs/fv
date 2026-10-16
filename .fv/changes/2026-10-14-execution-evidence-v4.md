@@ -109,3 +109,19 @@ The user approved an isolated backend fix. Compiling the unchanged model produce
 Staged JAR SHA-256: `68c3d272f913e2450c1ef3a714d4baefdc1854b7103cf4c88d52995bf03efbfa`. Original JAR SHA-256: `880c0b2b72354816f12e9a9755829f2907071e9a181ffea1937954c23d54739d`. Source SHA-256: `9c9e7fc0839b29839bd9430876a2ec29de785194bdd0285dbc3c6a7d0d35c65a`.
 
 The staged backend completed `invPS7` at the unchanged four-step bound with exit zero, using a private server endpoint and the unchanged model hash `6739f855e1712e19ae142d5765556bb44f47fd4e25fc4e217447a42517223663`. This is isolated toolchain acceptance, not canonical claim evidence or production activation. Deployment still requires explicit tool/environment binding and fresh affected evidence.
+
+## Post-commit review dispositions (2026-10-15)
+
+Seven independent code reviews of `aa6946f` are retained under `.fv/code-adversarial/2026-10-15-*-review-1.md`. The user chose to fix findings that could let a real Dossier run reuse stale evidence and to refuse unsupported arrangements at discovery. Authors were `openai-codex/gpt-6.1-sol` task agents; reviewers were `fv-code-adversary` agents. Third-family review is outstanding.
+
+| Slice | Disposition |
+|---|---|
+| Native ownership | CA-01: group signaling only for our unreaped direct child on Darwin with source-checked Bun 1.3.14 and no forced waiter thread. Birth and status are checked synchronously before `kill(-pgid)`. Every other runtime, and reaped, descendant or foreign groups, is refused with sticky indeterminate ownership. Unfinished refused children are unref'd, so the producer reports ERROR instead of hanging; they need operator cleanup. CA-02: Darwin census propagates every error except ESRCH. EPERM rows fall back to `KERN_PROC_PID` with bracketing snapshots. CA-03: gate argv grammar fixed. Cancellation now signals the direct child first and waits the existing grace before refusing survivors. |
+| Producer store | CA-01: fatal observation errors stop fresh and cached member loops and admitted waiters. CA-02: recovery fsyncs the event, its directory and ancestors before retiring the pending result. The abnormal raw-output trailer now renders the artifact's own result, matching the portable checker. |
+| Source bindings | CA-01 through CA-04 fixed: UTF-8 record-set ordering, canonical dispatch targets, NONEMPTY versus NUL-free OS strings, and directory-prefix semantics. |
+| Adoption/dashboard | CA-01 through CA-03 fixed: alias-safe helper refresh by rename, cwd-relative `--records`, and association counts on early-error returns. |
+| Base toolchain | CA-01 through CA-03 and CA-05 through CA-07 fixed; CA-04 (`DYLD_*` overrides) is refused. Tool file canonicalization uses `canonicalToolPath`, because Darwin `realpath` returned nondeterministic hardlink spellings for `/usr/bin` developer shims, producing false `Conflicting tool root` and identity-drift errors. Rust, proof and native adapters were cut over too; native executable equality compares `(dev, ino)`. |
+| Rust toolchain | CA-01, CA-03 and CA-04 are refused at discovery. CA-02 and CA-05 through CA-08 are fixed. Build-script providers bind crates.io identity plus exact build-source fingerprints, so unreviewed provider revisions refuse. |
+| Proof toolchain | CA-01 through CA-03 are refused at discovery. CA-04 is fixed. Lake reports effective project source requirements, and the producer refuses any recipe whose source closure omits a required file or a `*.lean` file under a required source directory (`.lake` excluded, symlinks refused). |
+
+Known limits: Linux and other runtimes cannot cancel owned process groups and leave work indeterminate. Lake source coverage is Lean-specific. Three Linux runs reported reversed or out-of-range observation intervals once and did not recur. Retained ns bounds suggest wall-clock stepping in the container VM; fail-closed, cause unproven.

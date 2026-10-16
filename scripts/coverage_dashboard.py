@@ -158,6 +158,7 @@ only. --check runs in self-conformance mode: it prints CHECK: ... to
 stderr and exits 0 if the rendered output is clean, 1 if a bare VERIFIED
 leaked.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -204,8 +205,15 @@ BINDING_MODE = "not-recomputed"
 
 # Per-claim statuses that mean the claim is not covered by a passing
 # record. Drives both the run verdict and the "incomplete" summary bucket.
-GAP_STATUSES = {"missing-record", "duplicate-record", "invalid", "INCOMPLETE",
-                "unwaived-assumption", "evidence-gap", "dependency-gap"}
+GAP_STATUSES = {
+    "missing-record",
+    "duplicate-record",
+    "invalid",
+    "INCOMPLETE",
+    "unwaived-assumption",
+    "evidence-gap",
+    "dependency-gap",
+}
 
 UNSCOPED_VERDICT_RE = re.compile(r"VERIFIED(?!\[)")  # a bare, unqualified verdict
 
@@ -227,8 +235,9 @@ def _execution_state(record: dict) -> dict:
     }
 
 
-def _execution_defects(execution: object, index: int, state: dict,
-                       obligation_kind: str | None) -> list[str]:
+def _execution_defects(
+    execution: object, index: int, state: dict, obligation_kind: str | None
+) -> list[str]:
     """One v3 cohort entry, by the rules that need no repository access.
 
     Mirrors check_evidence_records._execution_defects minus the artifact read
@@ -245,8 +254,9 @@ def _execution_defects(execution: object, index: int, state: dict,
     if not isinstance(tool, str) or EVIDENCE_TOOL_ID.fullmatch(tool) is None:
         defects.append(f"{label}malformed evidence tool id {tool!r}")
     elif tool in state["seen_tools"]:
-        defects.append(f"{label}duplicate evidence tool {tool!r}: "
-                       "cohort coverage is ambiguous")
+        defects.append(
+            f"{label}duplicate evidence tool {tool!r}: cohort coverage is ambiguous"
+        )
     else:
         state["seen_tools"].add(tool)
     klass = execution["evidence_class"]
@@ -258,13 +268,20 @@ def _execution_defects(execution: object, index: int, state: dict,
         # witness-only execution is the record class lying about the cohort.
         compatible = OBLIGATION_EVIDENCE_COMPATIBILITY.get(obligation_kind)
         if compatible is None or klass not in compatible:
-            defects.append(f"{label}incompatible evidence class {klass!r} "
-                           f"for obligation kind {obligation_kind!r}")
+            defects.append(
+                f"{label}incompatible evidence class {klass!r} "
+                f"for obligation kind {obligation_kind!r}"
+            )
     command = execution["command"]
-    if (not isinstance(command, list) or not command
-            or any(not isinstance(part, str) or not part for part in command)):
-        defects.append(f"{label}command is not a nonempty argv array of "
-                       f"nonempty strings: {command!r}")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(part, str) or not part for part in command)
+    ):
+        defects.append(
+            f"{label}command is not a nonempty argv array of "
+            f"nonempty strings: {command!r}"
+        )
     cwd = execution["cwd"]
     if not isinstance(cwd, str) or not cwd.strip():
         defects.append(f"{label}cwd is not a repo-relative path: {cwd!r}")
@@ -286,15 +303,20 @@ def _execution_defects(execution: object, index: int, state: dict,
         # a whole cohort.
         first = state["seen_paths"].setdefault(raw_relative, index)
         if first != index:
-            defects.append(f"{label}raw_output_path {raw_relative!r} duplicates "
-                           f"executions[{first}]: one artifact cannot discharge "
-                           "two executions")
+            defects.append(
+                f"{label}raw_output_path {raw_relative!r} duplicates "
+                f"executions[{first}]: one artifact cannot discharge "
+                "two executions"
+            )
         if state["producer"] and isinstance(run_id, str):
-            expected = PRODUCER_ARTIFACT.format(claim_id=state["claim_id"],
-                                                run_id=run_id)
+            expected = PRODUCER_ARTIFACT.format(
+                claim_id=state["claim_id"], run_id=run_id
+            )
             if raw_relative != expected:
-                defects.append(f"{label}raw_output_path {raw_relative!r} is not "
-                               f"this run's producer artifact {expected!r}")
+                defects.append(
+                    f"{label}raw_output_path {raw_relative!r} is not "
+                    f"this run's producer artifact {expected!r}"
+                )
     marker = execution.get("pass_marker")
     if "pass_marker" in execution and (not isinstance(marker, str) or not marker):
         defects.append(f"{label}pass_marker is empty")
@@ -308,8 +330,9 @@ def _derivation_defects(bindings: dict, primary: dict) -> list[str]:
     half describes a different run than its cohort reads as two different
     claims depending on which half a consumer trusts."""
     defects: list[str] = []
-    if (bindings.get("raw_output_path") != primary.get("raw_output_path")
-            or bindings.get("raw_output_hash") != primary.get("raw_output_hash")):
+    if bindings.get("raw_output_path") != primary.get(
+        "raw_output_path"
+    ) or bindings.get("raw_output_hash") != primary.get("raw_output_hash"):
         defects.append("legacy raw-output bindings are not derived from executions[0]")
     command = bindings.get("command")
     if isinstance(command, str):
@@ -322,18 +345,25 @@ def _derivation_defects(bindings: dict, primary: dict) -> list[str]:
     configuration = bindings.get("configuration")
     declared_cwd = configuration.get("cwd") if isinstance(configuration, dict) else None
     if declared_cwd != primary.get("cwd"):
-        defects.append("legacy configuration.cwd binding is not derived from executions[0]")
-    declared_marker = (configuration.get("pass_marker")
-                       if isinstance(configuration, dict) else None)
+        defects.append(
+            "legacy configuration.cwd binding is not derived from executions[0]"
+        )
+    declared_marker = (
+        configuration.get("pass_marker") if isinstance(configuration, dict) else None
+    )
     if declared_marker != primary.get("pass_marker"):
-        defects.append("legacy configuration.pass_marker binding is not derived "
-                       "from executions[0]")
+        defects.append(
+            "legacy configuration.pass_marker binding is not derived from executions[0]"
+        )
     return defects
 
 
-def validate_record(rec: object, obligation_kind: str | None = None,
-                    expect_required_targets: tuple[str, ...] | None = None,
-                    expect_manifest: str | None = None) -> list[str]:
+def validate_record(
+    rec: object,
+    obligation_kind: str | None = None,
+    expect_required_targets: tuple[str, ...] | None = None,
+    expect_manifest: str | None = None,
+) -> list[str]:
     """Structural defects per the G1 schema, using check_evidence_records'
     own constants and rules. Empty list means the record is structurally
     sound as far as a view without repository access can tell.
@@ -367,12 +397,14 @@ def validate_record(rec: object, obligation_kind: str | None = None,
     for field in BINDING_FIELDS + (V3_BINDING_FIELDS if schema_v3 else ()):
         if field not in bindings:
             defects.append(f"missing binding field {field!r}")
-        elif bindings[field] in ("", [], {}) or \
-                (bindings[field] is None and field not in NULLABLE):
+        elif bindings[field] in ("", [], {}) or (
+            bindings[field] is None and field not in NULLABLE
+        ):
             defects.append(f"empty binding field {field!r}")
     defects.extend(gate._asserted_field_defects(bindings, schema_v3))
     if bindings.get("profile") == PRODUCER_PROFILE and not gate._valid_toolchain(
-            bindings.get("toolchain_digests")):
+        bindings.get("toolchain_digests")
+    ):
         defects.append("producer evidence lacks resolved executable identity")
     if defects:
         return defects
@@ -387,8 +419,10 @@ def validate_record(rec: object, obligation_kind: str | None = None,
     if obligation_kind is not None:
         compatible = OBLIGATION_EVIDENCE_COMPATIBILITY.get(obligation_kind)
         if compatible is None or rec["evidence_class"] not in compatible:
-            defects.append(f"incompatible evidence class {rec['evidence_class']!r} "
-                           f"for obligation kind {obligation_kind!r}")
+            defects.append(
+                f"incompatible evidence class {rec['evidence_class']!r} "
+                f"for obligation kind {obligation_kind!r}"
+            )
     if not schema_v3:
         return defects
     executions = bindings.get("executions")
@@ -398,8 +432,9 @@ def validate_record(rec: object, obligation_kind: str | None = None,
     state = _execution_state(rec)
     cohort_defects: list[str] = []
     for index, execution in enumerate(executions):
-        cohort_defects.extend(_execution_defects(execution, index, state,
-                                                 obligation_kind))
+        cohort_defects.extend(
+            _execution_defects(execution, index, state, obligation_kind)
+        )
     if cohort_defects:
         return defects + cohort_defects
     return defects + _derivation_defects(bindings, executions[0])
@@ -431,12 +466,14 @@ def _id_list(claim_id: str, field: str, value: object) -> list[str]:
     needs to refuse to guess when the field is unreadable."""
     if not isinstance(value, list) or not value:
         raise ManifestError(
-            f"system_claim {claim_id!r}: {field} is not a nonempty array")
+            f"system_claim {claim_id!r}: {field} is not a nonempty array"
+        )
     ids: list[str] = []
     for entry in value:
         if not isinstance(entry, str) or not entry.strip():
             raise ManifestError(
-                f"system_claim {claim_id!r}: {field} contains a malformed id {entry!r}")
+                f"system_claim {claim_id!r}: {field} contains a malformed id {entry!r}"
+            )
         if entry not in ids:
             ids.append(entry)
     return ids
@@ -464,8 +501,7 @@ def load_manifest(path: Path) -> tuple[list[str], dict[str, str], dict[str, dict
         for index, item in enumerate(entries):
             claim_id = item.get("id") if isinstance(item, dict) else None
             if not isinstance(claim_id, str) or not claim_id.strip():
-                raise ManifestError(
-                    f"{collection}[{index}] declares no usable id")
+                raise ManifestError(f"{collection}[{index}] declares no usable id")
             # Gate B's two id grammars, read from it: an id outside the obligation
             # grammar is malformed, and an id outside the producer's claim_id
             # grammar could never have a record written for it. Gate B makes both
@@ -473,24 +509,29 @@ def load_manifest(path: Path) -> tuple[list[str], dict[str, str], dict[str, dict
             # required set with missing-record rows.
             if gate.OBLIGATION_ID.fullmatch(claim_id) is None:
                 raise ManifestError(
-                    f"{collection}[{index}] has malformed id {claim_id!r}")
+                    f"{collection}[{index}] has malformed id {claim_id!r}"
+                )
             if gate.PRODUCER_CLAIM_ID.fullmatch(claim_id) is None:
                 raise ManifestError(
                     f"{collection}[{index}] id {claim_id!r} is not usable by the "
                     "evidence producer: obligation ids must match "
-                    "[A-Za-z0-9][A-Za-z0-9._-]*")
+                    "[A-Za-z0-9][A-Za-z0-9._-]*"
+                )
             if claim_id in kinds:
                 raise ManifestError(
                     f"duplicate obligation id {claim_id!r} in {collection} "
-                    f"(already declared as {kinds[claim_id]})")
+                    f"(already declared as {kinds[claim_id]})"
+                )
             required.append(claim_id)
             kinds[claim_id] = kind
             if kind == SYSTEM_CLAIM:
                 system_claims[claim_id] = {
-                    "depends_on": _id_list(claim_id, "depends_on",
-                                           item.get("depends_on")),
-                    "required_evidence": _id_list(claim_id, "required_evidence",
-                                                  item.get("required_evidence")),
+                    "depends_on": _id_list(
+                        claim_id, "depends_on", item.get("depends_on")
+                    ),
+                    "required_evidence": _id_list(
+                        claim_id, "required_evidence", item.get("required_evidence")
+                    ),
                 }
     return required, kinds, system_claims
 
@@ -510,11 +551,14 @@ def executions_of(rec: dict) -> list[dict] | None:
     cohort = []
     for index, entry in enumerate(raw):
         fields = entry if isinstance(entry, dict) else {}
-        readable = {field: value if isinstance(value, str) else None
-                    for field, value in (
-                        ("tool", fields.get("tool")),
-                        ("result", fields.get("result")),
-                        ("evidence_class", fields.get("evidence_class")))}
+        readable = {
+            field: value if isinstance(value, str) else None
+            for field, value in (
+                ("tool", fields.get("tool")),
+                ("result", fields.get("result")),
+                ("evidence_class", fields.get("evidence_class")),
+            )
+        }
         cohort.append({"index": index, **readable})
     return cohort
 
@@ -566,13 +610,16 @@ def cohort_coverage(
     return coverage, gaps
 
 
-def evaluate_claim(cid: str, by_claim: dict[str, dict],
-                   kinds: dict[str, str] | None = None,
-                   system_claims: dict[str, dict] | None = None,
-                   duplicates: frozenset[str] | set[str] = frozenset(),
-                   expect_required_targets: tuple[str, ...] | None = None,
-                   expect_manifest: str | None = None,
-                   cited: dict[str, set[str]] | None = None) -> dict:
+def evaluate_claim(
+    cid: str,
+    by_claim: dict[str, dict],
+    kinds: dict[str, str] | None = None,
+    system_claims: dict[str, dict] | None = None,
+    duplicates: frozenset[str] | set[str] = frozenset(),
+    expect_required_targets: tuple[str, ...] | None = None,
+    expect_manifest: str | None = None,
+    cited: dict[str, set[str]] | None = None,
+) -> dict:
     kinds = kinds or {}
     system_claims = system_claims or {}
     kind = kinds.get(cid)
@@ -583,25 +630,41 @@ def evaluate_claim(cid: str, by_claim: dict[str, dict],
         # Gate B refuses to pick a winner between two records for one claim,
         # and a view that silently rendered the last one would report coverage
         # the gate calls ambiguous.
-        row = {"claim_id": cid, "status": "duplicate-record",
-               "evidence_class": None, "result": None, "scope": None,
-               "waived": False,
-               "defects": ["duplicate records for claim_id (ambiguous)"]}
+        row = {
+            "claim_id": cid,
+            "status": "duplicate-record",
+            "evidence_class": None,
+            "result": None,
+            "scope": None,
+            "waived": False,
+            "defects": ["duplicate records for claim_id (ambiguous)"],
+        }
     elif rec is None:
-        row = {"claim_id": cid, "status": "missing-record", "evidence_class": None,
-               "result": None, "scope": None, "waived": False, "defects": []}
+        row = {
+            "claim_id": cid,
+            "status": "missing-record",
+            "evidence_class": None,
+            "result": None,
+            "scope": None,
+            "waived": False,
+            "defects": [],
+        }
     else:
         cohort = executions_of(rec)
-        defects = validate_record(rec, kind, expect_required_targets,
-                                  expect_manifest)
+        defects = validate_record(rec, kind, expect_required_targets, expect_manifest)
         # One artifact cannot discharge two claims. The rule spans records, so it
         # is the caller's index that decides it, not this record's own bindings.
         defects.extend(gate.shared_artifact_defects(cid, rec, cited or {}))
         if defects:
-            row = {"claim_id": cid, "status": "invalid",
-                   "evidence_class": rec.get("evidence_class"),
-                   "result": rec.get("result"), "scope": rec.get("scope"),
-                   "waived": False, "defects": defects}
+            row = {
+                "claim_id": cid,
+                "status": "invalid",
+                "evidence_class": rec.get("evidence_class"),
+                "result": rec.get("result"),
+                "scope": rec.get("scope"),
+                "waived": False,
+                "defects": defects,
+            }
         else:
             klass, result, scope = rec["evidence_class"], rec["result"], rec["scope"]
             waived = bool(rec["waiver"])
@@ -621,9 +684,15 @@ def evaluate_claim(cid: str, by_claim: dict[str, dict],
                 status = "unwaived-assumption"
             else:
                 status = "PASS"
-            row = {"claim_id": cid, "status": status, "evidence_class": klass,
-                   "result": result, "scope": scope, "waived": waived,
-                   "defects": []}
+            row = {
+                "claim_id": cid,
+                "status": status,
+                "evidence_class": klass,
+                "result": result,
+                "scope": scope,
+                "waived": waived,
+                "defects": [],
+            }
     row["obligation_kind"] = kind
     row["executions"] = cohort
     row["assumed_executions"] = assumed
@@ -684,12 +753,17 @@ def apply_dependency_coverage(rows: list[dict]) -> None:
 
 
 def summarize(rows: list[dict]) -> dict:
-    status_key = {"PASS": "pass", "FAIL": "fail", "INCOMPLETE": "incomplete",
-                  "missing-record": "missing", "duplicate-record": "duplicate",
-                  "invalid": "invalid",
-                  "unwaived-assumption": "unwaived_assumption",
-                  "evidence-gap": "evidence_gap",
-                  "dependency-gap": "dependency_gap"}
+    status_key = {
+        "PASS": "pass",
+        "FAIL": "fail",
+        "INCOMPLETE": "incomplete",
+        "missing-record": "missing",
+        "duplicate-record": "duplicate",
+        "invalid": "invalid",
+        "unwaived-assumption": "unwaived_assumption",
+        "evidence-gap": "evidence_gap",
+        "dependency-gap": "dependency_gap",
+    }
     result_key = {"PASS": "pass", "FAIL": "fail", "INCOMPLETE": "incomplete"}
     counts = {v: 0 for v in status_key.values()}
     waived_or_assumed = []
@@ -703,8 +777,9 @@ def summarize(rows: list[dict]) -> dict:
             waived_or_assumed.append(row["claim_id"])
         if row.get("assumed_executions"):
             assumed_executions[row["claim_id"]] = row["assumed_executions"]
-        kind_bucket = by_kind.setdefault(row.get("obligation_kind") or "unknown",
-                                        {"pass": 0, "fail": 0, "gap": 0})
+        kind_bucket = by_kind.setdefault(
+            row.get("obligation_kind") or "unknown", {"pass": 0, "fail": 0, "gap": 0}
+        )
         if row["status"] == "PASS":
             kind_bucket["pass"] += 1
         elif row["status"] == "FAIL":
@@ -717,13 +792,15 @@ def summarize(rows: list[dict]) -> dict:
         for entry in row.get("executions") or []:
             bucket = by_execution_class.setdefault(
                 entry["evidence_class"] or "unreadable",
-                {"pass": 0, "fail": 0, "incomplete": 0, "other": 0})
+                {"pass": 0, "fail": 0, "incomplete": 0, "other": 0},
+            )
             bucket[result_key.get(entry["result"] or "", "other")] += 1
         klass = row["evidence_class"]
         if klass is None:
             continue
         bucket = by_class.setdefault(
-            klass, {"pass": 0, "fail": 0, "incomplete": 0, "other": 0})
+            klass, {"pass": 0, "fail": 0, "incomplete": 0, "other": 0}
+        )
         if row["status"] == "PASS":
             bucket["pass"] += 1
         elif row["status"] == "FAIL":
@@ -735,15 +812,22 @@ def summarize(rows: list[dict]) -> dict:
     system_rows = [r for r in rows if r.get("obligation_kind") == SYSTEM_CLAIM]
     system_claims = {
         "total": len(system_rows),
-        "covered": sorted(r["claim_id"] for r in system_rows
-                          if r["status"] == "PASS"),
-        "evidence_gaps": {r["claim_id"]: r["evidence_gaps"]
-                          for r in system_rows if r.get("evidence_gaps")},
-        "dependency_gaps": {r["claim_id"]: r["dependency_gaps"]
-                            for r in system_rows if r.get("dependency_gaps")},
-        "non_passing_executions": {r["claim_id"]: r["non_passing_executions"]
-                                   for r in system_rows
-                                   if r.get("non_passing_executions")},
+        "covered": sorted(r["claim_id"] for r in system_rows if r["status"] == "PASS"),
+        "evidence_gaps": {
+            r["claim_id"]: r["evidence_gaps"]
+            for r in system_rows
+            if r.get("evidence_gaps")
+        },
+        "dependency_gaps": {
+            r["claim_id"]: r["dependency_gaps"]
+            for r in system_rows
+            if r.get("dependency_gaps")
+        },
+        "non_passing_executions": {
+            r["claim_id"]: r["non_passing_executions"]
+            for r in system_rows
+            if r.get("non_passing_executions")
+        },
     }
     return {
         "total_required": len(rows),
@@ -757,8 +841,9 @@ def summarize(rows: list[dict]) -> dict:
     }
 
 
-def compute_verdict(rows: list[dict], by_claim: dict[str, dict],
-                     required: list[str]) -> tuple[str, int]:
+def compute_verdict(
+    rows: list[dict], by_claim: dict[str, dict], required: list[str]
+) -> tuple[str, int]:
     if not required:
         return "INCOMPLETE", 3
     if any(r["status"] == "FAIL" for r in rows):
@@ -778,13 +863,16 @@ def compute_verdict(rows: list[dict], by_claim: dict[str, dict],
     return verdict, 0
 
 
-def build_dashboard(records_path: Path, required: list[str],
-                     records: list[dict], kinds: dict[str, str] | None = None,
-                     system_claims: dict[str, dict] | None = None,
-                     dependency_expansion: dict[str, list[str]] | None = None,
-                     expect_required_targets: tuple[str, ...] | None = None,
-                     expect_manifest: str | None = None
-                     ) -> tuple[dict, int]:
+def build_dashboard(
+    records_path: Path,
+    required: list[str],
+    records: list[dict],
+    kinds: dict[str, str] | None = None,
+    system_claims: dict[str, dict] | None = None,
+    dependency_expansion: dict[str, list[str]] | None = None,
+    expect_required_targets: tuple[str, ...] | None = None,
+    expect_manifest: str | None = None,
+) -> tuple[dict, int]:
     kinds = kinds or {}
     by_claim: dict[str, dict] = {}
     duplicates: set[str] = set()
@@ -797,9 +885,19 @@ def build_dashboard(records_path: Path, required: list[str],
     # Built over the judged set exactly as Gate B builds it, before any row is
     # evaluated: a substituted artifact is only visible across records.
     cited = gate.cited_artifact_index(required, by_claim)
-    rows = [evaluate_claim(cid, by_claim, kinds, system_claims, duplicates,
-                           expect_required_targets, expect_manifest, cited)
-            for cid in required]
+    rows = [
+        evaluate_claim(
+            cid,
+            by_claim,
+            kinds,
+            system_claims,
+            duplicates,
+            expect_required_targets,
+            expect_manifest,
+            cited,
+        )
+        for cid in required
+    ]
     apply_dependency_coverage(rows)
     summary = summarize(rows)
     verdict, code = compute_verdict(rows, by_claim, required)
@@ -817,12 +915,20 @@ def build_dashboard(records_path: Path, required: list[str],
     return dashboard, code
 
 
-def build_v4_dashboard(root: Path, records_path: Path,
-                       manifest_path: Path | None = None,
-                       require: list[str] | None = None) -> tuple[dict, int]:
+def build_v4_dashboard(
+    root: Path,
+    records_path: Path,
+    manifest_path: Path | None = None,
+    require: list[str] | None = None,
+) -> tuple[dict, int]:
     report, code = v4.assess_v4(
-        root, records_path, manifest_path, require,
-        recompute=False, recheck_observations=False)
+        root,
+        records_path,
+        manifest_path,
+        require,
+        recompute=False,
+        recheck_observations=False,
+    )
     if report.get("binding") != BINDING_MODE:
         raise ValueError("v4 dashboard assessment must not recompute bindings")
     required = report["required_claims"]
@@ -838,8 +944,12 @@ def build_v4_dashboard(root: Path, records_path: Path,
         entry = entries.get(cid)
         if entry is None:
             raise ValueError(f"v4 assessment omitted required claim {cid!r}")
-        row = {**entry, "waived": False, "obligation_kind": kinds.get(cid),
-               "assumed_executions": []}
+        row = {
+            **entry,
+            "waived": False,
+            "obligation_kind": kinds.get(cid),
+            "assumed_executions": [],
+        }
         for field in ("evidence_class", "result", "scope"):
             value = row.get(field)
             row[field] = value if isinstance(value, str) else None
@@ -849,10 +959,14 @@ def build_v4_dashboard(root: Path, records_path: Path,
         cohort = []
         for index, slot in enumerate(entry.get("executions") or []):
             fields = slot if isinstance(slot, dict) else {}
-            readable = {name: value if isinstance(value, str) else None
-                        for name, value in (("tool", fields.get("tool")),
-                                            ("result", fields.get("state")),
-                                            ("evidence_class", fields.get("evidence_class")))}
+            readable = {
+                name: value if isinstance(value, str) else None
+                for name, value in (
+                    ("tool", fields.get("tool")),
+                    ("result", fields.get("state")),
+                    ("evidence_class", fields.get("evidence_class")),
+                )
+            }
             cohort.append({**fields, "index": index, **readable})
         row["executions"] = cohort
         row["non_passing_executions"] = non_passing_executions(cohort)
@@ -869,10 +983,14 @@ def build_v4_dashboard(root: Path, records_path: Path,
                 row["status"] = "evidence-gap"
         rows.append(row)
     apply_dependency_coverage(rows)
-    dashboard = {**report, "gate": "coverage-dashboard",
-                 "records": str(records_path), "rows": rows,
-                 "summary": summarize(rows),
-                 "pass_semantics": "stored-only; freshness and reuse eligibility not assessed"}
+    dashboard = {
+        **report,
+        "gate": "coverage-dashboard",
+        "records": str(records_path),
+        "rows": rows,
+        "summary": summarize(rows),
+        "pass_semantics": "stored-only; freshness and reuse eligibility not assessed",
+    }
     if code != 2:
         if any(row["status"] == "FAIL" for row in rows):
             dashboard["verdict"], code = "FAILED", 1
@@ -893,33 +1011,50 @@ def render_system_claims(rows: list[dict]) -> list[str]:
         coverage = row.get("evidence_coverage")
         if coverage is None:
             cohort = row.get("executions") or []
-            observed = " ".join(f"{e['tool'] or '?'}={e['result'] or 'unknown'}"
-                                for e in cohort) or "none recorded"
-            lines.append("    required_evidence: not declared by manifest; "
-                         f"executions: {observed}")
+            observed = (
+                " ".join(
+                    f"{e['tool'] or '?'}={e['result'] or 'unknown'}" for e in cohort
+                )
+                or "none recorded"
+            )
+            lines.append(
+                "    required_evidence: not declared by manifest; "
+                f"executions: {observed}"
+            )
         else:
-            lines.append("    required_evidence: " + " ".join(
-                f"{tool}={coverage[tool]}" for tool in row["required_evidence"]))
+            lines.append(
+                "    required_evidence: "
+                + " ".join(
+                    f"{tool}={coverage[tool]}" for tool in row["required_evidence"]
+                )
+            )
             if row["evidence_gaps"]:
-                lines.append("    missing PASS evidence: "
-                             + ", ".join(row["evidence_gaps"]))
+                lines.append(
+                    "    missing PASS evidence: " + ", ".join(row["evidence_gaps"])
+                )
         # Printed for both branches: a cohort entry that did not PASS is a
         # defect whether or not the manifest declared what the cohort needs.
         if row["non_passing_executions"]:
-            lines.append("    cohort executions that did not PASS: "
-                         + ", ".join(sorted(row["non_passing_executions"])))
+            lines.append(
+                "    cohort executions that did not PASS: "
+                + ", ".join(sorted(row["non_passing_executions"]))
+            )
         if row.get("dependency_gaps"):
-            lines.append("    dependencies not covered: "
-                         + ", ".join(row["dependency_gaps"]))
+            lines.append(
+                "    dependencies not covered: " + ", ".join(row["dependency_gaps"])
+            )
         if row.get("dependencies_not_evaluated"):
-            lines.append("    dependencies not evaluated this run: "
-                         + ", ".join(row["dependencies_not_evaluated"]))
+            lines.append(
+                "    dependencies not evaluated this run: "
+                + ", ".join(row["dependencies_not_evaluated"])
+            )
     return lines
 
 
 def render_text(dashboard: dict) -> str:
-    lines = [f"{'CLAIM':<10} {'KIND':<14} {'STATUS':<20} {'CLASS':<20} "
-             f"{'WAIVED':<7} SCOPE"]
+    lines = [
+        f"{'CLAIM':<10} {'KIND':<14} {'STATUS':<20} {'CLASS':<20} {'WAIVED':<7} SCOPE"
+    ]
     for row in dashboard["rows"]:
         lines.append(
             f"{row['claim_id']:<10} "
@@ -940,50 +1075,66 @@ def render_text(dashboard: dict) -> str:
         f"dependency-gap={s['dependency_gap']}"
     )
     if dashboard.get("schema_version") == "fv-evidence-run/v4":
-        lines.append(f"bindings: {BINDING_MODE} (stored results only; "
-                     "freshness and reuse eligibility are not assessed)")
+        lines.append(
+            f"bindings: {BINDING_MODE} (stored results only; "
+            "freshness and reuse eligibility are not assessed)"
+        )
         counts = dashboard["counts"]
         lines.append(
             f"logical-associations={counts['logical_associations']} "
             f"unique-physical-executions={counts['unique_physical_executions']} "
             f"actual-dispatches={counts['actual_dispatches']} "
-            f"cache-hits={counts['cache_hits']}")
+            f"cache-hits={counts['cache_hits']}"
+        )
         lines.append(
             f"association-work: missing={counts['missing_associations']} "
             f"failed={counts['failed_associations']} "
             f"error={counts['error_associations']} "
-            f"cancelled={counts['cancelled_associations']}")
+            f"cancelled={counts['cancelled_associations']}"
+        )
         for row in dashboard["rows"]:
             for slot in row["executions"]:
                 observation = slot.get("observation")
-                observation_result = (observation.get("result")
-                                      if isinstance(observation, dict) else "missing")
+                observation_result = (
+                    observation.get("result")
+                    if isinstance(observation, dict)
+                    else "missing"
+                )
                 lines.append(
                     f"  {row['claim_id']}/{slot.get('slot_id') or slot['index']} "
                     f"tool={slot['tool'] or 'unreadable'} "
                     f"state={slot['result'] or 'unreadable'} "
                     f"observation={observation_result} "
-                    f"history-blockers={len(slot.get('blocking_events') or [])}")
+                    f"history-blockers={len(slot.get('blocking_events') or [])}"
+                )
             for defect in row.get("defects") or []:
                 lines.append(f"  ! {row['claim_id']}: {defect}")
         for defect in dashboard.get("errors") or []:
             lines.append(f"  ! {defect}")
     else:
-        lines.append(f"bindings: {BINDING_MODE} (snapshot and intent freshness are "
-                     "Gate B's to recompute; this view reads records only)")
+        lines.append(
+            f"bindings: {BINDING_MODE} (snapshot and intent freshness are "
+            "Gate B's to recompute; this view reads records only)"
+        )
     if s["waived_or_assumed"]:
         lines.append(f"waived-or-assumed: {', '.join(s['waived_or_assumed'])}")
     lines.append("by evidence_class:")
     for klass, c in sorted(s["by_evidence_class"].items()):
-        lines.append(f"  {klass}: pass={c['pass']} fail={c['fail']} "
-                      f"incomplete={c['incomplete']} other={c['other']}")
+        lines.append(
+            f"  {klass}: pass={c['pass']} fail={c['fail']} "
+            f"incomplete={c['incomplete']} other={c['other']}"
+        )
     if s["by_execution_evidence_class"]:
-        lines.append("by logical association evidence_class:"
-                     if dashboard.get("schema_version") == "fv-evidence-run/v4"
-                     else "by execution evidence_class:")
+        lines.append(
+            "by logical association evidence_class:"
+            if dashboard.get("schema_version") == "fv-evidence-run/v4"
+            else "by execution evidence_class:"
+        )
         for klass, c in sorted(s["by_execution_evidence_class"].items()):
-            lines.append(f"  {klass}: pass={c['pass']} fail={c['fail']} "
-                          f"incomplete={c['incomplete']} other={c['other']}")
+            lines.append(
+                f"  {klass}: pass={c['pass']} fail={c['fail']} "
+                f"incomplete={c['incomplete']} other={c['other']}"
+            )
     if s["assumed_executions"]:
         lines.append("assumed-class executions:")
         for cid, entries in sorted(s["assumed_executions"].items()):
@@ -999,8 +1150,7 @@ def verdict_line(verdict: str) -> str:
     return f"VERDICT: {verdict}"
 
 
-def emit_dashboard(dashboard: dict, code: int, *, as_json: bool,
-                   check: bool) -> int:
+def emit_dashboard(dashboard: dict, code: int, *, as_json: bool, check: bool) -> int:
     if check:
         text = render_text(dashboard)
         vline = verdict_line(dashboard["verdict"])
@@ -1008,13 +1158,15 @@ def emit_dashboard(dashboard: dict, code: int, *, as_json: bool,
         blob = "\n".join([text, vline, payload])
         offending = [ln for ln in blob.splitlines() if UNSCOPED_VERDICT_RE.search(ln)]
         if offending:
-            print("CHECK: bare VERIFIED token found in dashboard output:",
-                  file=sys.stderr)
+            print(
+                "CHECK: bare VERIFIED token found in dashboard output:", file=sys.stderr
+            )
             for ln in offending:
                 print(f"  {ln}", file=sys.stderr)
             return 1
-        print("CHECK: clean, no bare VERIFIED token in dashboard output",
-              file=sys.stderr)
+        print(
+            "CHECK: clean, no bare VERIFIED token in dashboard output", file=sys.stderr
+        )
         return 0
     if as_json:
         print(json.dumps(dashboard, indent=2))
@@ -1027,19 +1179,31 @@ def emit_dashboard(dashboard: dict, code: int, *, as_json: bool,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--records", required=True, type=Path)
-    ap.add_argument("--require", default=None,
-                    help="comma-separated claim IDs the profile requires; on its "
-                         "own it declares no obligation set, so obligation kinds, "
-                         "required_targets and manifest freshness do not bind")
-    ap.add_argument("--manifest", type=Path, default=None,
-                    help="obligation manifest: the required claim IDs, their "
-                         "kinds, each record's expected required_targets, and the "
-                         "manifest hash records must be bound to")
+    ap.add_argument(
+        "--require",
+        default=None,
+        help="comma-separated claim IDs the profile requires; on its "
+        "own it declares no obligation set, so obligation kinds, "
+        "required_targets and manifest freshness do not bind",
+    )
+    ap.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="obligation manifest: the required claim IDs, their "
+        "kinds, each record's expected required_targets, and the "
+        "manifest hash records must be bound to",
+    )
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--check", action="store_true",
-                     help="self-conformance: exit nonzero if this tool's own "
-                          "rendered output would ever emit a bare VERIFIED")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="self-conformance: exit nonzero if this tool's own "
+        "rendered output would ever emit a bare VERIFIED",
+    )
     args = ap.parse_args()
+    # Keep symlink components visible to v4 validation.
+    args.records = args.records.absolute()
 
     root = gate.infer_repo_root(args.records)
     try:
@@ -1050,10 +1214,14 @@ def main() -> int:
         return 2
     if is_v4:
         try:
-            required = ([c.strip() for c in args.require.split(",") if c.strip()]
-                        if args.require is not None else None)
+            required = (
+                [c.strip() for c in args.require.split(",") if c.strip()]
+                if args.require is not None
+                else None
+            )
             dashboard, code = build_v4_dashboard(
-                root, args.records, args.manifest, required)
+                root, args.records, args.manifest, required
+            )
         except (OSError, ValueError) as e:
             print(f"ERROR: cannot assess v4 records: {e}", file=sys.stderr)
             print(verdict_line("ERROR"), file=sys.stderr)
@@ -1098,16 +1266,21 @@ def main() -> int:
     elif args.manifest:
         required = manifest_required
     else:
-        print("ERROR: pass --require or --manifest — a dashboard with no "
-              "required claims covers nothing", file=sys.stderr)
+        print(
+            "ERROR: pass --require or --manifest — a dashboard with no "
+            "required claims covers nothing",
+            file=sys.stderr,
+        )
         print(verdict_line("ERROR"), file=sys.stderr)
         return 2
 
     if args.manifest and args.require:
         unknown = sorted(set(required) - set(kinds))
         if unknown:
-            print(f"ERROR: required claims absent from manifest: {unknown}",
-                  file=sys.stderr)
+            print(
+                f"ERROR: required claims absent from manifest: {unknown}",
+                file=sys.stderr,
+            )
             print(verdict_line("ERROR"), file=sys.stderr)
             return 2
 
@@ -1121,15 +1294,25 @@ def main() -> int:
         for cid in list(required):
             if kinds.get(cid) != SYSTEM_CLAIM:
                 continue
-            added = [dep for dep in system_claims.get(cid, {}).get("depends_on", ())
-                     if dep not in required]
+            added = [
+                dep
+                for dep in system_claims.get(cid, {}).get("depends_on", ())
+                if dep not in required
+            ]
             if added:
                 dependency_expansion[cid] = added
                 required.extend(added)
 
-    dashboard, code = build_dashboard(args.records, required, records, kinds,
-                                      system_claims, dependency_expansion,
-                                      expected_targets, expect_manifest)
+    dashboard, code = build_dashboard(
+        args.records,
+        required,
+        records,
+        kinds,
+        system_claims,
+        dependency_expansion,
+        expected_targets,
+        expect_manifest,
+    )
 
     return emit_dashboard(dashboard, code, as_json=args.json, check=args.check)
 

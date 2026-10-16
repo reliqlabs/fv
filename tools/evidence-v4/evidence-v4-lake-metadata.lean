@@ -35,6 +35,18 @@ private def readPackage (cfg : LoadConfig) : LogIO (Package × NameMap String) :
 private def packageJSON (pkg : Package) (env : Lake.Env) (cfg : LoadConfig) (options : NameMap String) : Json := Json.mkObj [
   ("name", toJson pkg.prettyName),
   ("directory", toJson pkg.dir.toString),
+  ("sourceDirectories", toJson (#[pkg.srcDir.toString] ++ pkg.targetDecls.filterMap fun decl =>
+    if let some config := decl.toConfigDecl.leanLibConfig? then
+      some (pkg.srcDir / config.srcDir.normalize).toString
+    else if let some config := decl.toConfigDecl.leanExeConfig? then
+      some (pkg.srcDir / config.srcDir.normalize).toString
+    else none)),
+  ("inputPaths", toJson (pkg.targetDecls.filterMap fun decl =>
+    if let some config := decl.toConfigDecl.config? InputFile.configKind then
+      some (pkg.dir / config.path).toString
+    else if let some config := decl.toConfigDecl.config? InputDir.configKind then
+      some (pkg.dir / config.path).toString
+    else none)),
   ("configuration", toJson pkg.configFile.toString),
   ("configurationOptions", toJson options),
   ("configurationCacheDirectory", toJson cfg.configDir.toString),
@@ -59,7 +71,12 @@ private def packageJSON (pkg : Package) (env : Lake.Env) (cfg : LoadConfig) (opt
   ("archiver", toJson env.lean.ar.toString),
   ("nativeArguments", toJson (pkg.config.weakLeancArgs ++ pkg.config.moreLeancArgs ++ pkg.config.weakLinkArgs ++ pkg.config.moreLinkArgs)),
   ("leanArguments", toJson (pkg.config.weakLeanArgs ++ pkg.config.moreLeanArgs)),
-  ("unresolvedNativeTargets", toJson (!pkg.config.moreLinkObjs.isEmpty || !pkg.config.moreLinkLibs.isEmpty || pkg.targetDecls.any fun decl => decl.kind.isAnonymous || decl.kind == ExternLib.configKind)),
+  ("unresolvedNativeTargets", toJson (!pkg.config.moreLinkObjs.isEmpty || !pkg.config.moreLinkLibs.isEmpty || pkg.targetDecls.any fun decl =>
+    if let some config := decl.toConfigDecl.leanLibConfig? then
+      !config.moreLinkObjs.isEmpty || !config.moreLinkLibs.isEmpty
+    else if let some config := decl.toConfigDecl.leanExeConfig? then
+      !config.moreLinkObjs.isEmpty || !config.moreLinkLibs.isEmpty
+    else decl.kind.isAnonymous || decl.kind == ExternLib.configKind)),
   ("targetArguments", Json.arr (pkg.targetDecls.filterMap fun decl =>
     if let some config := decl.toConfigDecl.leanLibConfig? then
       some (Json.mkObj [("native", toJson (config.weakLeancArgs ++ config.moreLeancArgs ++ config.weakLinkArgs ++ config.moreLinkArgs)), ("lean", toJson (config.weakLeanArgs ++ config.moreLeanArgs))])
