@@ -46,7 +46,7 @@ const resolveCommand = async (command, cwd=input.root) => {
 try {
   const result=await discoverRustAdapter({
     root:input.root,cwd:input.root,cwdRelative:'.',subject:input.subject,effectiveEnv:input.env,
-    declaration:{locator:{mode:'adapter',value:'cargo-toolchain',cwd:'.',subject:input.subject}},
+    declaration:{locator:{mode:'adapter',value:input.adapter??'cargo-toolchain',cwd:'.',subject:input.subject}},
     applicationContexts:[],
     resolveCommand,
     probe:async(command,options={})=>{
@@ -149,13 +149,60 @@ class CargoFixture:
             env=self.env,
         )
 
-    def capture(self, *args, env=None, entry=None):
+    def kani(self):
+        home = Path(self.env["CARGO_HOME"])
+        distribution = self.base / "kani"
+        (distribution / "toolchain").parent.mkdir()
+        (distribution / "toolchain").symlink_to(self.case.sysroot)
+        (distribution / "rust-toolchain-version").write_text(
+            Path(self.case.sysroot).name
+        )
+        (distribution / "rustc-version").write_text(
+            command(self.case.rustc, "--version")
+        )
+        for directory in ("lib", "library", "no_core", "playback"):
+            (distribution / directory).mkdir()
+        for filename in (
+            home / "bin/cargo-kani",
+            *(
+                distribution / "bin" / name
+                for name in (
+                    "kani-driver",
+                    "kani-compiler",
+                    "cbmc",
+                    "goto-cc",
+                    "goto-instrument",
+                    "goto-analyzer",
+                    "kissat",
+                )
+            ),
+        ):
+            filename.parent.mkdir(parents=True, exist_ok=True)
+            filename.write_text("#!/bin/sh\nprintf 'kani 0.0.0\\n'\n")
+            filename.chmod(0o755)
+        (home / ".crates2.json").write_text(
+            json.dumps(
+                {
+                    "installs": {
+                        "kani-verifier 0.0.0 (registry+https://github.com/rust-lang/crates.io-index)": {
+                            "bins": ["cargo-kani"]
+                        }
+                    }
+                }
+            )
+        )
+        self.env["KANI_HOME"] = str(distribution)
+        self.env["PATH"] = str(home / "bin") + os.pathsep + self.env["PATH"]
+        return home / "bin/cargo-kani"
+
+    def capture(self, *args, env=None, entry=None, adapter="cargo-toolchain"):
         result = subprocess.run(
             [shutil.which("bun"), "--eval", PROGRAM],
             input=json.dumps(
                 {
                     "root": str(self.root),
                     "subject": [entry or self.case.cargo, *(args or ("build",))],
+                    "adapter": adapter,
                     "env": {**self.env, **(env or {})},
                 }
             ),
@@ -863,6 +910,274 @@ class RustReview(unittest.TestCase):
             '#[cfg_attr(unix, link(name="unbound_vendor", kind="static"))] extern "C" {}\n',
         )
         self.assert_refused(fixture.capture(), "Rust-source native linkage")
+
+    def test_r3_ca06_aliases_refuse_before_any_probe(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        for config in ('[alias]\nkani=["run"]\n', "[alias]\n"):
+            fixture.write(".cargo/config.toml", config)
+            result = fixture.capture()
+            self.assert_refused(result, "Cargo alias configuration")
+            self.assertEqual(result["probes"], [])
+        fixture.write(".cargo/config.toml", "")
+        fixture.write("ci/cargo.toml", '[alias]\nkani="run"\n')
+        for argument in ("ci/cargo.toml", 'alias.kani="run"'):
+            self.assert_refused(
+                fixture.capture("build", "--config", argument),
+                "Cargo alias configuration",
+            )
+        for name, value in (("CARGO_ALIAS_KANI", "run"), ("CARGO_ALIAS_OTHER", "")):
+            result = fixture.capture(env={name: value})
+            self.assert_refused(result, "Cargo alias environment")
+            self.assertEqual(result["probes"], [])
+
+    def test_r3_ca06_cargo_home_launcher_precedence_matches_cargo(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        home_launcher = fixture.kani()
+        path_launcher = fixture.base / "path-bin/cargo-kani"
+        path_launcher.parent.mkdir()
+        path_launcher.write_text("#!/bin/sh\nprintf 'kani 0.0.0\\n'\n")
+        path_launcher.chmod(0o755)
+        original = fixture.env["PATH"].split(os.pathsep, 1)[1]
+        path_only = str(path_launcher.parent) + os.pathsep + original
+        result = fixture.capture(
+            "kani", adapter="kani-toolchain", env={"PATH": path_only}
+        )
+        self.assert_refused(result, "Cargo-selected cargo-kani differs")
+        self.assertEqual(result["probes"], [])
+        for search, expected in (
+            (fixture.env["PATH"], home_launcher),
+            (
+                str(path_launcher.parent) + os.pathsep + fixture.env["PATH"],
+                path_launcher,
+            ),
+        ):
+            with self.subTest(search=search):
+                result = fixture.capture(
+                    "kani", adapter="kani-toolchain", env={"PATH": search}
+                )
+                self.assertTrue(result["ok"], result)
+                launcher = next(
+                    root["path"]
+                    for root in result["roots"]
+                    if root["label"] == "config/kani-launcher"
+                )
+                self.assertEqual(launcher, str(expected))
+        home_launcher.chmod(0o644)
+        result = fixture.capture(
+            "kani", adapter="kani-toolchain", env={"PATH": path_only}
+        )
+        self.assertTrue(result["ok"], result)
+        home_launcher.chmod(0o755)
+        for env in (
+            {"CARGO_HOME": str(home_launcher.parent.parent) + "/../cargo-home"},
+            {"PATH": path_only + os.pathsep + str(fixture.base / "unused/../bin")},
+        ):
+            self.assert_refused(
+                fixture.capture("kani", adapter="kani-toolchain", env=env),
+                "parent-traversing Cargo subcommand search paths",
+            )
+
+    def test_r3_ca04_solver_attributes_scan_graph_and_included_sources(self):
+        fixture = CargoFixture(self)
+        fixture.package("dependency", "dependency")
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        fixture.kani()
+        for filename, source in (
+            ("src/lib.rs", '#[kani::solver(bin = "/opt/sat")] fn proof() {}'),
+            (
+                "dependency/src/lib.rs",
+                '#[cfg_attr(kani, kani::solver(bin="/opt/sat"))] pub fn value() -> u8 { 1 }',
+            ),
+            ("src/proof.txt", '#[kani :: solver (bin = r#"/opt/sat"#)] fn proof() {}'),
+        ):
+            with self.subTest(filename=filename):
+                fixture.write("src/lib.rs", 'include!("proof.txt");')
+                fixture.write("dependency/src/lib.rs", "pub fn value() -> u8 { 1 }")
+                fixture.write("src/proof.txt", "pub fn proof() {}")
+                fixture.write(filename, source)
+                self.assert_refused(
+                    fixture.capture("kani", adapter="kani-toolchain"),
+                    "Kani solver attribute",
+                )
+        fixture.write("src/lib.rs", "#[kani::solver(kissat)] fn proof() {}")
+        fixture.write("src/proof.txt", '// #[kani::solver(bin="/opt/comment")]\n')
+        fixture.write("dependency/src/lib.rs", "pub fn value() -> u8 { 1 }")
+        result = fixture.capture("kani", adapter="kani-toolchain")
+        self.assertTrue(result["ok"], result)
+
+    def test_r3_ca04_kani_manifest_overrides_refuse(self):
+        for scope in ("package", "workspace"):
+            for value in (
+                '[{}.metadata.kani.flags]\nsolver="bin=/opt/sat"',
+                '[{}.metadata.kani]\nflags=["--solver=bin=/opt/sat"]',
+            ):
+                with self.subTest(scope=scope, value=value):
+                    fixture = CargoFixture(self)
+                    fixture.lock()
+                    fixture.kani()
+                    fixture.manifest_tail(value.format(scope))
+                    self.assert_refused(
+                        fixture.capture("kani", adapter="kani-toolchain"),
+                        "Kani package/workspace metadata overrides",
+                    )
+        fixture = CargoFixture(self)
+        fixture.package(
+            "dependency",
+            "dependency",
+            tail='[package.metadata.kani.flags]\nsolver="bin=/opt/sat"',
+        )
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        fixture.kani()
+        self.assert_refused(
+            fixture.capture("kani", adapter="kani-toolchain"),
+            "Kani package/workspace metadata overrides",
+        )
+
+    def test_r3_ca03_toolchain_files_require_only_a_channel(self):
+        rustup = shutil.which("rustup")
+        if not rustup:
+            self.skipTest("requires rustup")
+        fixture = CargoFixture(self)
+        fixture.lock()
+        proxy = fixture.base / "proxy/cargo"
+        proxy.parent.mkdir()
+        proxy.symlink_to(rustup)
+        channel = Path(self.sysroot).name
+        env = {
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
+        }
+        for filename in ("rust-toolchain", "rust-toolchain.toml"):
+            for content in (
+                '[toolchain]\npath="/opt/rust-dev"\n',
+                '[toolchain]\nchannel="' + channel + '"\npath="/opt/rust-dev"\n',
+                '[toolchain]\nchannel="' + channel + '"\ncomponents=["clippy"]\n',
+                '[toolchain]\nchannel="'
+                + channel
+                + '"\ntargets=["wasm32-unknown-unknown"]\n',
+                '[toolchain]\nchannel="' + channel + '"\nprofile="minimal"\n',
+                'unknown=true\n[toolchain]\nchannel="' + channel + '"\n',
+                "[toolchain]\n",
+            ):
+                with self.subTest(filename=filename, content=content):
+                    target = fixture.write(filename, content)
+                    self.assert_refused(
+                        fixture.capture(entry=str(proxy), env=env),
+                        "rust-toolchain file",
+                    )
+            target.unlink()
+        fixture.write("rust-toolchain.toml", '[toolchain]\nchannel="' + channel + '"\n')
+        result = fixture.capture(entry=str(proxy), env=env)
+        self.assertTrue(result["ok"], result)
+
+    def test_r3_ca02_config_include_refuses_every_source(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        fixture.write(".cargo/config.toml", 'include=["/opt/shared/cargo.toml"]\n')
+        self.assert_refused(fixture.capture(), "Cargo config include")
+        fixture.write(".cargo/config.toml", "")
+        fixture.write("ci/cargo.toml", 'include=["/opt/shared/cargo.toml"]\n')
+        for argument in (
+            "ci/cargo.toml",
+            'include=["/opt/shared/cargo.toml"]',
+            "include=[]",
+        ):
+            with self.subTest(argument=argument):
+                result = fixture.capture("build", "--config", argument)
+                self.assert_refused(result, "Cargo config include")
+                self.assertEqual(result["probes"], [])
+
+    def test_r3_ca01_cargo_features_refuse_root_and_dependency_manifests(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        fixture.write(
+            "Cargo.toml",
+            'cargo-features=["profile-rustflags"]\n'
+            + fixture.manifest
+            + '\n[profile.dev]\nrustflags=["@/opt/kani.args"]\n',
+        )
+        self.assert_refused(fixture.capture(), "manifest cargo-features")
+        fixture = CargoFixture(self)
+        fixture.package("dependency", "dependency")
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        manifest = fixture.root / "dependency/Cargo.toml"
+        manifest.write_text("cargo-features=[]\n" + manifest.read_text())
+        self.assert_refused(fixture.capture(), "manifest cargo-features")
+
+    def test_r3_ca05_kani_cfg_dependency_tables_refuse_before_graph_selection(self):
+        for selector in (
+            "cfg(kani)",
+            "cfg( kani )",
+            "cfg(all(unix, kani))",
+            "cfg(not(kani))",
+        ):
+            with self.subTest(selector=selector):
+                fixture = CargoFixture(self)
+                fixture.package("hidden", "hidden", build="fn main() {}")
+                fixture.manifest_tail(
+                    "[target."
+                    + json.dumps(selector)
+                    + '.dependencies]\nhidden={path="hidden"}'
+                )
+                fixture.lock()
+                fixture.kani()
+                result = fixture.capture("kani", adapter="kani-toolchain")
+                self.assert_refused(result, "cfg(kani)-selected dependency tables")
+                self.assertFalse(
+                    any(probe["command"][1:2] == ["tree"] for probe in result["probes"])
+                )
+        fixture = CargoFixture(self)
+        fixture.package("hidden", "hidden")
+        fixture.package(
+            "dependency",
+            "dependency",
+            tail='[target."cfg(kani)".build-dependencies]\nhidden={path="../hidden"}',
+        )
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        fixture.kani()
+        self.assert_refused(
+            fixture.capture("kani", adapter="kani-toolchain"),
+            "cfg(kani)-selected dependency tables",
+        )
+
+    def test_r3_ca07_renamed_inclusion_macros_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.package("dependency", "dependency")
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        fixture.write(
+            "src/lib.rs",
+            "pub fn copy(include: &str) { let include = include.to_owned(); drop(include); }",
+        )
+        self.assertTrue(fixture.capture()["ok"])
+        for macro in ("include", "include_str", "include_bytes"):
+            for filename in ("src/lib.rs", "dependency/src/lib.rs", "src/code.txt"):
+                with self.subTest(macro=macro, filename=filename):
+                    fixture.write("src/lib.rs", 'include!("code.txt");')
+                    fixture.write("src/code.txt", "pub fn value() -> u8 { 1 }")
+                    fixture.write("dependency/src/lib.rs", "pub fn value() -> u8 { 1 }")
+                    fixture.write(
+                        filename,
+                        f'use core::{{{macro} as grab}}; grab!("/opt/unbound");',
+                    )
+                    self.assert_refused(
+                        fixture.capture(), "Rust inclusion macro imports"
+                    )
+
+    def test_r3_ca08_cross_target_proc_macro_refuses_unbound_host_linker(self):
+        fixture = CargoFixture(self)
+        fixture.package("macro", "host-macro", proc_macro=True)
+        fixture.manifest_tail('[dependencies]\nhost-macro={path="macro"}')
+        fixture.lock()
+        result = fixture.capture("build", "--target", "wasm32-unknown-unknown")
+        self.assert_refused(
+            result, "cross-target host linker requires a distinct host context"
+        )
 
     def test_ca08_incremental_target_and_bench_profile_selection(self):
         fixture = CargoFixture(self)

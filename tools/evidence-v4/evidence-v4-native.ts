@@ -676,12 +676,8 @@ async function requireGroupAnchor(identity: OwnedProcess, known: readonly OwnedP
 	for (const previous of known) {
 		if (previous.process_group !== identity.process_group || previous.session_id !== identity.session_id) continue;
 		const current = await readProcessIdentity(previous.pid);
-		if (!current) continue;
-		if (
-			!sameProcess(previous, current) ||
-			current.process_group !== previous.process_group ||
-			current.session_id !== previous.session_id
-		)
+		if (!current || !sameProcess(previous, current)) continue;
+		if (current.process_group !== previous.process_group || current.session_id !== previous.session_id)
 			throw new Error("owned process birth or group identity changed");
 		return;
 	}
@@ -1603,9 +1599,8 @@ export class NativeSession {
 				for (const entry of owned) {
 					if (entry.terminated_at) continue;
 					const current = await readProcessIdentity(entry.process.pid);
-					if (entry.terminated_at || !current) continue;
+					if (entry.terminated_at || !current || !sameProcess(current, entry.process)) continue;
 					if (
-						!sameProcess(current, entry.process) ||
 						current.process_group !== entry.process.process_group ||
 						current.session_id !== entry.process.session_id
 					) {

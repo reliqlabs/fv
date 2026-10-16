@@ -25,7 +25,7 @@ COMMON = REPO / "tools/evidence-v4/evidence-v4-toolchain-common.ts"
 SEAMS = r"""
 // Test-local exports leave the producer's public API unchanged.
 export const review = {
-  darwin, processTable, groupStopped, signalOwned, verifyCollectorGate, COLLECTOR_GATE,
+  darwin, processTable, requireGroupAnchor, groupStopped, signalOwned, verifyCollectorGate, COLLECTOR_GATE,
   setIdentity(value) { readProcessIdentity = value; },
   setTable(value) { processTable = value; },
   setDarwin(value) { darwinSymbols = value; darwinLibrary = Promise.resolve(value); },
@@ -233,6 +233,129 @@ try {
                 ),
                 result,
             )
+
+    def test_exited_member_pid_reuse_in_live_group_requires_new_admission(self):
+        for mode in ("foreign", "descendant", "escape"):
+            with (
+                self.subTest(mode=mode),
+                tempfile.TemporaryDirectory(prefix="r38-live-pid-") as directory,
+            ):
+                root = Path(directory).resolve()
+                result = native(
+                    r"""
+const realIdentity = native.readProcessIdentity, realTable = native.review.processTable;
+const session = await native.createNativeSession({cwd: input.cwd, runId: randomUUID()});
+const { createServer } = await import('node:net');
+let connection, canExit = false;
+const server = createServer(socket => {
+  connection = socket;
+  if (canExit) socket.end('1');
+});
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+const realSpawn = Bun.spawn;
+let direct, member, recycled = false, censused = false;
+Bun.spawn = options => {
+  direct = realSpawn(options);
+  member = identity(2000000000, direct.pid, direct.pid);
+  return direct;
+};
+const reused = () => ({
+  ...member, parent_pid: input.mode === 'foreign' ? process.pid : direct.pid,
+  process_group: input.mode === 'descendant' ? direct.pid : member.pid,
+  session_id: input.mode === 'descendant' ? direct.pid : member.pid,
+  process_start_id: 'reused-in-live-group',
+});
+native.review.setIdentity(async pid => {
+  if (member?.pid === pid)
+    return direct.exitCode === null && direct.signalCode === null ? recycled ? reused() : member : null;
+  return realIdentity(pid);
+});
+native.review.setTable(owned => {
+  const rows = realTable(owned);
+  if (direct?.exitCode === null && direct.signalCode === null) {
+    if (session.owner.children.some(value => value.pid === member.pid)) recycled = true;
+    if (recycled && censused && !canExit) {
+      canExit = true;
+      connection?.end('1');
+    }
+    const current = recycled ? reused() : member;
+    rows.push({pid: current.pid, ppid: current.parent_pid, pgid: current.process_group});
+    if (recycled) censused = true;
+  }
+  return rows;
+});
+try {
+  const value = await session.run({command: [input.python, '-c',
+    'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10); s.recv(1)',
+    String(server.address().port)], environment: input.environment, timeoutSeconds: null});
+  emit({...await finish(session, value), censused, memberPid: member.pid});
+} finally {
+  Bun.spawn = realSpawn;
+  connection?.destroy();
+  server.close();
+}
+""",
+                    {
+                        "cwd": str(root),
+                        "mode": mode,
+                        "python": str(Path(sys.executable).resolve()),
+                        "environment": native_environment(root),
+                    },
+                )
+                self.assertTrue(result["censused"], result)
+                registrations = [
+                    entry["process"]
+                    for entry in result["ownership"]["children"]
+                    if entry["process"]["pid"] == result["memberPid"]
+                ]
+                self.assertEqual(
+                    len(registrations), 2 if mode == "descendant" else 1, result
+                )
+                if mode == "escape":
+                    self.assertIn("escaped owned groups", result["error"], result)
+                    self.assertTrue(result["releaseError"], result)
+                    self.assertTrue(
+                        any(
+                            window["state"] == "indeterminate"
+                            for window in result["ownership"]["spawn_windows"]
+                        ),
+                        result,
+                    )
+                else:
+                    self.assertEqual(result["termination"]["exit_code"], 0, result)
+                    self.assertIsNone(result["error"], result)
+                    self.assertIsNone(result["releaseError"], result)
+                if mode == "descendant":
+                    self.assertEqual(
+                        registrations[-1]["process_start_id"],
+                        "reused-in-live-group",
+                        result,
+                    )
+
+    def test_group_anchor_skips_reused_birth_but_refuses_changed_group_or_session(self):
+        result = native(r"""
+const original = identity(41001), survivor = identity(41002, original.pid, original.pid);
+const results = [];
+for (const mode of ['survivor', 'unanchored', 'group', 'session']) {
+  const current = {...original,
+    process_start_id: mode === 'group' || mode === 'session' ? original.process_start_id : 'reused-birth',
+    process_group: mode === 'group' ? 42001 : original.process_group,
+    session_id: mode === 'session' ? 42001 : original.session_id};
+  native.review.setIdentity(async pid => pid === original.pid ? current : survivor);
+  let error = null;
+  try { await native.review.requireGroupAnchor(original,
+    mode === 'unanchored' ? [original] : [original, survivor]); }
+  catch (failure) { error = String(failure); }
+  results.push({mode, error});
+}
+emit({results});
+""")
+        for row in result["results"]:
+            with self.subTest(mode=row["mode"]):
+                if row["mode"] == "survivor":
+                    self.assertIsNone(row["error"], row)
+                else:
+                    self.assertTrue(row["error"], row)
 
     def test_released_hosted_pid_reuse_is_ignored_or_admitted_by_new_birth(self):
         for mode in ("foreign", "descendant"):

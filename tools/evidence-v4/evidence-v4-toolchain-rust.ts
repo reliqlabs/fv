@@ -389,6 +389,8 @@ function selection(subject: readonly string[]): Selection {
 
 type Configuration = { values: Table; roots: ToolRoot[]; bases: Map<string, string> };
 async function configuration(context: AdapterContext, selected: Selection): Promise<Configuration> {
+	for (const name of Object.keys(context.effectiveEnv))
+		if (name.startsWith("CARGO_ALIAS_")) fail("Cargo alias environment is unsupported: " + name);
 	const roots: ToolRoot[] = [];
 	const bases = new Map<string, string>();
 	const files: { filename: string; base: string; label: string }[] = [];
@@ -426,6 +428,7 @@ async function configuration(context: AdapterContext, selected: Selection): Prom
 		if (seen.has(real)) continue;
 		seen.add(real);
 		const value = parseCargoTOML(await readText(real));
+		if (value.alias !== undefined) fail("Cargo alias configuration is unsupported");
 		if (value.include !== undefined) fail("Cargo config include needs an explicit supported selection");
 		merge(values, value);
 		noteBase(value, file.base);
@@ -444,6 +447,8 @@ async function configuration(context: AdapterContext, selected: Selection): Prom
 			base = path.dirname(path.dirname(filename));
 			roots.push({ label: `config/command/${index}`, path: filename });
 		}
+		if (value.alias !== undefined) fail("Cargo alias configuration is unsupported");
+		if (value.include !== undefined) fail("Cargo config include needs an explicit supported selection");
 		merge(values, value);
 		noteBase(value, base);
 	}
@@ -497,10 +502,18 @@ async function rustupSelection(
 				if ((await exists(plain)) || (await exists(toml))) {
 					const filename = (await exists(plain)) ? plain : toml;
 					const bytes = await readText(filename);
-					named =
-						filename === plain && !bytes.trimStart().startsWith("[")
-							? bytes.trim()
-							: string(table(parseCargoTOML(bytes).toolchain).channel, "rust-toolchain channel");
+					if (filename === plain && /^[A-Za-z0-9._-]+$/.test(bytes.trim())) named = bytes.trim();
+					else {
+						const value = parseCargoTOML(bytes);
+						const toolchain = table(value.toolchain);
+						if (
+							Object.keys(value).some((key) => key !== "toolchain") ||
+							Object.keys(toolchain).some((key) => key !== "channel")
+						)
+							fail("unsupported rust-toolchain file key");
+						named = string(toolchain.channel, "rust-toolchain channel");
+					}
+					if (!named) fail("rust-toolchain file requires a channel");
 					roots.push({ label: "config/rust-toolchain", path: filename });
 					break;
 				}
@@ -678,9 +691,44 @@ async function applicationGraph(
 	};
 	const base = ["--offline", "--locked", ...selected.configArgs];
 	const manifestArgs = selected.manifest ? ["--manifest-path", path.resolve(context.cwd, selected.manifest)] : [];
+	const checkedManifests = new Set<string>();
+	async function checkManifest(filename: string): Promise<void> {
+		const real = await requiredReal(filename);
+		if (checkedManifests.has(real)) return;
+		const manifest = parseCargoTOML(await readText(real));
+		if (manifest["cargo-features"] !== undefined) fail("manifest cargo-features is unsupported: " + filename);
+		for (const scope of ["package", "workspace"])
+			if (table(table(manifest[scope]).metadata).kani !== undefined)
+				fail("Kani package/workspace metadata overrides are unsupported: " + filename);
+		if (selected.operation === "kani")
+			for (const [key, value] of Object.entries(table(manifest.target)))
+				if (
+					/^\s*cfg\s*\(/.test(key) &&
+					/\bkani\b/.test(key) &&
+					["dependencies", "dev-dependencies", "build-dependencies"].some((kind) => Object.hasOwn(table(value), kind))
+				)
+					fail("cfg(kani)-selected dependency tables are unsupported: " + filename);
+		checkedManifests.add(real);
+	}
+	if (selected.manifest) await checkManifest(path.resolve(context.cwd, selected.manifest));
+	else {
+		let directory = context.cwd;
+		while (true) {
+			const filename = path.join(directory, "Cargo.toml");
+			if (await exists(filename)) {
+				await checkManifest(filename);
+				break;
+			}
+			const parent = path.dirname(directory);
+			if (parent === directory) break;
+			directory = parent;
+		}
+	}
 	const first = metadata(await probe(["metadata", "--format-version", "1", "--no-deps", ...base, ...manifestArgs]));
 	const workspace = await requiredReal(first.workspace_root);
 	if (!beneath(await requiredReal(context.root), workspace)) fail("workspace escapes project source closure");
+	await checkManifest(path.join(workspace, "Cargo.toml"));
+	for (const pkg of first.packages) await checkManifest(pkg.manifest_path);
 	const onePackage =
 		selected.packages.length === 1
 			? first.packages.filter(
@@ -700,6 +748,7 @@ async function applicationGraph(
 			...featureArgs(selected),
 		]),
 	);
+	for (const pkg of full.packages) await checkManifest(pkg.manifest_path);
 	const lockfile = path.join(workspace, "Cargo.lock");
 	const lock = parseCargoTOML(await readText(lockfile)).package;
 	if (!Array.isArray(lock)) fail("Cargo.lock lacks package entries");
@@ -810,8 +859,10 @@ async function applicationGraph(
 			let index = 0;
 			while (true) {
 				const manifest = path.join(parent, "Cargo.toml");
-				if (parent !== directory && (await exists(manifest)))
+				if (parent !== directory && (await exists(manifest))) {
+					await checkManifest(manifest);
 					roots.push({ label: `config/git/${digest}/${index++}`, path: manifest });
+				}
 				if (await exists(path.join(parent, ".git"))) break;
 				const next = path.dirname(parent);
 				if (next === parent) fail(`missing Git checkout boundary for ${pkg.name}`);
@@ -1166,6 +1217,9 @@ function assertRustSourceIncludes(
 ): boolean {
 	let code = rustSourceCode(source);
 	if (code === null) fail("unclassified Rust source inclusion syntax in " + filename);
+	for (const match of code.matchAll(/\bkani\s*::\s*solver\s*\(([^)]*)\)/g))
+		if (!/^kissat\s*,?$/.test(match[1].trim()))
+			fail("Kani solver attribute requires the installed pinned kissat selection in " + filename);
 	if (inactiveTests) {
 		const start = code.search(/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*\{/);
 		if (start >= 0) code = code.slice(0, start);
@@ -1174,6 +1228,8 @@ function assertRustSourceIncludes(
 		code = code.replace(/#\s*\[\s*cfg_attr\s*\(\s*serde_build_from_git\s*,[\s\S]*?\]/g, (match) =>
 			" ".repeat(match.length),
 		);
+	if (/\buse\b[^;]*\binclude(?:_bytes|_str)?\b/.test(code))
+		fail("Rust inclusion macro imports are unsupported in " + filename);
 	function bound(value: string, sourceInput: boolean): void {
 		const resolved = path.resolve(path.dirname(filename), value);
 		const relative = path.relative(directory, resolved).split(path.sep).join("/");
@@ -1744,6 +1800,11 @@ async function nativeDependencies(
 		: target.includes("apple-darwin") || target.includes("linux")
 			? "cc"
 			: "rust-lld";
+	if (
+		target !== host &&
+		graph.some((pkg) => pkg.attestationHost || pkg.targets.some((item) => item.kind.includes("custom-build")))
+	)
+		fail("cross-target host linker requires a distinct host context");
 	const nativeDirectories = graph
 		.filter(
 			(pkg) =>
@@ -1796,8 +1857,6 @@ async function nativeDependencies(
 			if (pkg.links && (Object.hasOwn(targetConfig, pkg.links) || Object.hasOwn(table(targets[host]), pkg.links)))
 				fail("Cargo links override requires a supported native closure in " + pkg.name);
 			const usesCC = pkg.dependencies.some((dep) => dep.kind === "build" && dep.name === "cc");
-			if (usesCC && target !== host && pkg.attestationHost)
-				fail("cross-target host build/proc-macro native compilation requires a distinct host context in " + pkg.name);
 			if (!reviewed && !usesCC) fail("unreviewed build-script process/input closure in " + pkg.name);
 			if (reviewed) await assertReviewedBuildHelpers(pkg, packagesById, checkedHelpers);
 			if (usesCC) {
@@ -1934,6 +1993,41 @@ async function kaniContext(
 	const cargoHome =
 		context.effectiveEnv.CARGO_HOME || (context.effectiveEnv.HOME && path.join(context.effectiveEnv.HOME, ".cargo"));
 	if (!cargoHome) fail("Kani requires declared CARGO_HOME or HOME");
+	const homeBin = path.join(path.resolve(context.cwd, cargoHome), "bin");
+	const search = context.effectiveEnv.PATH === undefined ? [] : context.effectiveEnv.PATH.split(path.delimiter);
+	const homeSelector = context.effectiveEnv.CARGO_HOME || context.effectiveEnv.HOME || "";
+	if ([homeSelector, ...search].some((directory) => directory.split(path.sep).includes("..")))
+		fail("parent-traversing Cargo subcommand search paths are unsupported");
+	const homeComponents = homeBin
+		.split(path.sep)
+		.filter((part) => part && part !== ".")
+		.join(path.sep);
+	// Cargo preserves an explicit home-bin position in PATH instead of prepending it.
+	if (
+		!search.some(
+			(directory) =>
+				path.isAbsolute(directory) &&
+				directory
+					.split(path.sep)
+					.filter((part) => part && part !== ".")
+					.join(path.sep) === homeComponents,
+		)
+	)
+		search.unshift(homeBin);
+	let selectedLauncher: string | undefined;
+	for (const directory of search) {
+		const candidate = path.resolve(context.cwd, directory, "cargo-kani");
+		try {
+			const stat = await fs.stat(candidate);
+			if (stat.isFile() && stat.mode & 0o111) {
+				selectedLauncher = (await context.resolveCommand(candidate)).realpath;
+				break;
+			}
+		} catch (error) {
+			if (!["ENOENT", "ENOTDIR", "EACCES"].includes((error as NodeJS.ErrnoException).code || "")) throw error;
+		}
+	}
+	if (selectedLauncher !== launcher.realpath) fail("Cargo-selected cargo-kani differs from the bound PATH launcher");
 	const installationFile = path.join(path.resolve(context.cwd, cargoHome), ".crates2.json");
 	const installations = parseJSON(await fs.readFile(installationFile)) as {
 		installs?: Record<string, { bins?: string[] }>;
