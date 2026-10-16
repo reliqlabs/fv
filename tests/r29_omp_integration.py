@@ -171,6 +171,14 @@ def test_project_script_refresh(temporary: Path) -> None:
              str(project), "--refresh-project-scripts"],
             capture_output=True, text=True)
         files_after, directories_after = ancillary_state(project)
+        if state == "absent":
+            check("script-only refresh refuses a project without .fv and creates nothing",
+                  refreshed.returncode != 0
+                  and not (project / ".fv").exists()
+                  and files_after == files_before
+                  and directories_after == directories_before,
+                  refreshed.stdout + refreshed.stderr)
+            continue
         check(f"script-only refresh installs usable copies with {state} initializer state",
               refreshed.returncode == 0
               and all((project / ".fv" / "scripts" / name).read_bytes()
@@ -182,7 +190,7 @@ def test_project_script_refresh(temporary: Path) -> None:
               refreshed.stdout + refreshed.stderr)
         check(f"script-only refresh neither creates nor rewrites ancillary {state} state",
               files_after == files_before
-              and directories_after == directories_before | {".fv"},
+              and directories_after == directories_before,
               refreshed.stdout + refreshed.stderr)
 
 
