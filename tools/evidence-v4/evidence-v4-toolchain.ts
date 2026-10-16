@@ -11,6 +11,7 @@ import type {
 	Recipe,
 	ToolDeclaration,
 	ToolDiscovery,
+	ToolFile,
 	ToolIdentity,
 } from "./evidence-v4-model";
 import type { NativeSession } from "./evidence-v4-native";

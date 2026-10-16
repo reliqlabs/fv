@@ -503,7 +503,10 @@ export async function identifyQuint(context: AdapterContext): Promise<AdapterRes
 		const java = await context.resolveCommand("java");
 		for (const name of ["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "JVM_ARGS", "JVM_GC_ARGS"])
 			if (context.effectiveEnv[name]) throw new Error(`Unsupported JVM startup configuration in ${name}`);
-		const result = await probe(context, discovery, [java.invoked, "-XshowSettings:properties", "-version"]);
+		// Fix the discovery JVM's heap-reference mode; its default can vary with address placement.
+		const result = await probe(context, discovery, [
+			java.invoked, "-XX:-UseCompressedOops", "-XshowSettings:properties", "-version",
+		]);
 		const settings = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(result.stderr);
 		const home = settings.match(/^\s*java\.home = (.+)\r?$/mu)?.[1]?.trim();
 		if (!home) throw new Error("Cannot identify selected installed JVM");

@@ -140,3 +140,11 @@ Reviews of `6c787c2` are retained as `.fv/code-adversarial/2026-10-15-*-review-2
 | Proof toolchain and Lake sources | Proof CA-01, CA-03..CA-05 and Source CA-06, CA-09 refused at discovery: a restricted Lake DSL and CLI, no package overrides, symlink-before-`..` traversal, and Lean commands without an adapter. Proof CA-02, CA-06..CA-09 and Source CA-05, CA-07, CA-08, CA-11 fixed: `elan run` selector equality, the TLC classpath manifest, inode proxy equality, direct `.lean` subjects required, all files under input directories required, case-variant `.lean` files required, and generated namespaces and `.git` skipped in the walk. |
 
 Real captures of Dossier's `git`, `python-runtime` (checker plus both collectors), Cargo/Kani (EX-002, EX-003) and Lean declarations were admitted after these changes. Operational cost: a dependency update that touches a build script, or an unmodeled configuration form, now fails discovery until it is reviewed.
+
+## JVM discovery determinism (2026-10-16)
+
+Classification: implementation-only. Full Dossier planning at `936b350` failed final revalidation with identical Quint backend content digests and different JVM discovery stderr hashes. Retained executions showed the sole difference was `java.vm.compressedOopsMode`, alternating between `Zero based` and `Non-zero based`. The hashes were `9e36c1998e1173d222a7f12f3178598503a4c7a953b7fb0529f2f286c4bd6b77` and `80556ae92d0635c1e08f4a8dba5e3ba76f6cba8b1ffa9a48c798293e7f57f52d`.
+
+The properties-discovery JVM now uses `-XX:-UseCompressedOops`. Solver invocations and proof bounds are unchanged; exact discovery-output comparison remains enforced. The paired real-JVM regression failed before the fix and passed afterward. The proof adapter suite passed 34 tests; three existing helper-byte/native-binding/pnpm-boundary regressions passed. A full direct producer plan returned READY in 409,561 ms with 69 required records and 82 physical slots. This is preflight evidence only, not a proof result or activation verdict.
+
+The earlier indexed-origin/file lookup correction remains in the installed lineage; this change also supplies its missing `ToolFile` type import. General cross-run reuse is not qualified by these checks. Dossier's host explicitly disables it while the remaining round-3 findings stay open.

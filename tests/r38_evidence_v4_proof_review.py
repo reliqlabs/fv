@@ -63,7 +63,7 @@ try {
     process.exit(0);
   }
   const result = await (input.adapter === 'quint' ? identifyQuint(context) : identifyLean(context));
-  process.stdout.write(JSON.stringify({ok:true,sourceRequirements:result.sourceRequirements,roots:result.roots}));
+  process.stdout.write(JSON.stringify({ok:true,sourceRequirements:result.sourceRequirements,roots:result.roots,discovery:result.discovery}));
 } catch (error) {
   process.stdout.write(JSON.stringify({ok:false,error:error instanceof Error ? error.message : String(error)}));
 }
@@ -344,6 +344,35 @@ class TlcConfiguration(unittest.TestCase):
                 self.assertFalse(result["ok"], result)
                 self.assertIn("Unsupported JVM startup configuration", result["error"])
                 self.request["env"].pop(key)
+
+    @unittest.skipUnless(shutil.which("java"), "requires an installed JVM")
+    def test_java_discovery_is_independent_of_heap_address_layout(self):
+        self.jar(self.verification())
+        java = (
+            str(Path(os.environ["JAVA_HOME"]) / "bin/java")
+            if os.environ.get("JAVA_HOME")
+            else shutil.which("java")
+        )
+        self.request["commands"]["java"] = java
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+        [probe] = [
+            entry
+            for entry in result["discovery"]
+            if "-XshowSettings:properties" in entry["command"]
+        ]
+        outputs = []
+        for compressed in ("+", "-"):
+            run = subprocess.run(
+                [java, "-Xmx128m", f"-XX:{compressed}UseCompressedOops", *probe["command"][1:]],
+                cwd=self.root,
+                env=self.request["env"],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr.decode())
+            outputs.append((run.stdout, run.stderr))
+        self.assertEqual(outputs[0], outputs[1])
 
 
 def lean_installation():
