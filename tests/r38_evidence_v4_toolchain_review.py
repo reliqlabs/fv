@@ -752,6 +752,58 @@ else if(args[0]==='exec'){
         self.assertTrue(path_changed["ok"], path_changed)
         self.assertNotEqual(runtime_changed["digest"], path_changed["digest"])
 
+    def test_pnpm_virtual_store_links_are_bound_without_allowing_store_escape(self):
+        request = self.node_request()
+        store = self.root / "node_modules/.pnpm"
+        modules = store / "tsx@1.0.0/node_modules"
+        modules.mkdir(parents=True)
+        package = modules / "tsx"
+        (self.root / "node_modules/tsx").rename(package)
+        (self.root / "node_modules/tsx").symlink_to(
+            os.path.relpath(package, self.root / "node_modules"),
+            target_is_directory=True,
+        )
+        dependency = store / "esbuild@1.0.0/node_modules/esbuild"
+        self.write(
+            dependency / "package.json",
+            json.dumps({"name": "esbuild", "version": "1.0.0"}),
+        )
+        implementation = self.write(dependency / "index.js", "module.exports=1;\n")
+        hoisted = store / "node_modules"
+        hoisted.mkdir()
+        for link in (modules / "esbuild", hoisted / "esbuild"):
+            link.symlink_to(
+                os.path.relpath(dependency, link.parent), target_is_directory=True
+            )
+        self.shim.write_text(
+            SHIM.replace(
+                "__PATH__", os.pathsep.join(map(str, (modules, hoisted, self.injected)))
+            ),
+            encoding="utf-8",
+        )
+        before = invoke(request)
+        self.assertTrue(before["ok"], before)
+        link = next(
+            file
+            for file in before["files"]
+            if file["path"] == "execution/node-path/0/esbuild"
+        )
+        self.assertEqual(link["kind"], "symlink-directory")
+        self.assertTrue(
+            link["resolved_path"].startswith("execution/node-store/0/"), link
+        )
+        implementation.write_text("module.exports=2;\n", encoding="utf-8")
+        changed = invoke(request)
+        self.assertTrue(changed["ok"], changed)
+        self.assertNotEqual(before["digest"], changed["digest"])
+        (modules / "esbuild").unlink()
+        (modules / "esbuild").symlink_to(
+            os.path.relpath(self.injected, modules), target_is_directory=True
+        )
+        escaped = invoke(request)
+        self.assertFalse(escaped["ok"], escaped)
+        self.assertIn("Tool symlink escapes root boundary", escaped["error"])
+
     def test_tsx_typescript_parent_selects_ts_before_js(self):
         request = self.node_request(hidden=True)
         self.write(self.root / "entry.ts", "import './dependency.js';\n")

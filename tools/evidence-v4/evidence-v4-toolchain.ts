@@ -783,20 +783,52 @@ export async function discoverNativeAdapter(
 				const otool = await selectedOtool();
 				const loads = await context.probe([otool.invoked, "-l", image], { cwd });
 				discovery.push(loads.identity);
-				return parseMachOLoadCommands(probeText(loads));
+				try {
+					return parseMachOLoadCommands(probeText(loads));
+				} catch (error) {
+					throw new Error(`${error instanceof Error ? error.message : String(error)}: ${image}`);
+				}
 			})();
 			loadCommands.set(image, pending);
 		}
 		return pending;
 	};
+	// @executable_path names the process image, which for a shebang script is its interpreter.
+	const processImage = async (file: string, depth = 0): Promise<string> => {
+		const handle = await fs.open(file, "r");
+		const head = Buffer.alloc(256);
+		let length: number;
+		try {
+			({ bytesRead: length } = await handle.read(head, 0, 256, 0));
+		} finally {
+			await handle.close();
+		}
+		if (length >= 4 && MACHO_MAGIC.includes(head.readUInt32BE(0))) return file;
+		const prefix = head.subarray(0, length).toString("utf8");
+		if (!prefix.startsWith("#!") || depth > 2) throw new Error(`Unsupported native process image: ${file}`);
+		const tokens = prefix
+			.split("\n", 1)[0]
+			.slice(2)
+			.trim()
+			.split(/[ \t]+/u);
+		const interpreter =
+			path.basename(tokens[0]) === "env"
+				? tokens.length === 2
+					? tokens[1]
+					: (() => {
+							throw new Error(`Unsupported native shebang: ${file}`);
+						})()
+				: tokens[0];
+		return processImage((await context.resolveCommand(interpreter, cwd)).realpath, depth + 1);
+	};
 	const inspect = async (file: string, executable: string, inheritedRpaths: readonly string[] = []): Promise<void> => {
 		const real = await canonicalToolPath(file);
-		const executableReal = path.isAbsolute(executable)
+		const executableTarget = path.isAbsolute(executable)
 			? await canonicalToolPath(executable)
 			: (await context.resolveCommand(executable, cwd)).realpath;
 		const inputContext = D("native-input-context", {
 			image: real,
-			executable: executableReal,
+			executable: executableTarget,
 			rpaths: inheritedRpaths,
 		});
 		if (visited.has(inputContext)) return;
@@ -835,6 +867,7 @@ export async function discoverNativeAdapter(
 			}
 			return;
 		}
+		const executableReal = real === executableTarget ? real : await processImage(executableTarget);
 		const commands = await readLoadCommands(real);
 		const expand = (value: string, loader = real): string =>
 			path.resolve(
@@ -1000,12 +1033,29 @@ async function selectedNodeExecution(
 	await fs.access(executable, fs.constants.X_OK);
 	roots.push({ label: "execution/node-runtime", path: executable });
 	native.push(executable);
+	const stores = new Set<string>();
 	for (const [index, directory] of nodePath.split(path.delimiter).filter(Boolean).entries()) {
 		const selected = path.resolve(context.cwd, directory);
 		try {
 			if (!(await fs.stat(selected)).isDirectory())
 				throw new Error("Node module search entry is not a directory: " + selected);
-			roots.push({ label: "execution/node-path/" + index, path: selected });
+			let store = selected;
+			while (
+				path.dirname(store) !== store &&
+				!(path.basename(store) === ".pnpm" && path.basename(path.dirname(store)) === "node_modules")
+			)
+				store = path.dirname(store);
+			let linkBoundary: string | undefined;
+			if (path.basename(store) === ".pnpm" && path.basename(path.dirname(store)) === "node_modules") {
+				linkBoundary = await canonicalToolPath(store);
+				if (!inside(linkBoundary, await canonicalToolPath(selected)))
+					throw new Error("Node module search entry escapes pnpm virtual store: " + selected);
+				if (!stores.has(linkBoundary)) {
+					stores.add(linkBoundary);
+					roots.push({ label: "execution/node-store/" + index, path: linkBoundary, linkBoundary });
+				}
+			}
+			roots.push({ label: "execution/node-path/" + index, path: selected, linkBoundary });
 		} catch (error) {
 			if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
 		}
@@ -1214,7 +1264,18 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 	const hasher = new ToolHasher(),
 		identities = new Map<string, ToolIdentity>(),
 		adapters = new Map<string, AdapterResult>(),
-		origins = new Map<string, ToolRoot[]>();
+		origins = new Map<string, { label: string; base: string; directory: boolean; exclude?: readonly string[] }[]>(),
+		fileMaps = new Map<string, Map<string, ToolFile>>();
+	const setOrigins = async (id: string, roots: readonly ToolRoot[], files: readonly ToolFile[]): Promise<void> => {
+		const views: { label: string; base: string; directory: boolean; exclude?: readonly string[] }[] = [];
+		for (const view of roots) {
+			const base = await canonicalToolPath(view.path),
+				stat = await fs.stat(base);
+			views.push({ label: view.label, base, directory: stat.isDirectory(), exclude: view.exclude });
+		}
+		origins.set(id, views);
+		fileMaps.set(id, new Map(files.map((file) => [file.path, file])));
+	};
 	let generation = 0,
 		revalidationTail: Promise<void> = Promise.resolve();
 	const probes = new Map<string, Promise<ProbeResult>>(),
@@ -1487,7 +1548,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 				release: os.release(),
 				sdk: native.sdk ?? null,
 			};
-		origins.set("fv-producer", roots);
+		await setOrigins("fv-producer", roots, files);
 		return {
 			id: "fv-producer",
 			kind: "tree",
@@ -1585,7 +1646,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 					result = { roots, fileRequirements: [{ ids: [id], files: linked.map((value) => value.path) }] };
 					adapters.set(id, result);
 				}
-			} else if (process.platform === "darwin") {
+			} else if (process.platform === "darwin" && declaration.kind !== "tree") {
 				const rustupDriver =
 					locator.mode !== "command-relative" &&
 					["cargo", "rustc"].includes(path.basename(locator.value)) &&
@@ -1601,7 +1662,6 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 						!value.label.startsWith("drivers/discovery-") && value.label !== "sdk-settings" && value.path !== selected,
 				);
 				if (
-					declaration.kind !== "tree" &&
 					linked.some(
 						(value) =>
 							!value.label.startsWith("non-system-libraries/") &&
@@ -1609,7 +1669,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 					)
 				)
 					throw new Error("Unsupported non-adapter native driver closure: " + id);
-				if (linked.length && declaration.kind !== "tree") {
+				if (linked.length) {
 					identityKind = "tree";
 					roots = [
 						{ label: "selected-file", path: selected },
@@ -1657,7 +1717,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 				release: os.release(),
 				sdk: result?.sdk ?? null,
 			};
-		origins.set(id, roots);
+		await setOrigins(id, roots, files);
 		const digest = D("tool-content", { kind: identityKind, files, packages, system_dependencies });
 		if (declaration.accept.sha256.length && !declaration.accept.sha256.includes(digest))
 			throw new Error(`Unaccepted installed tool digest: ${id}`);
@@ -1689,14 +1749,12 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 					let bound = false;
 					for (const selected of scope)
 						for (const view of origins.get(selected) ?? []) {
-							const base = await canonicalToolPath(view.path),
-								stat = await fs.stat(base);
-							if (stat.isFile() ? base !== real : !inside(base, real)) continue;
-							const relative = stat.isDirectory() ? path.relative(base, real).split(path.sep).join("/") : "";
+							if (!view.directory ? view.base !== real : !inside(view.base, real)) continue;
+							const relative = view.directory ? path.relative(view.base, real).split(path.sep).join("/") : "";
 							if (view.exclude?.some((ex) => relative === ex || relative.startsWith(ex.replace(/\/$/u, "") + "/")))
 								continue;
 							const virtual = relative ? (view.label === "." ? relative : view.label + "/" + relative) : view.label,
-								entry = identities.get(selected)?.files.find((file) => file.path === virtual);
+								entry = fileMaps.get(selected)?.get(virtual);
 							if (
 								entry?.kind === "file" &&
 								entry.hash === bytes.hash &&
@@ -1748,15 +1806,16 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 			const bytes = await hasher.file(actual.realpath);
 			for (const id of closure(ids))
 				for (const view of origins.get(id) ?? []) {
-					const base = await canonicalToolPath(view.path),
-						stat = await fs.stat(base);
-					if ((stat.isFile() && base !== actual.realpath) || (stat.isDirectory() && !inside(base, actual.realpath)))
+					if (
+						(!view.directory && view.base !== actual.realpath) ||
+						(view.directory && !inside(view.base, actual.realpath))
+					)
 						continue;
-					const relative = stat.isDirectory() ? path.relative(base, actual.realpath).split(path.sep).join("/") : "";
+					const relative = view.directory ? path.relative(view.base, actual.realpath).split(path.sep).join("/") : "";
 					if (view.exclude?.some((ex) => relative === ex || relative.startsWith(ex.replace(/\/$/u, "") + "/")))
 						continue;
 					const virtual = relative ? (view.label === "." ? relative : view.label + "/" + relative) : view.label;
-					const entry = identities.get(id)?.files.find((file) => file.path === virtual);
+					const entry = fileMaps.get(id)?.get(virtual);
 					if (
 						entry?.kind === "file" &&
 						entry.hash === bytes.hash &&

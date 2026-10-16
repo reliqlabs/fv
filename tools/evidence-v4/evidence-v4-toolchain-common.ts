@@ -5,7 +5,7 @@ import { D, H, parseJSON, utf8Compare } from "./evidence-v4-model";
 import type { Cwd, Hash, PackageIdentity, Recipe, ToolDeclaration, ToolDiscovery, ToolFile } from "./evidence-v4-model";
 import type { NativeSession } from "./evidence-v4-native";
 
-export type ToolRoot = { label: string; path: string; exclude?: readonly string[] };
+export type ToolRoot = { label: string; path: string; exclude?: readonly string[]; linkBoundary?: string };
 export type CacheNamespaceSelection =
 	| { role: string; kind: "selected-path"; path: string }
 	| { role: string; kind: "producer-fresh" };
@@ -369,7 +369,13 @@ export class ToolHasher {
 		return { hash: value.hash, size: value.size, executable: value.executable };
 	}
 	async roots(roots: readonly ToolRoot[]): Promise<ToolFile[]> {
-		const views: { label: string; real: string; directory: boolean; exclude: readonly string[] }[] = [];
+		const views: {
+			label: string;
+			real: string;
+			directory: boolean;
+			exclude: readonly string[];
+			linkBoundary?: string;
+		}[] = [];
 		const labels = new Map<string, string>();
 		for (const root of roots) {
 			toolPath(root.label);
@@ -381,7 +387,13 @@ export class ToolHasher {
 				continue;
 			}
 			labels.set(root.label, real);
-			views.push({ label: root.label, real, directory: stat.isDirectory(), exclude: root.exclude ?? [] });
+			views.push({
+				label: root.label,
+				real,
+				directory: stat.isDirectory(),
+				exclude: root.exclude ?? [],
+				linkBoundary: root.linkBoundary === undefined ? undefined : await canonicalToolPath(root.linkBoundary),
+			});
 		}
 		views.sort((a, b) => utf8Compare(a.label, b.label));
 		const entries = new Map<string, ToolFile>();
@@ -411,6 +423,8 @@ export class ToolHasher {
 					);
 					if (target.includes("\0")) throw new Error(`Invalid tool symlink target: ${actual}`);
 					const real = await canonicalToolPath(actual);
+					if (view.linkBoundary && !inside(view.linkBoundary, real))
+						throw new Error(`Tool symlink escapes root boundary: ${virtual}`);
 					const resolved = await fs.stat(real);
 					if (!resolved.isFile() && !resolved.isDirectory())
 						throw new Error(`Invalid tool symlink target kind: ${actual}`);
