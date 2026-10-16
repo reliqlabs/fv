@@ -26,6 +26,7 @@ const CONTROL = "DOSSIER_QUINT_OWNERSHIP_FDS";
 const TRANSPORT_CONTROL = "BUN_BE_BUN";
 const MAX_GRACE = 5000;
 const FORCED_WAITER = Object.hasOwn(process.env, "BUN_FEATURE_FLAG_FORCE_WAITER_THREAD");
+const WAITER_VARIABLE = Buffer.from("BUN_FEATURE_FLAG_FORCE_WAITER_THREAD\0");
 const GATE = String.raw`
 const fs = require("node:fs"), ffi = require("bun:ffi");
 const libc = process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : fs.readFileSync("/proc/self/maps", "utf8").split("\n").map(line => line.trim().split(/\s+/).at(-1) || "").find(file => /\/(?:libc\.so(?:\.[0-9]+)*|libc-[^/]+\.so|ld-musl-[^/]+\.so\.[0-9]+)$/.test(file));
@@ -274,6 +275,8 @@ interface NativeControlABI extends NativeSocketABI {
 interface DarwinSystemABI extends NativeSocketABI {
 	__error(): NativeAddress;
 	getsid(pid: number): number;
+	getenv(name: NativeAddress): NativeAddress | null;
+	sigaction(signal: number, action: NativeAddress | null, previous: NativeAddress | null): number;
 	gethostuuid(output: NativeAddress, timeout: NativeAddress): number;
 	sysctlbyname(
 		name: NativeAddress,
@@ -298,6 +301,7 @@ interface DarwinProcessABI {
 }
 interface DarwinNativeABI extends DarwinSystemABI, DarwinProcessABI, NativeControlABI {
 	ptr: NativeAddressOf;
+	forcedWaiter: boolean;
 }
 interface LinuxControlABI extends NativeSocketABI {
 	__errno_location(): NativeAddress;
@@ -315,6 +319,8 @@ async function darwin(): Promise<DarwinNativeABI> {
 			const memory = read as NativeMemoryReader;
 			const library = dlopen("/usr/lib/libSystem.B.dylib", {
 				getsid: { args: [FFIType.i32], returns: FFIType.i32 },
+				getenv: { args: [FFIType.ptr], returns: FFIType.ptr },
+				sigaction: { args: [FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 				shutdown: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 				__error: { args: [], returns: FFIType.ptr },
 				dup: { args: [FFIType.i32], returns: FFIType.i32 },
@@ -339,6 +345,8 @@ async function darwin(): Promise<DarwinNativeABI> {
 				...system,
 				...processInfo,
 				ptr: addressOf,
+				// Bun's JS env mutations do not change the libc environment consulted at startup.
+				forcedWaiter: system.getenv(addressOf(WAITER_VARIABLE)) !== null,
 				currentErrno: () => memory.i32(system.__error(), 0),
 			};
 			return darwinSymbols;
@@ -536,6 +544,7 @@ function restrictedDarwinProcess(
 			if (errno === osConstants.errno.ESRCH) return null;
 			throw new Error(`unavailable Darwin restricted census for PID ${pid}: errno=${errno}`);
 		}
+		if (length.readBigUInt64LE() === 0n) return null;
 		// LP64 SDK kinfo_proc: sizeof=648, p_pid=40, e_sess=304, e_ppid=560, e_pgid=564.
 		if (length.readBigUInt64LE() !== 648n || info.readInt32LE(40) !== pid)
 			throw new Error(`incomplete Darwin restricted census for PID ${pid}`);
@@ -700,7 +709,7 @@ async function signalOwned(
 	const members = processTable(known).filter((row) => row.pgid === identity.process_group);
 	if (!members.length) return;
 	await requireGroupAnchor(identity, known);
-	// Bun 1.3.14 process.zig: waitPosix/onWaitPid update Darwin status on the JS thread.
+	// Bun 0d9b296af src/runtime/api/bun/process.zig:312-315 reaps and updates status on the JS thread.
 	if (
 		process.platform !== "darwin" ||
 		process.versions.bun !== "1.3.14" ||
@@ -713,6 +722,14 @@ async function signalOwned(
 		identity.parent_pid !== process.pid
 	)
 		throw new Error("refusing group signal without a retained process-lifetime capability");
+	if (darwinSymbols.forcedWaiter || darwinSymbols.getenv(darwinSymbols.ptr(WAITER_VARIABLE)) !== null)
+		throw new Error("refusing group signal with a native forced waiter thread");
+	// LP64 Darwin sigaction: handler=0, mask=8, flags=12, sizeof=16.
+	const disposition = Buffer.alloc(16);
+	if (darwinSymbols.sigaction(20, null, darwinSymbols.ptr(disposition)) !== 0)
+		throw new Error(`refusing group signal without SIGCHLD disposition: errno=${darwinSymbols.currentErrno()}`);
+	if (disposition.readBigUInt64LE(0) === 1n || (disposition.readUInt32LE(12) & 0x0020) !== 0)
+		throw new Error("refusing group signal with automatic SIGCHLD reaping");
 	const current = readDarwinProcessIdentity(identity.pid, darwinSymbols);
 	if (
 		!current ||
@@ -1584,8 +1601,9 @@ export class NativeSession {
 				);
 				const descendants = new Set<number>();
 				for (const entry of owned) {
+					if (entry.terminated_at) continue;
 					const current = await readProcessIdentity(entry.process.pid);
-					if (!current) continue;
+					if (entry.terminated_at || !current) continue;
 					if (
 						!sameProcess(current, entry.process) ||
 						current.process_group !== entry.process.process_group ||
@@ -1606,11 +1624,11 @@ export class NativeSession {
 						}
 				}
 				for (const row of rows) {
-					if (owned.some((entry) => entry.process.pid === row.pid)) continue;
 					const group = groups.get(row.pgid);
 					if (group) {
 						const identity = await readProcessIdentity(row.pid);
 						if (!identity) continue;
+						if (owned.some((entry) => !entry.terminated_at && sameProcess(entry.process, identity))) continue;
 						if (identity.process_group !== row.pgid || identity.session_id !== group.process.session_id)
 							throw new Error("descendant session changed during enumeration");
 						try {

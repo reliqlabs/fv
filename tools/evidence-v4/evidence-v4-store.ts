@@ -1106,6 +1106,14 @@ export class Store {
 		try {
 			const existing = await readBytes(this.root, relative);
 			if (!existing.equals(Buffer.from(bytes))) fail("recovered owner immutable snapshot differs");
+			const absolute = await checkedPath(this.root, relative);
+			const handle = await fs.open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+			try {
+				await seam(this.options, "fsync", absolute, () => handle.sync());
+			} finally {
+				await handle.close();
+			}
+			await syncAncestors(this.root, path.dirname(absolute), this.options);
 			return { path: relative, hash: H(existing), size: existing.length };
 		} catch (error) {
 			if (errorCode(error) !== "ENOENT") throw error;

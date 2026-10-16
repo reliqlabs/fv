@@ -11,7 +11,6 @@ requested drivers without executing package build scripts or proof commands.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -285,6 +284,12 @@ class RustReview(unittest.TestCase):
         for env in (
             {"RUSTFLAGS": "--sysroot " + self.sysroot},
             {"CARGO_ENCODED_RUSTFLAGS": "--sysroot=" + self.sysroot},
+            {"CARGO_BUILD_RUSTFLAGS": "--sysroot=" + self.sysroot},
+            {
+                "CARGO_TARGET_"
+                + self.host.upper().replace("-", "_")
+                + "_RUSTFLAGS": "--sysroot=" + self.sysroot
+            },
         ):
             with self.subTest(env=env):
                 self.assert_refused(fixture.capture(env=env), "rustflags --sysroot")
@@ -337,8 +342,6 @@ class RustReview(unittest.TestCase):
         for env in (
             {"CFLAGS": "-include " + str(header)},
             {"CFLAGS": "-I" + str(outside)},
-            {"RUSTFLAGS": "-C link-arg=" + str(archive)},
-            {"RUSTFLAGS": "-C link-arg=-Wl,--version-script," + str(header)},
         ):
             with self.subTest(env=env):
                 self.assert_refused(
@@ -346,10 +349,8 @@ class RustReview(unittest.TestCase):
                     "native flag input is outside hashed roots",
                 )
         internal = fixture.write("native/feature.h", "#define FEATURE 1\n")
-        internal_archive = fixture.write("native/libextra.a", "!<arch>\n")
         env = {
             "CFLAGS": "-include " + str(internal),
-            "RUSTFLAGS": "-C link-arg=" + str(internal_archive),
         }
         before = fixture.capture(env=env)
         self.assertTrue(before["ok"], before)
@@ -384,7 +385,6 @@ class RustReview(unittest.TestCase):
                     fixture.manifest_tail('[dependencies]\nhost-macro={path="host"}')
                 else:
                     fixture.manifest_tail('[build-dependencies]\nring={path="native"}')
-                    fixture.write("build.rs", "fn main() {}\n")
                 fixture.lock()
                 target = (
                     "x86_64-unknown-linux-gnu"
@@ -453,9 +453,9 @@ class RustReview(unittest.TestCase):
             "build.rs", 'fn main() { let _ = std::fs::read("/opt/unbound-input"); }'
         )
         framework.lock()
-        self.assert_refused(framework.capture(), "unresolved native linkage")
+        self.assert_refused(framework.capture(), "unreviewed build-script")
 
-    def test_ca05_literal_rustc_must_match_selected_rustc(self):
+    def test_ca05_literal_rustc_scripts_require_review(self):
         fixture = CargoFixture(self)
         fixture.write(
             "build.rs",
@@ -466,19 +466,19 @@ class RustReview(unittest.TestCase):
         selected.chmod(0o755)
         fixture.lock()
         self.assert_refused(
-            fixture.capture(env={"RUSTC": str(selected)}), "literal rustc differs"
+            fixture.capture(env={"RUSTC": str(selected)}), "unreviewed build-script"
         )
 
-    def test_ca06_aliased_lookup_environment_mutation_refuses(self):
+    def test_ca06_unreviewed_lookup_mutation_refuses(self):
         fixture = CargoFixture(self)
         fixture.write(
             "build.rs",
             'use std::env::set_var as change; fn query() -> Option<()> { change("PATH", "/opt/unbound-tools"); let _ = std::process::Command::new("fv-r38-optional-helper").output().ok()?; Some(()) } fn main() { query(); }',
         )
         fixture.lock()
-        self.assert_refused(fixture.capture(), "optional process lookup is changed")
+        self.assert_refused(fixture.capture(), "unreviewed build-script")
 
-    def test_ca06_optional_absence_uses_package_cwd_and_reprobes(self):
+    def test_ca06_unreviewed_optional_absence_scripts_never_execute(self):
         for entry in ("../helpers", ""):
             with self.subTest(entry=entry):
                 fixture = CargoFixture(self)
@@ -492,39 +492,7 @@ class RustReview(unittest.TestCase):
                 fixture.lock()
                 env = {"PATH": entry + os.pathsep + fixture.env["PATH"]}
                 before = fixture.capture(env=env)
-                self.assertTrue(before["ok"], before)
-                lookup = [
-                    probe
-                    for probe in before["probes"]
-                    if probe["command"][1:2] == ["-e"]
-                ]
-                self.assertEqual(len(lookup), 1, before)
-                self.assertEqual(Path(lookup[0]["cwd"]), fixture.root / "nested/member")
-                self.assertEqual(
-                    lookup[0]["env"]["CARGO_MANIFEST_DIR"],
-                    str(fixture.root / "nested/member"),
-                )
-                observation = json.loads(lookup[0]["stdout"])
-                self.assertEqual(
-                    observation["cwd_hash"],
-                    "sha256:"
-                    + hashlib.sha256(
-                        str(fixture.root / "nested/member").encode()
-                    ).hexdigest(),
-                )
-                self.assertEqual(
-                    observation["path_hash"],
-                    "sha256:" + hashlib.sha256(env["PATH"].encode()).hexdigest(),
-                )
-                self.assertEqual(
-                    len(observation["candidates"]), len(env["PATH"].split(os.pathsep))
-                )
-                self.assertTrue(
-                    all(
-                        candidate["absent"] is True
-                        for candidate in observation["candidates"]
-                    )
-                )
+                self.assert_refused(before, "unreviewed build-script")
                 helper_dir = fixture.root / (
                     "nested/helpers" if entry else "nested/member"
                 )
@@ -540,7 +508,7 @@ class RustReview(unittest.TestCase):
                     marker.exists(), "discovery executed the optional helper"
                 )
                 self.assertFalse(result["ok"], result)
-                self.assertIn("optional executable", result["error"])
+                self.assertIn("unreviewed build-script", result["error"])
                 self.assertEqual(result["nativeSelections"], [])
 
     def test_ca06_external_package_relative_and_empty_path_refuse(self):
@@ -557,7 +525,7 @@ class RustReview(unittest.TestCase):
                     "requires absolute nonempty PATH",
                 )
 
-    def test_ca07_only_complete_false_conditions_eliminate_branches(self):
+    def test_ca07_unreviewed_forwarding_scripts_refuse_even_false_branches(self):
         self.require_registry("aws-lc-sys", "0.44.0")
         for name, version in (
             ("libc", "0.2.186"),
@@ -588,14 +556,313 @@ class RustReview(unittest.TestCase):
                     "build.rs",
                     FORWARDING.replace("BRANCH", f"if {condition} {{ {payload} }}"),
                 )
-                self.assert_refused(
-                    fixture.capture(), "unresolved native linkage in app"
-                )
+                self.assert_refused(fixture.capture(), "unreviewed build-script")
         fixture.write(
             "build.rs", FORWARDING.replace("BRANCH", f"if {atom} {{ {payload} }}")
         )
         result = fixture.capture()
+        self.assert_refused(result, "unreviewed build-script")
+
+    def test_r2_ca01_all_rustflags_and_rustdocflags_sources_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        target = "CARGO_TARGET_" + self.host.upper().replace("-", "_")
+        for name in (
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            target + "_RUSTFLAGS",
+            "RUSTDOCFLAGS",
+            "CARGO_ENCODED_RUSTDOCFLAGS",
+            "CARGO_BUILD_RUSTDOCFLAGS",
+            target + "_RUSTDOCFLAGS",
+        ):
+            for flags in ("--sysroot=/opt/alt-rust", "-L/opt/vendor", "--cfg=unbound"):
+                with self.subTest(name=name, flags=flags):
+                    self.assert_refused(
+                        fixture.capture(env={name: flags}),
+                        "Rust toolchain attestation:",
+                    )
+        for table in ("build", "target." + self.host):
+            for name in ("rustflags", "rustdocflags"):
+                with self.subTest(table=table, name=name):
+                    fixture.write(
+                        ".cargo/config.toml",
+                        f'[{table}]\n{name}=["--extern","unbound=/opt/unbound.rlib"]\n',
+                    )
+                    self.assert_refused(fixture.capture(), "unsupported " + name)
+
+    def test_r2_ca02_allowlist_normalizes_codegen_forms(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        for flags in (
+            "--codegen link-arg=/opt/vendor.a",
+            "--codegen=linker=/opt/ld",
+            "-Cprofile-use=/opt/pgo.profdata",
+            "-C profile-use=/opt/pgo.profdata",
+            "--extern unbound=/opt/unbound.rlib",
+            "-Zcodegen-backend=/opt/backend.so",
+            "-Clinker-plugin-lto=/opt/plugin",
+            "-Ctarget-feature=+crt-static",
+            '--cfg=target_os="windows"',
+            "-C",
+            "--codegen",
+            "--unknown-reviewed-later",
+        ):
+            with self.subTest(flags=flags):
+                self.assert_refused(
+                    fixture.capture(env={"RUSTFLAGS": flags}),
+                    "unsupported rustflags token",
+                )
+        for flags in (
+            "-C link-arg=--allow-undefined",
+            "-Clink-arg=--allow-undefined",
+            "--codegen link-arg=--allow-undefined",
+            "--codegen=link-arg=--allow-undefined",
+        ):
+            with self.subTest(allowed=flags):
+                result = fixture.capture(
+                    "build",
+                    "--target",
+                    "wasm32-unknown-unknown",
+                    env={"RUSTFLAGS": flags},
+                )
+                self.assertTrue(result["ok"], result)
+                self.assert_refused(
+                    fixture.capture(env={"RUSTFLAGS": flags}),
+                    "unsupported rustflags token",
+                )
+
+    def test_r2_ca03_configured_host_linkers_refuse_with_cross_target(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        foreign = (
+            "x86_64-unknown-linux-gnu"
+            if self.host != "x86_64-unknown-linux-gnu"
+            else "aarch64-unknown-linux-gnu"
+        )
+        key = "CARGO_TARGET_" + self.host.upper().replace("-", "_") + "_LINKER"
+        self.assert_refused(
+            fixture.capture("build", "--target", foreign, env={key: "/opt/host-ld"}),
+            "Cargo host linker",
+        )
+        fixture.write(
+            ".cargo/config.toml", f'[target.{self.host}]\nlinker="/opt/host-ld"\n'
+        )
+        self.assert_refused(
+            fixture.capture("build", "--target", foreign), "Cargo host linker"
+        )
+        self.assert_refused(fixture.capture(), "Cargo host linker")
+
+    def test_r2_ca04_runner_environment_and_configuration_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        for operation in ("test", "run", "bench"):
+            with self.subTest(operation=operation):
+                key = "CARGO_TARGET_" + self.host.upper().replace("-", "_") + "_RUNNER"
+                self.assert_refused(
+                    fixture.capture(operation, env={key: "/opt/runner"}),
+                    "Cargo target runner",
+                )
+        for runner in ('"/opt/runner"', '["/opt/runner","--skip-tests"]'):
+            fixture.write(
+                ".cargo/config.toml", f"[target.{self.host}]\nrunner={runner}\n"
+            )
+            self.assert_refused(fixture.capture("test"), "Cargo target runner")
+
+    def test_r2_ca05_unreviewed_library_and_file_effects_refuse(self):
+        for source in (
+            "fn main() { helper::run(); }",
+            'fn main() { let b=std::fs::read("/opt/input").unwrap(); assert!(b.is_empty()); }',
+            "fn main() {}",
+        ):
+            with self.subTest(source=source):
+                fixture = CargoFixture(self)
+                fixture.package("helper", "helper")
+                fixture.write(
+                    "helper/src/lib.rs",
+                    'pub fn run() { std::process::Command::new("/opt/tool").status().unwrap(); }',
+                )
+                fixture.manifest_tail('[build-dependencies]\nhelper={path="helper"}')
+                fixture.write("build.rs", source)
+                fixture.lock()
+                self.assert_refused(
+                    fixture.capture(), "unreviewed build-script process/input closure"
+                )
+
+    def test_r2_ca05_reviewed_script_refuses_unreviewed_build_helper(self):
+        self.require_registry("generic-array", "0.14.7")
+        fixture = CargoFixture(self, registry=True)
+        fixture.package("helper", "version_check")
+        fixture.write(
+            "helper/Cargo.toml",
+            '[package]\nname="version_check"\nversion="0.9.5"\nedition="2021"\n',
+        )
+        fixture.manifest_tail(
+            '[dependencies]\ngeneric-array="=0.14.7"\n[patch.crates-io]\nversion_check={path="helper"}'
+        )
+        fixture.lock()
+        self.assert_refused(
+            fixture.capture(), "unreviewed build-script dependency version_check"
+        )
+
+    def test_r2_ca06_relative_link_arguments_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.write("native/libextra.a", "!<arch>\n")
+        fixture.lock()
+        for flags in (
+            "-Clink-arg=native/libextra.a",
+            "--codegen=link-arg=native/libextra.a",
+            "-Clink-args=native/libextra.a",
+        ):
+            with self.subTest(flags=flags):
+                self.assert_refused(
+                    fixture.capture(env={"CARGO_BUILD_RUSTFLAGS": flags}),
+                    "unsupported rustflags token",
+                )
+
+    def test_r2_ca07_inclusions_refuse_external_and_generated_unknown_sources(self):
+        for operand in ('"/opt/keys/k.bin"', '"../../outside"', 'r#"/opt/keys/k.bin"#'):
+            for form in (
+                "include_bytes!({})",
+                "include_str!({})",
+                "include!({})",
+                "#[path={}] mod outside;",
+            ):
+                with self.subTest(operand=operand, form=form):
+                    fixture = CargoFixture(self)
+                    fixture.write("src/lib.rs", form.format(operand))
+                    fixture.lock()
+                    self.assert_refused(
+                        fixture.capture(), "Rust source inclusion is outside"
+                    )
+        fixture = CargoFixture(self)
+        fixture.write("src/lib.rs", 'pub const DATA: &str = include_str!("data.txt");')
+        fixture.write("src/data.txt", "one")
+        fixture.lock()
+        before = fixture.capture()
+        self.assertTrue(before["ok"], before)
+        fixture.write("src/data.txt", "two")
+        after = fixture.capture()
+        self.assertTrue(after["ok"], after)
+        self.assertNotEqual(before["files"], after["files"])
+        for source in (
+            'const DATA: &[u8] = include_bytes!(concat!(env!("UNBOUND"), "/data"));',
+            'const DATA: &[u8] = include_bytes!(concat!("/opt/", "data"));',
+            '#[cfg_attr(unix, path="../../outside.rs")] mod outside;',
+            'const DATA: &[u8] = zerocopy::include_value!("/opt/data");',
+            '#[cfg(test)] mod tests { const DATA: &[u8] = include_bytes!("/opt/test-data"); }',
+            '#[cfg_attr(serde_build_from_git, path="../../outside.rs")] mod outside;',
+            'use zerocopy::include_value as read; const DATA: &[u8] = read!("/opt/input");',
+        ):
+            with self.subTest(source=source):
+                fixture.write("src/lib.rs", source)
+                self.assert_refused(fixture.capture(), "Rust")
+        fixture.write(
+            "src/lib.rs", 'pub const DATA: &str = include_str!("/opt/input");'
+        )
+        fixture.write("build.rs", "fn main() {}")
+        self.assert_refused(fixture.capture(), "Rust source inclusion is outside")
+
+    def test_r2_ca07_nested_non_rs_sources_are_scanned(self):
+        fixture = CargoFixture(self)
+        fixture.write("src/data.txt", "bound")
+        fixture.write("src/code.txt", 'const DATA: &str = include_str!("data.txt");')
+        fixture.lock()
+        for root in ('include!("code.txt");', '#[path="code.txt"] mod code;'):
+            with self.subTest(root=root):
+                fixture.write("src/lib.rs", root)
+                fixture.write(
+                    "src/code.txt", 'const DATA: &str = include_str!("data.txt");'
+                )
+                self.assertTrue(fixture.capture()["ok"])
+                fixture.write(
+                    "src/code.txt", 'const DATA: &str = include_str!("/opt/unbound");'
+                )
+                self.assert_refused(
+                    fixture.capture(), "Rust source inclusion is outside"
+                )
+                fixture.write(
+                    "src/code.txt", 'const DATA: &str = include_str!(env!("UNBOUND"));'
+                )
+                self.assert_refused(
+                    fixture.capture(), "unreviewed dynamic included Rust source"
+                )
+
+    def test_r2_ca07_inactive_source_reviews_require_registry_identity(self):
+        for name, version, source in (
+            ("cosmwasm-std", "3.0.7", "src/testing/mock.rs"),
+            ("serde_derive_internals", "0.29.1", "lib.rs"),
+        ):
+            with self.subTest(name=name):
+                self.require_registry(name, version)
+                fixture = CargoFixture(self)
+                fixture.manifest = fixture.manifest.replace(
+                    'name="app"', f'name="{name}"'
+                ).replace('version="0.1.0"', f'version="{version}"')
+                fixture.write("Cargo.toml", fixture.manifest)
+                installed = next(
+                    (self.cargo_home / "registry/src").glob("*/" + name + "-" + version)
+                )
+                fixture.write(source, (installed / source).read_text())
+                fixture.lock()
+                self.assert_refused(
+                    fixture.capture(), "Rust source inclusion is outside"
+                )
+
+    def test_r2_ca08_cfg_mutations_and_unknown_cargo_configuration_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        for name in ("RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"):
+            self.assert_refused(
+                fixture.capture(
+                    env={
+                        name: '--cfg target_os="windows" -Aexplicit_builtin_cfgs_in_flags'
+                    }
+                ),
+                "unsupported rustflags token",
+            )
+        self.assert_refused(
+            fixture.capture(env={"CARGO_UNSTABLE_HOST_CONFIG": "true"}),
+            "unstable Cargo environment",
+        )
+        self.assert_refused(
+            fixture.capture(env={"CARGO_BUILD_UNKNOWN": "true"}),
+            "unsupported Cargo build environment",
+        )
+        self.assert_refused(
+            fixture.capture(env={"CARGO_PROFILE_DEV_RUSTFLAGS": "--cfg=unbound"}),
+            "Cargo profile environment",
+        )
+        self.assert_refused(
+            fixture.capture("test", env={"RUSTDOC": "/opt/skipped-doctests"}),
+            "configured rustdoc",
+        )
+        fixture.write(".cargo/config.toml", '[build]\nunknown="unbound"\n')
+        self.assert_refused(fixture.capture(), "unsupported Cargo build configuration")
+        for selector in ("cfg(unix)", "cfg (unix)", "cfg\t(unix)"):
+            fixture.write(
+                ".cargo/config.toml",
+                "[target." + json.dumps(selector) + ']\nlinker="/opt/unbound"\n',
+            )
+            self.assert_refused(
+                fixture.capture(), "unsupported Cargo target selection key"
+            )
+
+    def test_r2_dossier_link_variables_are_not_native_attributes(self):
+        fixture = CargoFixture(self)
+        fixture.write(
+            "src/lib.rs",
+            "pub fn copy(link: &str) { let link = link.to_owned(); drop(link); }\n",
+        )
+        fixture.lock()
+        result = fixture.capture()
         self.assertTrue(result["ok"], result)
+        fixture.write(
+            "src/lib.rs",
+            '#[cfg_attr(unix, link(name="unbound_vendor", kind="static"))] extern "C" {}\n',
+        )
+        self.assert_refused(fixture.capture(), "Rust-source native linkage")
 
     def test_ca08_incremental_target_and_bench_profile_selection(self):
         fixture = CargoFixture(self)

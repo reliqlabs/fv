@@ -661,6 +661,93 @@ class SourceReview(unittest.TestCase):
                 "symlink inside tool source directory: lean/link.lean", linked["reason"]
             )
 
+    def test_input_directories_require_non_lean_files(self):
+        with tempfile.TemporaryDirectory(prefix="r38-input-dir-") as directory:
+            root = Path(directory).resolve()
+            (root / "vectors").mkdir()
+            (root / "vectors/case.json").write_text("{}")
+            request = {
+                "op": "requirements",
+                "root": str(root),
+                "bound": [],
+                "required": {
+                    "directories": [],
+                    "files": [],
+                    "inputDirectories": ["vectors"],
+                },
+            }
+            [missing] = native([request])
+            self.assertFalse(missing["ok"])
+            self.assertIn("vectors/case.json", missing["reason"])
+            request["bound"] = ["vectors/case.json"]
+            self.assertTrue(native([request])[0]["ok"])
+
+    def test_required_paths_refuse_symlinks_including_ancestors(self):
+        with tempfile.TemporaryDirectory(prefix="r38-input-link-") as directory:
+            root = Path(directory).resolve()
+            (root / "impl").mkdir()
+            (root / "impl/A.lean").write_text("def a := 1")
+            (root / "src").symlink_to(root / "impl", target_is_directory=True)
+            for required in (
+                {"directories": ["src"], "files": []},
+                {"directories": [], "files": ["src/A.lean"]},
+                {"directories": [], "files": [], "inputDirectories": ["src"]},
+            ):
+                with self.subTest(required=required):
+                    [result] = native(
+                        [
+                            {
+                                "op": "requirements",
+                                "root": str(root),
+                                "bound": ["src/A.lean"],
+                                "required": required,
+                            }
+                        ]
+                    )
+                    self.assertFalse(result["ok"])
+                    self.assertRegex(
+                        result["reason"], "symlink|unsafe directory component"
+                    )
+
+    def test_case_variant_lean_sources_require_closure_coverage(self):
+        with tempfile.TemporaryDirectory(prefix="r38-input-case-") as directory:
+            root = Path(directory).resolve()
+            (root / "A.LEAN").write_text("def a := 1")
+            request = {
+                "op": "requirements",
+                "root": str(root),
+                "bound": [],
+                "required": {"directories": ["."], "files": []},
+            }
+            [missing] = native([request])
+            self.assertFalse(missing["ok"])
+            self.assertIn("A.LEAN", missing["reason"])
+            request["bound"] = ["A.LEAN"]
+            self.assertTrue(native([request])[0]["ok"])
+
+    def test_source_walk_skips_git_and_effective_generated_namespaces(self):
+        with tempfile.TemporaryDirectory(prefix="r38-input-exclude-") as directory:
+            root = Path(directory).resolve()
+            (root / "A.lean").write_text("def a := 1")
+            for generated in (".git/hooks", "vendor", "compiled"):
+                (root / generated).mkdir(parents=True)
+                (root / generated / "alias").symlink_to(root / "A.lean")
+            [result] = native(
+                [
+                    {
+                        "op": "requirements",
+                        "root": str(root),
+                        "bound": ["A.lean"],
+                        "required": {
+                            "directories": ["."],
+                            "files": [],
+                            "excludedPaths": ["vendor", "compiled"],
+                        },
+                    }
+                ]
+            )
+            self.assertTrue(result["ok"], result)
+
 
 if __name__ == "__main__":
     if not all(shutil.which(name) for name in ("bun", "git", "sh")):

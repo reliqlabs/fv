@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""R38: fatal observation accounting and visible-history recovery barriers."""
+"""R38: final-result trailers, resource isolation and recovery durability."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from pathlib import Path
 from evidence_v4_fixture import EvidenceV4Fixture
 from r38_evidence_v4_lifecycle import (
     LifecycleDriver,
+    direct_group_signals_supported,
     history,
     owner_path,
     read_json,
@@ -31,10 +32,12 @@ const request = JSON.parse(readFileSync(0, "utf8"));
 const { openEvidenceStore } = await import(request.modules + "/evidence-v4-store.ts");
 const barriers = [];
 let reached = false;
+let watching = request.watch_start === undefined;
 const syscallBarrier = async (operation, file, phase) => {
-    if (operation === "fsync" && request.watch?.includes(file))
+    if (operation === "fsync" && file === request.watch_start) watching = true;
+    if (watching && operation === "fsync" && request.watch?.includes(file))
         barriers.push({ file, phase, owner_exists: existsSync(request.owner_path) });
-    if (!reached && request.cut && operation === request.cut.operation &&
+    if (watching && !reached && request.cut && operation === request.cut.operation &&
         phase === request.cut.phase && new RegExp(request.cut.pattern).test(file)) {
         reached = true;
         if (request.reached_path) writeFileSync(request.reached_path, file);
@@ -44,7 +47,11 @@ const syscallBarrier = async (operation, file, phase) => {
 };
 let result;
 try {
-    if (request.mode === "recover") {
+    if (request.mode === "validate-policy") {
+        const { validatePolicy } = await import(request.modules + "/evidence-v4-policy.ts");
+        validatePolicy(request.policy);
+        result = { valid: true };
+    } else if (request.mode === "recover") {
         const { recoverOwner } = await import(request.modules + "/evidence-v4-native.ts");
         await recoverOwner({
             cwd: request.cwd,
@@ -106,13 +113,17 @@ def checker_resource(fixture):
     fixture.save_policy("shared observation resource regression")
 
 
-def visible_observation_cut(fixture):
+def observation_crash(fixture, *, visible_history=True):
     request = {
         "mode": "crash-run",
         "cwd": str(fixture.root),
-        "operation": "fsync",
-        "phase": "after",
-        "path": r"/v4/history/00000000000000000002\.json$",
+        "operation": "fsync" if visible_history else "write",
+        "phase": "after" if visible_history else "before",
+        "path": (
+            r"/v4/history/00000000000000000002\.json$"
+            if visible_history
+            else r"/v4/\.staging-file-check\.json-"
+        ),
         "call": call_for(fixture),
     }
     with LifecycleDriver(request, environment=fixture.process_environment()) as driver:
@@ -127,6 +138,95 @@ def visible_observation_cut(fixture):
 
 @unittest.skipUnless(os.name == "posix", "v4 requires POSIX process ownership")
 class EvidenceV4StoreReview(unittest.TestCase):
+    def test_cancelled_invalid_output_retains_final_error_trailer(self):
+        if not direct_group_signals_supported():
+            self.skipTest("requires source-checked direct-child group signaling")
+        for emitted, prefix in (
+            (r"printf '\377'", b"\xff"),
+            (
+                "printf '%s\\n' '--- fv-evidence: exit=0 ---'",
+                b"--- fv-evidence: exit=0 ---\n",
+            ),
+        ):
+            with (
+                self.subTest(prefix=prefix),
+                EvidenceV4Fixture(claims=("A",)) as fixture,
+            ):
+                recipe = fixture.policy["recipes"][0]
+                recipe["command"] = [
+                    fixture.shell,
+                    "-c",
+                    emitted + '; exec "$@"',
+                    "cancel-invalid-output",
+                    *recipe["command"],
+                ]
+                fixture.save_policy("cancel invalid output regression")
+                fixture.set_control(wait_for_gate="cancel")
+                process = fixture.start_call(jobs=1)
+                try:
+                    wait_for(
+                        lambda: fixture.count() == 1,
+                        process=process,
+                        label="evidence waiting after emitting invalid output",
+                    )
+                    fixture.cancel(process)
+                    result = fixture.finish_call(process)
+                    self.assertEqual(result["result"], "ERROR", result)
+                    artifacts = fixture.artifacts()
+                    self.assertEqual(len(artifacts), 1, result)
+                    artifact = artifacts[0][1]
+                    self.assertEqual(artifact["result"], "ERROR", artifact)
+                    self.assertTrue(artifact["termination"]["cancelled"], artifact)
+                    self.assertFalse(artifact["marker_matched"], artifact)
+                    self.assertEqual(
+                        (fixture.root / artifact["stdout"]["path"]).read_bytes(),
+                        prefix,
+                    )
+                    self.assertEqual(
+                        (fixture.root / artifact["raw_output"]["path"]).read_bytes(),
+                        prefix
+                        + (b"" if prefix.endswith(b"\n") else b"\n")
+                        + b"--- fv-evidence-v4: result=ERROR ---\n",
+                    )
+                    self.assertEqual(
+                        [
+                            (entry["kind"], entry["result"])
+                            for entry in history(fixture)
+                        ],
+                        [("execution", "ERROR")],
+                    )
+                    self.assertFalse(owner_path(fixture.root).exists())
+                finally:
+                    fixture.release("cancel")
+                    if process.poll() is None:
+                        fixture.cancel(process)
+                        fixture.finish_call(process)
+
+    def test_checker_recipe_resource_overlap_is_refused_before_discovery(self):
+        with EvidenceV4Fixture(claims=("A",), recipe_count=2) as fixture:
+            checker_resource(fixture)
+            valid = run_driver(
+                fixture,
+                request_for(fixture, mode="validate-policy", policy=fixture.policy),
+            )
+            self.assertTrue(valid.get("valid"), valid)
+            for recipe in fixture.policy["recipes"]:
+                with self.subTest(recipe=recipe["recipe_id"]):
+                    original = recipe["resources"]
+                    recipe["resources"] = fixture.policy["claim_checker"]["resources"]
+                    fixture.save_policy("overlapping checker resource regression")
+                    result = fixture.plan()
+                    self.assertTrue(result.get("rejected"), result)
+                    self.assertIn(
+                        "claim checker resource overlaps recipe " + recipe["recipe_id"],
+                        result["reason"],
+                    )
+                    self.assertIn(recipe["resources"][0], result["reason"])
+                    recipe["resources"] = original
+            self.assertEqual(fixture.count("recipe-1"), 0)
+            self.assertEqual(fixture.count("recipe-2"), 0)
+            self.assertFalse(owner_path(fixture.root).exists())
+
     def assert_retained_observation(self, fixture, claim_id="A"):
         owner = read_json(owner_path(fixture.root))
         self.assertEqual(len(owner["pending_results"]), 1, owner)
@@ -314,7 +414,7 @@ class EvidenceV4StoreReview(unittest.TestCase):
     ):
         with EvidenceV4Fixture(claims=("A", "B")) as fixture:
             checker_resource(fixture)
-            owner = visible_observation_cut(fixture)
+            owner = observation_crash(fixture)
             event = fixture.evidence_root / "history" / "00000000000000000002.json"
             retained = event.read_bytes()
             expected = [
@@ -332,6 +432,7 @@ class EvidenceV4StoreReview(unittest.TestCase):
                     mode="recover",
                     owner=owner,
                     watch=[str(path) for path in expected],
+                    watch_start=str(event),
                 ),
             )
             self.assertTrue(result.get("recovered"), result)
@@ -363,7 +464,7 @@ class EvidenceV4StoreReview(unittest.TestCase):
     def test_recovery_barrier_failure_keeps_pending_owner_and_resource_locks(self):
         with EvidenceV4Fixture(claims=("A", "B")) as fixture:
             checker_resource(fixture)
-            owner = visible_observation_cut(fixture)
+            owner = observation_crash(fixture)
             owner_bytes = owner_path(fixture.root).read_bytes()
             event = fixture.evidence_root / "history" / "00000000000000000002.json"
             retained = event.read_bytes()
@@ -384,6 +485,7 @@ class EvidenceV4StoreReview(unittest.TestCase):
                             fixture,
                             mode="recover",
                             owner=owner,
+                            watch_start=str(event),
                             cut={
                                 "operation": "fsync",
                                 "phase": "before",
@@ -407,6 +509,93 @@ class EvidenceV4StoreReview(unittest.TestCase):
             self.assertFalse(owner_path(fixture.root).exists())
             self.assertTrue(all(not path.exists() for path in locks))
             self.assertEqual(event.read_bytes(), retained)
+
+    def test_visible_recovered_owner_retry_resyncs_snapshot_before_retirement(self):
+        with EvidenceV4Fixture(claims=("A", "B")) as fixture:
+            checker_resource(fixture)
+            owner = observation_crash(fixture, visible_history=False)
+            owner_bytes = owner_path(fixture.root).read_bytes()
+            snapshot = (
+                fixture.evidence_root
+                / "recovered-owners"
+                / (owner["owner_id"] + ".json")
+            )
+            expected = [
+                snapshot,
+                snapshot.parent,
+                fixture.evidence_root,
+                fixture.evidence_root.parent,
+                fixture.root / ".fv",
+                fixture.root,
+            ]
+            registry = read_json(
+                fixture.evidence_root / "locks" / (owner["owner_id"] + ".locks.json")
+            )
+            locks = [
+                Path(entry["file"])
+                for entry in registry
+                if Path(entry["file"]).exists()
+            ]
+            self.assertTrue(locks, registry)
+            for target in [snapshot.parent, *expected]:
+                with self.subTest(target=target):
+                    result = run_driver(
+                        fixture,
+                        request_for(
+                            fixture,
+                            mode="recover",
+                            owner=owner,
+                            watch_start=str(snapshot),
+                            cut={
+                                "operation": "fsync",
+                                "phase": "before",
+                                "pattern": "^" + re.escape(str(target)) + "$",
+                            },
+                        ),
+                    )
+                    self.assertTrue(result["reached"], result)
+                    self.assertIn(
+                        "injected observation storage barrier failure",
+                        result.get("error", ""),
+                    )
+                    self.assertEqual(read_json(snapshot), owner)
+                    self.assertEqual(owner_path(fixture.root).read_bytes(), owner_bytes)
+                    self.assertTrue(all(lock.exists() for lock in locks))
+                    self.assertEqual(
+                        [entry["kind"] for entry in history(fixture)], ["execution"]
+                    )
+            retained = snapshot.read_bytes()
+            result = run_driver(
+                fixture,
+                request_for(
+                    fixture,
+                    mode="recover",
+                    owner=owner,
+                    watch_start=str(snapshot),
+                    watch=[str(path) for path in expected],
+                ),
+            )
+            self.assertTrue(result.get("recovered"), result)
+            self.assertEqual(
+                [
+                    entry["file"]
+                    for entry in result["barriers"]
+                    if entry["phase"] == "after"
+                ][: len(expected)],
+                [str(path) for path in expected],
+            )
+            self.assertTrue(all(entry["owner_exists"] for entry in result["barriers"]))
+            self.assertEqual(snapshot.read_bytes(), retained)
+            self.assertFalse(owner_path(fixture.root).exists())
+            self.assertTrue(all(not lock.exists() for lock in locks))
+            events = history(fixture)
+            self.assertEqual(
+                [entry["kind"] for entry in events], ["execution", "indeterminate"]
+            )
+            self.assertEqual(
+                events[-1]["indeterminate_owner"]["path"],
+                str(snapshot.relative_to(fixture.root)),
+            )
 
 
 if __name__ == "__main__":

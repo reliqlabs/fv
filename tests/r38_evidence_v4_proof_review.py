@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import zipfile
 
 REPO = Path(__file__).resolve().parents[1]
 MODULE = REPO / "tools/evidence-v4/evidence-v4-toolchain-proof.ts"
@@ -25,6 +26,9 @@ PROGRAM = (
     + "const {canonicalToolPath}=await import("
     + json.dumps(MODULE.with_name("evidence-v4-toolchain-common.ts").as_uri())
     + ");\n"
+    + "const registryModule = "
+    + json.dumps(MODULE.with_name("evidence-v4-toolchain.ts").as_uri())
+    + ";\n"
     + r"""
 const path = await import('node:path');
 const input = await Bun.stdin.json();
@@ -36,7 +40,7 @@ const resolveCommand = async (name, cwd = input.cwd) => {
 const context = {
   root:input.root, cwd:input.cwd, cwdRelative:'.', subject:input.subject,
   effectiveEnv:input.env, declaration:{id:'proof'}, session:{},
-  applicationContexts:(input.applications ?? []).map(app => ({...app,recipe:{resources:[]}})),
+  applicationContexts:(input.applications ?? []).map(app => ({...app,recipe:{resources:app.resources ?? []}})),
   commandContexts:input.checks === undefined ? undefined : [...(input.applications ?? []), ...input.checks],
   resolveCommand,
   // Native closure has its own adapter tests; these tests exercise proof configuration admission.
@@ -50,6 +54,14 @@ const context = {
   },
 };
 try {
+  if (input.op === 'bind') {
+    const {createToolchainSession} = await import(registryModule);
+    const policy = {toolchains:[{id:'plain',kind:'tree',locator:{mode:'path',value:input.distribution},requires:[]}],recipes:[],preflight:[]};
+    const tools = createToolchainSession({root:input.root,policy,env:input.env,session:{}});
+    await tools.assertCommandBound(input.subject, '.', ['plain']);
+    process.stdout.write(JSON.stringify({ok:true}));
+    process.exit(0);
+  }
   const result = await (input.adapter === 'quint' ? identifyQuint(context) : identifyLean(context));
   process.stdout.write(JSON.stringify({ok:true,sourceRequirements:result.sourceRequirements,roots:result.roots}));
 } catch (error) {
@@ -196,6 +208,143 @@ class TlcConfiguration(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("TLC configuration field or memory-size", result["error"])
 
+    def test_mismatched_verify_subcommand_and_node_entry_refuse_discovery(self):
+        self.config.write_text('{"maxHeap":"-javaagent:/outside/agent.jar"}')
+        cli = self.request["subject"][0]
+        for subject in (
+            [cli, "verify", "--backend=tlc", "--tlc-config", str(self.config)],
+            [
+                shutil.which("node"),
+                cli,
+                "verify",
+                "--backend=tlc",
+                "--tlc-config",
+                str(self.config),
+            ],
+        ):
+            with self.subTest(subject=subject):
+                self.request["applications"] = [
+                    {"subject": subject, "cwd": str(self.root)}
+                ]
+                result = discover(self.request)
+                self.assertFalse(result["ok"], result)
+                self.assertRegex(result["error"], "subcommand|application entry")
+
+    def test_tlc_config_refuses_symlink_before_parent_traversal(self):
+        outside = self.root / "outside/a/b"
+        outside.mkdir(parents=True)
+        (self.root / "linked").symlink_to(outside, target_is_directory=True)
+        self.config.write_text("{}")
+        self.request["subject"][-1] = "linked/../tlc.json"
+        result = discover(self.request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Symlink in Quint configuration path", result["error"])
+
+    def test_node_options_accepts_no_unreviewed_tokens(self):
+        self.config.write_text("{}")
+        for value in (
+            "--require=/outside/loader.js",
+            "-r/outside/loader.js",
+            "--experimental-loader=/outside/loader.js",
+            "--unknown-option",
+        ):
+            with self.subTest(value=value):
+                self.request["env"]["NODE_OPTIONS"] = value
+                result = discover(self.request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Node startup/module closure", result["error"])
+
+    def verification(self):
+        self.config.write_text("{}")
+        self.request["subject"] = [
+            self.request["subject"][0],
+            "verify",
+            "--backend=tlc",
+            "--server-endpoint=localhost:1",
+            "--tlc-config",
+            str(self.config),
+        ]
+        self.request["applications"] = [
+            {
+                "subject": self.request["subject"],
+                "cwd": str(self.root),
+                "resources": ["quint"],
+            }
+        ]
+        apalache = self.root / "apalache"
+        (apalache / "bin").mkdir(parents=True)
+        (apalache / "lib").mkdir()
+        launcher = apalache / "bin/apalache-mc"
+        launcher.write_text(
+            '#!/bin/sh\nAPALACHE_JAR="${APALACHE_JAR:-../lib/apalache.jar}"\nexec java -jar "$APALACHE_JAR"\n'
+        )
+        launcher.chmod(0o755)
+        java = self.root / "java/bin/java"
+        java.parent.mkdir(parents=True)
+        java.write_text(
+            "#!/bin/sh\necho '    java.home = " + str(java.parent.parent) + "' >&2\n"
+        )
+        java.chmod(0o755)
+        self.request["commands"] = {"java": str(java)}
+        staged = self.root / "staged.jar"
+        self.jar(staged)
+        self.request["env"]["APALACHE_JAR"] = str(staged)
+        return apalache / "lib/apalache.jar"
+
+    def jar(self, file, manifest_extra="", index=False):
+        with zipfile.ZipFile(file, "w") as jar:
+            jar.writestr(
+                "META-INF/MANIFEST.MF",
+                "Manifest-Version: 1.0\nMain-Class: at.forsyte.apalache.tla.Tool\n"
+                + manifest_extra
+                + "\n",
+            )
+            jar.writestr("at/forsyte/apalache/tla/Tool.class", b"fixture")
+            jar.writestr("com/microsoft/z3/Context.class", b"fixture")
+            if index:
+                jar.writestr("META-INF/INDEX.LIST", b"fixture")
+
+    def test_tlc_classpath_jar_manifest_is_checked_with_staged_jar(self):
+        jar = self.verification()
+        for extra, index, expected in (
+            ("Class-Path: /outside/dependency.jar\n", False, "Class-Path delegation"),
+            ("", True, "index delegation"),
+        ):
+            with self.subTest(extra=extra, index=index):
+                self.jar(jar, extra, index)
+                result = discover(self.request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn(expected, result["error"])
+        self.jar(jar)
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+
+    def test_apalache_jar_refuses_symlink_before_parent_traversal(self):
+        self.jar(self.verification())
+        target = self.root / "jar-outside/a/b"
+        target.mkdir(parents=True)
+        (self.root / "jar-link").symlink_to(target, target_is_directory=True)
+        self.request["env"]["APALACHE_JAR"] = "jar-link/../staged.jar"
+        result = discover(self.request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Symlink in Apalache JAR path", result["error"])
+
+    def test_jvm_startup_environment_rejects_unreviewed_tokens(self):
+        self.jar(self.verification())
+        for key in (
+            "JAVA_TOOL_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JVM_ARGS",
+            "JVM_GC_ARGS",
+        ):
+            with self.subTest(key=key):
+                self.request["env"][key] = "@/outside/java.args"
+                result = discover(self.request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Unsupported JVM startup configuration", result["error"])
+                self.request["env"].pop(key)
+
 
 def lean_installation():
     candidates = []
@@ -298,7 +447,7 @@ class LakeConfiguration(unittest.TestCase):
             self.base / "outside", target_is_directory=True
         )
         self.toml(target='srcDir = "linked"\n')
-        self.assert_refused("srcDir resolves outside hashed input roots")
+        self.assert_refused("Symlink in Lake srcDir")
 
     def test_srcdir_in_generated_namespace_is_refused(self):
         (self.root / ".lake/build").mkdir(parents=True)
@@ -330,7 +479,7 @@ class LakeConfiguration(unittest.TestCase):
         self.lean_config(
             'input_file native where\n  path := "native.o"\nlean_lib Review\n'
         )
-        self.assert_refused("input target resolves outside hashed input roots")
+        self.assert_refused("Symlink in Lake input target")
 
     def test_project_inputs_are_returned_as_relative_source_requirements(self):
         (self.root / "src").mkdir()
@@ -341,7 +490,10 @@ class LakeConfiguration(unittest.TestCase):
         result = discover(self.request)
         self.assertTrue(result["ok"], result)
         self.assertEqual(
-            result["sourceRequirements"],
+            {
+                key: result["sourceRequirements"][key]
+                for key in ("directories", "files")
+            },
             {"directories": [".", "src"], "files": ["native.o"]},
         )
 
@@ -399,8 +551,245 @@ class LakeConfiguration(unittest.TestCase):
         result = discover(self.request)
         self.assertTrue(result["ok"], result)
         self.assertEqual(
-            result["sourceRequirements"], {"directories": ["."], "files": []}
+            {
+                key: result["sourceRequirements"][key]
+                for key in ("directories", "files")
+            },
+            {"directories": ["."], "files": []},
         )
+
+    def test_custom_facets_and_unreviewed_lake_fields_are_refused(self):
+        for body in (
+            "library_facet gate : Unit := pure ()\nlean_lib Review\n",
+            "module_facet gate : Unit := pure ()\nlean_lib Review\n",
+            "package_facet gate : Unit := pure ()\nlean_lib Review\n",
+            "target gate : Unit := pure ()\nlean_lib Review\n",
+            "script gate := pure 0\nlean_lib Review\n",
+            *(
+                "lean_lib Review where\n  " + field + " := #[]\n"
+                for field in (
+                    "plugins",
+                    "dynlibs",
+                    "needs",
+                    "defaultFacets",
+                    "nativeFacets",
+                    "unknownFutureField",
+                )
+            ),
+        ):
+            with self.subTest(body=body):
+                self.lean_config(body)
+                self.assert_refused("Unsupported Lake configuration construct")
+        (self.root / "lakefile.lean").unlink()
+        for field in (
+            "plugins",
+            "dynlibs",
+            "needs",
+            "defaultFacets",
+            "nativeFacets",
+            "unknownFutureField",
+        ):
+            with self.subTest(toml_field=field):
+                self.toml(target=field + " = []\n")
+                self.assert_refused("Unsupported Lake configuration key")
+
+    def test_all_package_override_cli_forms_are_refused(self):
+        self.toml()
+        lake = self.request["subject"][0]
+        for args in (
+            ["build", "--packages=/outside/p.json"],
+            ["--packages", "/outside/p.json", "build"],
+            ["--packages /outside/p.json", "build"],
+            ["--packages", "build"],
+            ["-U", "build"],
+            ["--update", "build"],
+            ["-d=../outside", "build"],
+            ["--dir ../outside", "build"],
+            ["-f=other.lean", "build"],
+            ["-Kunknown=value", "build"],
+            ["--future-option", "build"],
+            ["env", "lean", "Check.lean"],
+        ):
+            with self.subTest(args=args):
+                self.request["subject"] = [lake, *args]
+                self.assert_refused("Unsupported Lake application argument")
+
+    def test_default_and_custom_lake_package_overrides_files_are_refused(self):
+        self.toml()
+        for lake_directory in (".lake", "custom-lake"):
+            with self.subTest(directory=lake_directory):
+                directory = self.root / lake_directory
+                directory.mkdir(exist_ok=True)
+                file = directory / "package-overrides.json"
+                file.write_text('{"packages":[]}')
+                if lake_directory == "custom-lake":
+                    self.toml(package='lakeDir = "custom-lake"\n')
+                    self.assert_refused("Unsupported Lake configuration key")
+                else:
+                    self.assert_refused("Unsupported Lake package overrides")
+                file.unlink()
+
+    def test_srcdir_parent_traversal_after_symlink_and_internal_alias_refuse(self):
+        (self.root / "src").mkdir()
+        (self.root / "link").symlink_to(self.root / "src", target_is_directory=True)
+        for value in ("link", "link/../src"):
+            with self.subTest(value=value):
+                self.toml(target='srcDir = "' + value + '"\n')
+                self.assert_refused("Symlink in Lake srcDir")
+
+    def test_path_package_parent_traversal_after_symlink_refuses(self):
+        (self.root / "src").mkdir()
+        (self.root / "link").symlink_to(self.root / "src", target_is_directory=True)
+        self.toml(package='[[require]]\nname = "dep"\npath = "link/../dep"\n')
+        (self.root / "lake-manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": "1.2.0",
+                    "name": "Review",
+                    "packagesDir": ".lake/packages",
+                    "packages": [{"name": "dep", "type": "path", "dir": "link/../dep"}],
+                }
+            )
+        )
+        self.assert_refused("Symlink in Lake package path")
+        (self.root / "lake-manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": "1.2.0",
+                    "name": "Review",
+                    "packagesDir": "link/../cache",
+                    "packages": [{"name": "dep", "type": "git", "rev": "0" * 40}],
+                }
+            )
+        )
+        self.assert_refused("Symlink in Lake package path")
+
+    def test_input_dir_returns_all_file_requirements_separately(self):
+        (self.root / "vectors").mkdir()
+        (self.root / "vectors/case.json").write_text("{}")
+        self.lean_config(
+            'input_dir vectors where\n  path := "vectors"\nlean_lib Review\n'
+        )
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["sourceRequirements"]["inputDirectories"], ["vectors"])
+        self.assertNotIn("vectors", result["sourceRequirements"]["directories"])
+
+    def test_effective_generated_namespaces_are_returned_for_source_walk(self):
+        self.toml(package='packagesDir = "vendor"\nbuildDir = "compiled"\n')
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(
+            {".git", "vendor", "compiled"}.issubset(
+                result["sourceRequirements"]["excludedPaths"]
+            )
+        )
+
+    def test_elan_run_selector_mismatch_is_refused_for_recipes_and_checks(self):
+        self.toml()
+        launchers = self.elan_launcher()
+        self.request["subject"] = [str(launchers / "lake"), "+review-a", "build"]
+        for field in ("applications", "checks"):
+            with self.subTest(field=field):
+                self.request[field] = [
+                    {
+                        "subject": [
+                            str(launchers / "elan"),
+                            "run",
+                            "review-b",
+                            "lake",
+                            "build",
+                        ],
+                        "cwd": str(self.root),
+                    }
+                ]
+                self.assert_refused("selected application toolchain")
+                self.request.pop(field)
+        self.request["subject"] = [
+            str(launchers / "elan"),
+            "run",
+            "review-b",
+            "lake",
+            "build",
+        ]
+        self.request["applications"] = [
+            {
+                "subject": [str(launchers / "lake"), "+review-a", "build"],
+                "cwd": str(self.root),
+            }
+        ]
+        self.assert_refused("selected application toolchain")
+
+    def test_hardlinked_elan_proxies_and_matching_elan_run_are_admitted(self):
+        self.toml()
+        launchers = self.elan_launcher()
+        elan = Path(shutil.which("elan")).resolve()
+        for name in ("elan", "lake", "lean"):
+            (launchers / name).unlink()
+        shutil.copyfile(elan, launchers / "elan")
+        (launchers / "elan").chmod(0o755)
+        for name in ("lake", "lean"):
+            os.link(launchers / "elan", launchers / name)
+        (self.root / "Check.lean").write_text("def checked := 1\n")
+        self.request["subject"] = [str(launchers / "lake"), "+review-a", "build"]
+        self.request["applications"] = [
+            {
+                "subject": [
+                    str(launchers / "elan"),
+                    "run",
+                    "review-a",
+                    "lake",
+                    "build",
+                ],
+                "cwd": str(self.root),
+            },
+            {
+                "subject": [str(launchers / "lean"), "+review-a", "Check.lean"],
+                "cwd": str(self.root),
+            },
+        ]
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Check.lean", result["sourceRequirements"]["files"])
+        self.assertTrue(
+            any(root["path"] == str(launchers / "lean") for root in result["roots"])
+        )
+
+    def test_direct_lean_subjects_are_required_with_and_without_lake(self):
+        (self.root / "Check.lean").write_text("def checked := 1\n")
+        lean = str(self.distribution / "bin/lean")
+        self.toml()
+        self.request["applications"] = [
+            {"subject": [lean, "Check.lean"], "cwd": str(self.root)}
+        ]
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Check.lean", result["sourceRequirements"]["files"])
+        (self.root / "lake-manifest.json").unlink()
+        (self.root / "lakefile.toml").unlink()
+        self.request["subject"] = [lean, "Check.lean"]
+        result = discover(self.request)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Check.lean", result["sourceRequirements"]["files"])
+        (self.root / "Alias.lean").symlink_to(self.root / "Check.lean")
+        self.request["applications"][0]["subject"] = [lean, "Alias.lean"]
+        self.assert_refused("Symlink in Lean source input")
+
+    def test_lean_and_lake_commands_without_adapter_refuse_at_discovery(self):
+        for name in ("lake", "lean"):
+            with self.subTest(name=name):
+                request = {
+                    **self.request,
+                    "op": "bind",
+                    "distribution": str(self.distribution),
+                    "subject": [str(self.distribution / "bin" / name), "--version"],
+                }
+                result = discover(request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn(
+                    "Lean/Lake command requires a lean-toolchain adapter",
+                    result["error"],
+                )
 
 
 if __name__ == "__main__":

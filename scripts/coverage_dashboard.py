@@ -1079,7 +1079,10 @@ def render_text(dashboard: dict) -> str:
             f"bindings: {BINDING_MODE} (stored results only; "
             "freshness and reuse eligibility are not assessed)"
         )
-        counts = dashboard["counts"]
+        counts = {
+            key: value if value is not None else "not-assessed"
+            for key, value in dashboard["counts"].items()
+        }
         lines.append(
             f"logical-associations={counts['logical_associations']} "
             f"unique-physical-executions={counts['unique_physical_executions']} "

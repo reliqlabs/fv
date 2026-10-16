@@ -25,7 +25,7 @@ PROGRAM = (
     "const input=await Bun.stdin.json();const moduleURL=input.module??"
     + json.dumps(MODULE.as_uri())
     + ";const {discoverPythonAdapter,discoverNodeAdapter,discoverNativeAdapter,createToolchainSession}=await import(moduleURL);"
-    + "const {hashToolRoots}=await import(new URL('evidence-v4-toolchain-common.ts',moduleURL).href);"
+    + "const {hashToolRoots,parseMachOLoadCommands}=await import(new URL('evidence-v4-toolchain-common.ts',moduleURL).href);"
     + "const {D,H}=await import(new URL('evidence-v4-model.ts',moduleURL).href);\n"
     + r"""
 let session={async run(request){
@@ -56,7 +56,9 @@ const context={root:input.root,cwd:input.root,cwdRelative:'.',subject:declaratio
   native(subject,settings){return discoverNativeAdapter(context,subject,settings);}
 };
 try{
-  if(input.op==='resolve'){
+  if(input.op==='macho'){
+    process.stdout.write(JSON.stringify({ok:true,result:parseMachOLoadCommands(input.text)}));
+  }else if(input.op==='resolve'){
     const tools=createToolchainSession({root:input.root,env:input.env,policy:{toolchains:[]},session});
     const selected=await Promise.all(input.commands.map(command=>tools.resolveCommand(command)));
     process.stdout.write(JSON.stringify({ok:true,selected}));
@@ -64,7 +66,7 @@ try{
     const tools=createToolchainSession({root:input.root,env:input.env,policy:input.policy,session});
     const identities=await tools.capture(input.ids??[]);
     if(input.op==='optional-install'){
-      await fs.writeFile(input.install_file,'VALUE = 2\n');
+      if(input.append)await fs.appendFile(input.install_file,'\0');else await fs.writeFile(input.install_file,'VALUE = 2\n');
       try{
         await tools.revalidate(input.ids??[]);
         process.stdout.write(JSON.stringify({ok:true,accepted:true}));
@@ -173,6 +175,312 @@ class ToolchainReview(unittest.TestCase):
                 }
             ],
         }
+
+    def capture_python(self, source):
+        request = self.python_request(source)
+        request.update(
+            op="capture",
+            ids=["python"],
+            policy={
+                "toolchains": [declaration("python", "python-runtime", [self.python])],
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {
+                    "command": request["commands"][0]["subject"],
+                    "cwd": ".",
+                    "toolchain": ["python"],
+                },
+            },
+        )
+        return invoke(request)
+
+    def test_guarded_absence_requires_one_direct_import(self):
+        sources = (
+            "import sys\ntry:\n if sys.version_info >= (3,11):\n  import tomllib\n else:\n  import absent_fv_module\n import external_plugin\nexcept ImportError:\n pass\n",
+            "try:\n import absent_fv_module\n import external_plugin\nexcept ImportError:\n pass\n",
+            "try:\n def load():\n  import absent_fv_module\n import external_plugin\nexcept ImportError:\n pass\n",
+        )
+        self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        for source in sources:
+            with self.subTest(source=source):
+                result = invoke(self.python_request(source))
+                self.assertFalse(result["ok"], result)
+
+    def test_python_path_mutation_allowlist_refuses_other_forms(self):
+        sources = (
+            "sys.path += ['plugins']",
+            "del sys.path[0]",
+            "sys.path = ['plugins']",
+            "sys.path.extend(['plugins'])",
+            "sys.path.reverse()",
+            "sys.path_hooks.append(None)",
+            "sys.meta_path = []",
+            "with open(__file__) as stream:\n sys.path.insert(0, 'plugins')",
+            "for item in ['plugins']:\n sys.path.insert(0, item)",
+            "while flag:\n sys.path.append('plugins')",
+            "result = sys.path.append('plugins')",
+            "change = sys.path.append\nchange('plugins')",
+            "getattr(sys, 'path').append('plugins')",
+            "saved = sys.path",
+            "holder.path = sys.path",
+            "holder = {'path': sys.path}\nholder['path'].append('plugins')",
+            "def setup(paths=sys.path):\n paths.append('plugins')\nsetup()",
+            "def setup(runtime):\n runtime.path.append('plugins')\nsetup(sys)",
+            "for item in ['plugins']:\n import sys as runtime\n runtime.path.append(item)",
+            "if condition:\n import sys as runtime\n runtime.path.append('plugins')",
+            "def setup():\n import sys as runtime\n runtime.path.append('plugins')\nsetup()",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                result = invoke(self.python_request("import sys\n" + source + "\n"))
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python", result["error"])
+
+    def test_python_dynamic_loader_allowlist_refuses_other_forms(self):
+        sources = (
+            "import site\nsite.addsitedir('plugins')",
+            "import importlib\nimportlib.__import__('json')",
+            "from importlib.machinery import SourceFileLoader\nSourceFileLoader('x','plugins/x.py').load_module()",
+            "import importlib.util\nimportlib.util.find_spec('json')",
+            "exec(compile('import external_plugin', '<test>', 'exec'))",
+            "import runpy\ndef load(file):\n runpy.run_path(file)\nload(selected)",
+            "import importlib\ndef load(callback):\n callback(selected)\nload(importlib.import_module)",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                result = invoke(self.python_request(source + "\n"))
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python", result["error"])
+
+    def test_python_warning_and_extended_option_selectors_refuse(self):
+        for options in (
+            ["-W", "ignore::external_plugin.Warning"],
+            ["-Wignore::external_plugin.Warning"],
+            ["-X", "presite=external_plugin"],
+        ):
+            with self.subTest(options=options):
+                request = self.python_request("VALUE = 1\n")
+                request["commands"][0]["subject"][1:1] = options
+                result = invoke(request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python interpreter selection", result["error"])
+        request = self.python_request("VALUE = 1\n")
+        request["env"]["PYTHONWARNINGS"] = "ignore::external_plugin.Warning"
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("PYTHONWARNINGS", result["error"])
+
+    def test_python_literal_helper_loader_binds_target_imports(self):
+        self.write(self.root / "loaded.py", "import external_plugin\n")
+        module = self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        source = """import importlib.util, sys
+from pathlib import Path
+def _input(root, relative):
+ path = root / relative
+ if path.is_symlink() or path.resolve() != path or not path.is_file():
+  raise ValueError('missing or redirected input')
+ return path
+def _module(root, relative, name):
+ path = _input(root, relative)
+ spec = importlib.util.spec_from_file_location(name, path)
+ if spec is None or spec.loader is None:
+  raise ValueError('cannot load collector')
+ module = importlib.util.module_from_spec(spec)
+ sys.modules[name] = module
+ spec.loader.exec_module(module)
+ return module
+def check(root):
+ return _module(root, 'loaded.py', 'loaded')
+"""
+        result = invoke(self.python_request(source))
+        self.assertTrue(result["ok"], result)
+        self.assertIn(
+            str(module),
+            {
+                file
+                for requirement in result["requirements"]
+                for file in requirement["files"]
+            },
+        )
+        rejected = self.capture_python(source)
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertIn("external_plugin.py", rejected["error"])
+        rejected = invoke(
+            self.python_request(
+                source.replace("'loaded.py', 'loaded'", "selected, 'loaded'")
+            )
+        )
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertIn("non-literal Python loader", rejected["error"])
+
+    def test_python_sibling_loaders_and_snapshot_restore_bind_imports(self):
+        self.write(self.root / "loaded.py", "import external_plugin\n")
+        module = self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        sources = (
+            "import importlib.util\nfrom pathlib import Path\nspec = importlib.util.spec_from_file_location('loaded', Path(__file__).with_name('loaded.py'))\nmodule = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\n",
+            "import runpy\nfrom pathlib import Path\nrunpy.run_path(str(Path(__file__).parent / 'loaded.py'))\n",
+            "import runpy, sys\nfrom pathlib import Path\ndef load():\n sys.argv = [str(Path(__file__).with_name('loaded.py')), '--fixture']\n runpy.run_path(sys.argv[0], run_name='__main__')\n",
+            "import runpy, sys\nfrom pathlib import Path\ndef load():\n previous = sys.path[:]\n try:\n  sys.path.insert(0, str(Path(__file__).resolve().parent))\n  return runpy.run_path(str(Path(__file__).with_name('loaded.py')))\n finally:\n  sys.path[:] = previous\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                result = invoke(self.python_request(source))
+                self.assertTrue(result["ok"], result)
+                self.assertIn(
+                    str(module),
+                    {
+                        file
+                        for requirement in result["requirements"]
+                        for file in requirement["files"]
+                    },
+                )
+                rejected = self.capture_python(source)
+                self.assertFalse(rejected["ok"], rejected)
+                self.assertIn("external_plugin.py", rejected["error"])
+
+    def test_python_loader_preserves_search_path_and_run_name(self):
+        self.write(
+            self.root / "plugins/loaded.py",
+            "if __name__ == '<run_path>':\n import external_plugin\n",
+        )
+        self.write(self.root / "plugins/external_plugin.py", "VALUE = 'shadow'\n")
+        external = self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        result = invoke(
+            self.python_request("import runpy\nrunpy.run_path('plugins/loaded.py')\n")
+        )
+        self.assertTrue(result["ok"], result)
+        files = {
+            file
+            for requirement in result["requirements"]
+            for file in requirement["files"]
+        }
+        self.assertIn(str(external), files)
+        self.assertNotIn(str(self.root / "plugins/external_plugin.py"), files)
+        external.unlink()
+        fallback = invoke(
+            self.python_request("import runpy\nrunpy.run_path('plugins/loaded.py')\n")
+        )
+        self.assertTrue(fallback["ok"], fallback)
+        inputs = {
+            file
+            for requirement in fallback["requirements"]
+            for file, _digest in requirement.get("inputs", [])
+        }
+        self.assertIn(str(self.root / "plugins/external_plugin.py"), inputs)
+
+    def test_python_argv_loader_requires_unchanged_straightline_selection(self):
+        self.write(self.root / "loaded.py", "VALUE = 1\n")
+        mutations = (
+            "sys.argv[0] = selected",
+            "sys.argv.append(selected)",
+            "if condition:\n  sys.argv = [selected]",
+            "for value in values:\n  sys.argv = [value]",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                body = "\n".join(" " + line for line in mutation.splitlines())
+                source = (
+                    "import runpy, sys\ndef load():\n sys.argv = ['loaded.py']\n"
+                    + body
+                    + "\n runpy.run_path(sys.argv[0])\n"
+                )
+                result = invoke(self.python_request(source))
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python loader location", result["error"])
+
+    def test_python_wrapper_command_context_refuses(self):
+        request = self.python_request("VALUE = 1\n")
+        wrapper = self.write(
+            self.root / "run.sh", "exec " + shlex.quote(self.python) + " check.py\n"
+        )
+        request["commands"][0]["subject"] = ["/bin/sh", str(wrapper)]
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Python command wrapper", result["error"])
+
+    def test_python_dependency_of_bound_quint_is_not_a_python_invocation(self):
+        binary = self.root / "quint"
+        binary.symlink_to("/usr/bin/true")
+        script = self.write(self.root / "check.py", "VALUE = 1\n")
+        runtime = declaration("python", "python-runtime", [self.python])
+        commands = []
+        for identifier, executable in (("quint", str(binary)), ("bash", "/bin/bash")):
+            commands.append(
+                {
+                    "id": identifier,
+                    "kind": "executable",
+                    "locator": {"mode": "path", "value": executable},
+                    "requires": ["python"],
+                    "version_command": None,
+                    "version_cwd": None,
+                    "accept": {"sha256": [], "version_contains": []},
+                }
+            )
+        policy = {
+            "toolchains": [runtime, *commands],
+            "recipes": [],
+            "preflight": [
+                {"command": [str(binary), "verify"], "cwd": ".", "toolchain": ["quint"]}
+            ],
+            "claim_checker": {
+                "command": [self.python, str(script)],
+                "cwd": ".",
+                "toolchain": ["python"],
+            },
+        }
+        request = {
+            "op": "capture",
+            "root": str(self.root),
+            "env": self.env,
+            "ids": ["quint"],
+            "policy": policy,
+        }
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        policy["preflight"][0] = {
+            "command": ["/bin/bash", "-c", shlex.quote(self.python) + " check.py"],
+            "cwd": ".",
+            "toolchain": ["bash"],
+        }
+        request["ids"] = ["bash"]
+        rejected = invoke(request)
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertIn("Python command wrapper", rejected["error"])
+
+    def test_node_runtime_option_overrides_refuse(self):
+        for name in ("NODE_OPTIONS", "npm_config_node_options"):
+            for value in (
+                "--require /opt/hooks/trace.js",
+                "--import=external-loader",
+                "--loader x",
+                "-rhook",
+                "--max-old-space-size=1024",
+            ):
+                with self.subTest(name=name, value=value):
+                    result = invoke(
+                        {
+                            "op": "node",
+                            "root": str(self.root),
+                            "env": {**self.env, name: value},
+                            "declaration": declaration(
+                                "node", "node-toolchain", ["pnpm", "exec", "tsx"]
+                            ),
+                        }
+                    )
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn(name, result["error"])
+
+    def test_macho_embedded_loader_environment_refuses(self):
+        result = invoke(
+            {
+                "op": "macho",
+                "root": str(self.root),
+                "env": self.env,
+                "text": "Load command 0\n cmd LC_DYLD_ENVIRONMENT\n cmdsize 64\n name DYLD_LIBRARY_PATH=/opt/override (offset 12)\n",
+            }
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertIn("LC_DYLD_ENVIRONMENT", result["error"])
 
     def test_unresolved_dynamic_python_imports_reject(self):
         sources = (
@@ -586,6 +894,234 @@ else if(args[0]==='exec'){
                 self.assertIn(name, result["error"])
 
     @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_nonadapter_darwin_dylib_closure_is_bound_without_version_probe(self):
+        library_source = self.write(
+            self.root / "library.c", "int fixture(void) { return 0; }\n"
+        )
+        library = self.external / "libfixture.dylib"
+        executable_source = self.write(
+            self.root / "main.c",
+            "int fixture(void); int main(void) { return fixture(); }\n",
+        )
+        executable = self.external / "fixture"
+        for command in (
+            [
+                "/usr/bin/cc",
+                "-dynamiclib",
+                "-install_name",
+                str(library),
+                str(library_source),
+                "-o",
+                str(library),
+            ],
+            [
+                "/usr/bin/cc",
+                str(executable_source),
+                str(library),
+                "-o",
+                str(executable),
+            ],
+        ):
+            subprocess.run(command, capture_output=True, text=True, check=True)
+        for kind in ("executable", "file"):
+            with self.subTest(kind=kind):
+                tool = {
+                    "id": "fixture",
+                    "kind": kind,
+                    "locator": {"mode": "path", "value": str(executable)},
+                    "requires": [],
+                    "version_command": None,
+                    "version_cwd": None,
+                    "accept": {"sha256": [], "version_contains": []},
+                }
+                request = {
+                    "op": "capture",
+                    "root": str(self.root),
+                    "env": self.env,
+                    "ids": ["fixture"],
+                    "policy": {
+                        "toolchains": [tool],
+                        "recipes": [],
+                        "preflight": [],
+                        "claim_checker": {"toolchain": []},
+                    },
+                }
+                result = invoke(request)
+                self.assertTrue(result["ok"], result)
+                identity = next(
+                    value for value in result["identities"] if value["id"] == "fixture"
+                )
+                self.assertEqual(identity["kind"], "tree")
+                self.assertTrue(
+                    any(file["path"] == "selected-file" for file in identity["files"])
+                )
+                self.assertTrue(
+                    any(
+                        file["path"].startswith("native/non-system-libraries/")
+                        for file in identity["files"]
+                    )
+                )
+                request.update(
+                    op="optional-install", install_file=str(library), append=True
+                )
+                changed = invoke(request)
+                self.assertTrue(changed["ok"], changed)
+                self.assertFalse(changed["accepted"], changed)
+                self.assertIn(
+                    "Installed tool selection or bytes changed: fixture",
+                    changed["error"],
+                )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_rustup_selected_version_driver_is_bound(self):
+        directory = self.base / "rustup-bin"
+        installed = self.external / "selected-cargo"
+        shutil.copyfile("/usr/bin/true", installed)
+        installed.chmod(0o755)
+        self.write(
+            directory / "rustup",
+            "#!/bin/sh\nif [ \"$1\" = which ]; then printf '%s\\n' "
+            + shlex.quote(str(installed))
+            + "; else printf 'cargo 1.0\\n'; fi\n",
+            executable=True,
+        )
+        (directory / "cargo").symlink_to("rustup")
+        tool = {
+            "id": "cargo",
+            "kind": "executable",
+            "locator": {"mode": "command", "value": "cargo"},
+            "requires": ["shell"],
+            "version_command": ["cargo", "--version"],
+            "version_cwd": ".",
+            "accept": {"sha256": [], "version_contains": []},
+        }
+        shell = {
+            "id": "shell",
+            "kind": "file",
+            "locator": {"mode": "path", "value": "/bin/sh"},
+            "requires": [],
+            "version_command": None,
+            "version_cwd": None,
+            "accept": {"sha256": [], "version_contains": []},
+        }
+        request = {
+            "op": "capture",
+            "root": str(self.root),
+            "env": {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]},
+            "ids": ["cargo"],
+            "policy": {
+                "toolchains": [tool, shell],
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {"toolchain": []},
+            },
+        }
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        identity = next(
+            value for value in result["identities"] if value["id"] == "cargo"
+        )
+        self.assertEqual(identity["kind"], "tree")
+        self.assertTrue(
+            any(file["path"] == "native/drivers/cargo-0" for file in identity["files"])
+        )
+        request.update(op="optional-install", install_file=str(installed), append=True)
+        changed = invoke(request)
+        self.assertTrue(changed["ok"], changed)
+        self.assertFalse(changed["accepted"], changed)
+        self.assertIn(
+            "Installed tool selection or bytes changed: cargo", changed["error"]
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_nonadapter_metadata_helpers_use_producer_binding(self):
+        tool = {
+            "id": "true",
+            "kind": "executable",
+            "locator": {"mode": "path", "value": "/usr/bin/true"},
+            "requires": [],
+            "version_command": ["/usr/bin/true"],
+            "version_cwd": ".",
+            "accept": {"sha256": [], "version_contains": []},
+        }
+        result = invoke(
+            {
+                "op": "stability",
+                "root": str(self.root),
+                "env": self.env,
+                "ids": ["true"],
+                "policy": {
+                    "toolchains": [tool],
+                    "recipes": [],
+                    "preflight": [],
+                    "claim_checker": {"toolchain": []},
+                },
+            }
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["identities"], result["after"])
+        identity = next(
+            value for value in result["identities"] if value["id"] == "true"
+        )
+        self.assertEqual(identity["kind"], "executable")
+        self.assertEqual([file["path"] for file in identity["files"]], ["."])
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_metadata_helper_requires_captured_byte_binding(self):
+        helper = self.write(
+            self.external / "version-helper",
+            "#!/bin/sh\nprintf '1.0\\n'\n",
+            executable=True,
+        )
+        tools = [
+            {
+                "id": "main",
+                "kind": "executable",
+                "locator": {"mode": "path", "value": "/usr/bin/true"},
+                "requires": [],
+                "version_command": [str(helper)],
+                "version_cwd": ".",
+                "accept": {"sha256": [], "version_contains": []},
+            },
+            {
+                "id": "helper",
+                "kind": "file",
+                "locator": {"mode": "path", "value": str(helper)},
+                "requires": [],
+                "version_command": None,
+                "version_cwd": None,
+                "accept": {"sha256": [], "version_contains": []},
+            },
+            {
+                "id": "shell",
+                "kind": "file",
+                "locator": {"mode": "path", "value": "/bin/sh"},
+                "requires": [],
+                "version_command": None,
+                "version_cwd": None,
+                "accept": {"sha256": [], "version_contains": []},
+            },
+        ]
+        request = {
+            "op": "capture",
+            "root": str(self.root),
+            "env": self.env,
+            "ids": ["main", "shell"],
+            "policy": {
+                "toolchains": tools,
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {"toolchain": []},
+            },
+        }
+        rejected = invoke(request)
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertIn(str(helper), rejected["error"])
+        request["ids"] = ["main", "helper", "shell"]
+        accepted = invoke(request)
+        self.assertTrue(accepted["ok"], accepted)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
     def test_metadata_helper_bytes_enter_producer_identity(self):
         helpers = self.base / "helpers"
         otool = self.write(
@@ -630,6 +1166,13 @@ else if(args[0]==='exec'){
                 for file in before["identities"][0]["files"]
             ),
             before,
+        )
+        self.assertTrue(
+            any(
+                probe["command"][0] == str(otool) and probe["command"][-1] == "/bin/sh"
+                for probe in before["identities"][0]["discovery"]
+            ),
+            before["identities"][0]["discovery"],
         )
         for helper in (otool, plutil):
             with self.subTest(helper=helper.name):

@@ -105,6 +105,9 @@ export function validatePolicy(value: unknown): Policy {
 	const used = new Set<string>();
 	for (const recipe of policy.recipes) {
 		recipe.toolchain.forEach(visit);
+		const overlap = recipe.resources.find((resource) => policy.claim_checker.resources.includes(resource));
+		if (overlap !== undefined)
+			throw new Error(`claim checker resource overlaps recipe ${recipe.recipe_id}: ${overlap}`);
 		if (recipe.source_closure.mode === "verified-inputs" && recipe.source_closure.prefixes.length)
 			throw new Error(`whole-input closure has prefixes: ${recipe.recipe_id}`);
 		if (recipe.source_closure.mode === "prefixes" && !recipe.source_closure.prefixes.length)

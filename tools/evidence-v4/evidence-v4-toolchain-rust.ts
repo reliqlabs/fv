@@ -548,6 +548,7 @@ type MetadataPackage = {
 	targets: { kind: string[]; src_path: string }[];
 	links: string | null;
 	dependencies: { name: string; kind: string | null }[];
+	attestationBuildDependencies?: string[];
 	attestationFeatures?: string[];
 	attestationDependencies?: string[];
 	attestationHost?: boolean;
@@ -767,6 +768,9 @@ async function applicationGraph(
 	const resolvedNodes = new Map((full.resolve?.nodes || []).map((node) => [node.id, node]));
 	for (const pkg of graph.values()) {
 		const node = resolvedNodes.get(pkg.id);
+		pkg.attestationBuildDependencies = (node?.deps || [])
+			.filter((dependency) => graph.has(dependency.pkg) && dependency.dep_kinds.some((kind) => kind.kind === "build"))
+			.map((dependency) => dependency.pkg);
 		if (node)
 			pkg.attestationDependencies = node.deps
 				.filter((dependency) => graph.has(dependency.pkg) && dependency.dep_kinds.some((kind) => kind.kind === null))
@@ -982,9 +986,6 @@ const OPTIONAL_PROCESS_ABSENCE_PROBE = [
 	"candidates.push({path_hash:hash(candidate),absent:true});}",
 	"console.log(JSON.stringify({platform:process.platform,cwd_hash:hash(cwd),path_hash:hash(search),candidates}));",
 ].join("\n");
-const OPTIONAL_PROCESS_OUTPUT =
-	/^(?:\s*\.\s*arg\s*\(\s*"(?:[^"\\]|\\.)*"\s*\))*\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/;
-
 async function bindOptionalProcessAbsence(
 	context: AdapterContext,
 	source: string,
@@ -1035,100 +1036,6 @@ async function bindOptionalProcessAbsence(
 	discovery.push(result.identity);
 	if (!executables.includes(process.execPath)) executables.push(process.execPath);
 }
-function cargoRustcSelector(source: string, selector: string, offset: number): boolean {
-	const prefix = source.slice(0, offset);
-	const consumer = "\\s*;\\s*let\\s+(?:mut\\s+)?[A-Za-z_][A-Za-z0-9_]*\\s*=\\s*$";
-	const binding = "\\blet\\s+" + selector + "\\s*=\\s*";
-	if (new RegExp(binding + '(?:std::)?env::var(?:_os)?\\(\\s*"RUSTC"\\s*\\)\\s*\\?' + consumer).test(prefix))
-		return true;
-	const accessor = new RegExp(binding + '([A-Za-z_][A-Za-z0-9_]*)\\(\\s*"RUSTC"\\s*\\)' + consumer).exec(prefix);
-	if (!accessor) return false;
-	const name = accessor[1];
-	if (
-		[...source.matchAll(new RegExp("\\bfn\\s+" + name + "\\s*\\(", "g"))].length !== 1 ||
-		new RegExp("\\blet\\s+(?:mut\\s+)?" + name + "\\b").test(source)
-	)
-		return false;
-	// The accessor's successful result is exactly the requested Cargo variable.
-	// Its closure is reached only when that mandatory variable is absent.
-	const definition = new RegExp(
-		"\\bfn\\s+" +
-			name +
-			"\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*&\\s*str\\s*\\)\\s*->\\s*(?:std::ffi::)?OsString\\s*\\{\\s*(?:std::)?env::var_os\\(\\s*\\1\\s*\\)\\s*\\.\\s*unwrap_or_else\\(\\s*\\|\\s*\\|\\s*\\{[\\s\\S]*?\\}\\s*\\)\\s*\\}",
-	);
-	return definition.test(source);
-}
-function rebuildOnlyScript(source: string): boolean {
-	let offset = 0;
-	let valid = true;
-	const token = /[A-Za-z_][A-Za-z0-9_]*|[(){}!;,]|"(?:[^"\\\r\n]|\\.)*"/y;
-	function next(): string | null {
-		while (offset < source.length) {
-			if (/\s/.test(source[offset])) {
-				offset++;
-				continue;
-			}
-			if (source.startsWith("//", offset)) {
-				const end = source.indexOf("\n", offset + 2);
-				offset = end < 0 ? source.length : end + 1;
-				continue;
-			}
-			if (source.startsWith("/*", offset)) {
-				let depth = 1;
-				offset += 2;
-				while (offset < source.length && depth) {
-					if (source.startsWith("/*", offset)) {
-						depth++;
-						offset += 2;
-					} else if (source.startsWith("*/", offset)) {
-						depth--;
-						offset += 2;
-					} else offset++;
-				}
-				if (depth) {
-					valid = false;
-					return null;
-				}
-				continue;
-			}
-			break;
-		}
-		if (offset === source.length) return null;
-		token.lastIndex = offset;
-		const match = token.exec(source);
-		if (!match) {
-			valid = false;
-			return null;
-		}
-		offset = token.lastIndex;
-		return match[0];
-	}
-	if (next() !== "fn" || next() !== "main" || next() !== "(" || next() !== ")" || next() !== "{") return false;
-	let current = next();
-	while (current !== "}") {
-		if (current !== "println" || next() !== "!" || next() !== "(") return false;
-		const literal = next();
-		if (!literal?.startsWith('"')) return false;
-		let directive: unknown;
-		try {
-			directive = parseJSON(Buffer.from(literal, "utf8"));
-		} catch {
-			return false;
-		}
-		if (
-			typeof directive !== "string" ||
-			/[{}\x00-\x1f\x7f]/.test(directive) ||
-			!/^cargo::?rerun-if-(?:changed|env-changed)=.+$/.test(directive)
-		)
-			return false;
-		current = next();
-		if (current === ",") current = next();
-		if (current !== ")" || next() !== ";") return false;
-		current = next();
-	}
-	return next() === null && valid && offset === source.length;
-}
-
 function rustSourceCode(source: string): string | null {
 	const rawString = /(?:b|c)?r(#{0,255})"/y;
 	const character = /'(?:[^'\\\r\n]|\\(?:[nrt0\\'"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}))'/uy;
@@ -1182,6 +1089,11 @@ function hasNativeSourceLinkage(source: string, sourceLinksOnly = false, target 
 	const code = rustSourceCode(source);
 	if (code === null) return true;
 	for (const match of code.matchAll(/\b(?:link|link_args)\s*(?:\(|=)|\binclude\s*!|#\s*\[\s*path\s*=/g)) {
+		if (/^link(?:_args)?\b/.test(match[0])) {
+			const open = code.lastIndexOf("[", match.index);
+			if (open < 0 || open < code.lastIndexOf("]", match.index) || !code.slice(0, open).trimEnd().endsWith("#"))
+				continue;
+		}
 		if (!sourceLinksOnly) return true;
 		if (!/^link(?:_args)?\b/.test(match[0])) continue;
 		const attribute =
@@ -1206,13 +1118,120 @@ const REVIEWED_NONWINDOWS_LINK_SOURCES: Record<string, string> = {
 	"jobserver@0.1.34": "sha256:059bd857a7d7234832e7e498693765a9cdd3cf3f1c296701452b6fbd0fc23d5f",
 	"jobserver@0.1.35": "sha256:a63c9defad34cac7f2d136298777c0a5709f905bcbe0bfb2089e76a96feb1ea5",
 	"cmake@0.1.58": "sha256:1a8c1153c631ffd5a0ca9ebbf73d1a6dcda592e978824b85cbbde94eacea2864",
+	"getrandom@0.2.17": "sha256:280d6782ab784ef4618985933641af51f23abb178dac57018885e77337dd3d81",
 };
+// Dynamic data/doc macros and their callers require exact reviewed source snapshots.
+const REVIEWED_INCLUSION_SOURCES: Record<string, string> = {
+	"aead@0.5.2": "sha256:356814d9ab3736d9660b8a0aa389d2cf90db49a3bc70624f2c22ba47cf01bf69",
+	"aes-gcm@0.10.3": "sha256:3843e4feaa26f8538e2c30c6995bb3b915232b234f89eeec053179752142acf3",
+	"aes@0.8.4": "sha256:047434ce7c24c8c6cf764e3667d8e38076c0e3407e5dccde44640ee45233f9ff",
+	"aws-lc-rs@1.18.0": "sha256:8d3e6ef56f63af1236429c44a51b336e0e4712b06ad392bb08a952311589e554",
+	"chacha20@0.10.2": "sha256:20ee855b7ef93ce233de7d6ab702b492e044ea397186f682f5f15cc14b003d82",
+	"cipher@0.4.4": "sha256:5e19a8e10437f3a5fc0311fc001cd5e83ac787d4137524703e8709158a31bb72",
+	"crc-fast@1.10.0": "sha256:5f54db9f130454a3e63e53809e8fd4c0e89171daa04ee26b64f0b16759c381c9",
+	"ctr@0.9.2": "sha256:b6a125141e469a2a284abaee6e49b02f7d9568972fa9effa70b4d9c605fcc1c2",
+	"derive_more-impl@2.1.1": "sha256:77427b40280488fd31be6519cac82ee45c85a587d29cc3aed358579cc7559301",
+	"digest@0.10.7": "sha256:998224c165aaec9a6ba72a81c7e28cee89af3beb95bbb491e8d22413e3a3c035",
+	"digest@0.11.3": "sha256:196d2e89a33dd98b340e51a9d3272415a02fd4675a62814b7fece758fe757d42",
+	"ecdsa@0.16.9": "sha256:8cda5c2b2f4dbf5e61cc67654d64682a17435c358b119269ce649e8831ed0528",
+	"ecdsa@0.17.0": "sha256:dccb6ee88c003d85499ffc4354ddc466be3b3ee7403f8fc860c0b4d3015803e1",
+	"fs_extra@1.3.0": "sha256:75c631a4108c96632b600adbce5a610874ddad9ef61611bec2f77f134eb7d705",
+	"hmac@0.12.1": "sha256:1659f82120a305396903bc020324abe38f962767d62bbb534c4c0705c981fda4",
+	"hmac@0.13.0": "sha256:4c0acf23c9c095002e49e2cb246ac3729e55226f0cb7f91e4ef4cc4b24324cec",
+	"p256@0.13.2": "sha256:b075f8c0b77c76bca8e06f73d18017b87e9e5c0fef3aa570002974cc8af38b07",
+	"p256@0.14.0": "sha256:ab723190b284f867e0ae101cc2af19a3d55e58527fe487a5fbe9e1544e4bc30f",
+	"serde_with@3.11.0": "sha256:88f54bdf7340b5670dc81668a693b417fd31622c127d7b5c459ebfea464b0144",
+	"sha2@0.10.9": "sha256:ec86b36e4fb7cf990d15d0599af8ff67110e4bc5491e862c8d0f4d041b5485b8",
+	"sha2@0.11.0": "sha256:eebd02fcbc76d96f8ce4b2290465e5b199c14d399a29ee2ada38a66263beb45e",
+	"zerocopy@0.8.52": "sha256:91f758225d4e328f631dfa38243e7b9322a9886377aadb78747c596c97b21355",
+};
+// This exact dependency file ends in an inactive #[cfg(test)] module with unpackaged workspace fixtures.
+const REVIEWED_INACTIVE_TEST_SOURCES: Record<string, string> = {
+	"cosmwasm-std@3.0.7/src/testing/mock.rs": "sha256:07be3ab615dbd7188a72233a959c758cd6c9bd7ed0cbfe4f12ce8d7dde4f05b2",
+	"cosmwasm-std@3.0.9/src/testing/mock.rs": "sha256:07be3ab615dbd7188a72233a959c758cd6c9bd7ed0cbfe4f12ce8d7dde4f05b2",
+};
+const REVIEWED_INACTIVE_GIT_SOURCES: Record<string, string> = {
+	"serde_derive_internals@0.29.1/lib.rs": "sha256:f6b6a9432c01e8837479969e86211b71bdbe5b36eacbc4124118c4b0d635f5e5",
+	"serde_derive_internals@0.30.0/lib.rs": "sha256:024e87422592d0eb7ff9d13e56b71a48f1399a0feeb3d8ad90e9e43870318535",
+};
+function assertRustSourceIncludes(
+	source: string,
+	filename: string,
+	directory: string,
+	excluded: readonly string[],
+	generated: boolean,
+	inactiveTests: boolean,
+	inactiveGit: boolean,
+	includedSources: Set<string>,
+): boolean {
+	let code = rustSourceCode(source);
+	if (code === null) fail("unclassified Rust source inclusion syntax in " + filename);
+	if (inactiveTests) {
+		const start = code.search(/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*\{/);
+		if (start >= 0) code = code.slice(0, start);
+	}
+	if (inactiveGit)
+		code = code.replace(/#\s*\[\s*cfg_attr\s*\(\s*serde_build_from_git\s*,[\s\S]*?\]/g, (match) =>
+			" ".repeat(match.length),
+		);
+	function bound(value: string, sourceInput: boolean): void {
+		const resolved = path.resolve(path.dirname(filename), value);
+		const relative = path.relative(directory, resolved).split(path.sep).join("/");
+		if (
+			!value ||
+			path.isAbsolute(value) ||
+			value.includes("\\") ||
+			/[\x00-\x1f]/.test(value) ||
+			!beneath(directory, resolved) ||
+			excluded.some((item) => relative === item || relative.startsWith(item + "/"))
+		)
+			fail("Rust source inclusion is outside immutable package roots: " + value);
+		if (sourceInput && !resolved.endsWith(".rs")) includedSources.add(resolved);
+	}
+	let dynamic =
+		/\b(?:block_cipher_test|block_mode_dec_test|block_mode_enc_test|codegen_example|create_derive|generate_guide|hash_serialization_test|include_value|new_mac_test|new_resettable_mac_test|new_test|new_wycheproof_test|stream_cipher_test|test_file)\b/.test(
+			code,
+		);
+	for (const match of code.matchAll(
+		/\binclude(?:_bytes|_str)?\s*!\s*[([{]|#\s*\[\s*(?:cfg_attr\s*\([^\n;]*,\s*)?path\s*=/g,
+	)) {
+		const sourceInput = /^include\s*!|^#/.test(match[0]);
+		const tail = source.slice(match.index! + match[0].length).trimStart();
+		const literal = /^(?:"(?:[^"\\]|\\.)*"|r(#{0,255})"[\s\S]*?"\1)/.exec(tail);
+		if (literal) {
+			let value: string;
+			if (literal[1] !== undefined) value = literal[0].slice(2 + literal[1].length, -1 - literal[1].length);
+			else {
+				try {
+					value = parseJSON(Buffer.from(literal[0])) as string;
+				} catch {
+					fail("unsupported Rust inclusion string escape in " + filename);
+				}
+			}
+			bound(value, sourceInput);
+		} else if (
+			generated &&
+			/^concat!\(\s*env!\(\s*"OUT_DIR"\s*\)\s*,\s*"\/[A-Za-z0-9_][A-Za-z0-9_.-]*"\s*,?\s*\)/.test(tail)
+		) {
+			continue;
+		} else {
+			const concatenated = /^concat!\(\s*((?:"[^"\\]*"\s*,\s*)*"[^"\\]*"\s*,?)\s*\)/.exec(tail);
+			if (concatenated)
+				bound([...concatenated[1].matchAll(/"([^"\\]*)"/g)].map((item) => item[1]).join(""), sourceInput);
+			else dynamic = true;
+		}
+	}
+	return dynamic;
+}
+
 async function assertNoPackageLinkDirectives(
 	pkg: MetadataPackage,
 	roots: readonly ToolRoot[],
 	sourceLinksOnly = false,
 	target = "",
 	unmodifiedTargetCfg = true,
+	includesOnly = false,
+	inactiveGit = false,
 ): Promise<void> {
 	const directory = await requiredReal(path.dirname(pkg.manifest_path));
 	const view = roots.find((root) => root.label.startsWith("packages/") && root.path === directory);
@@ -1224,7 +1243,14 @@ async function assertNoPackageLinkDirectives(
 		/(?:-apple-darwin|-unknown-linux-(?:gnu|musl))$/.test(target)
 			? REVIEWED_NONWINDOWS_LINK_SOURCES[pkg.name + "@" + pkg.version]
 			: undefined;
-	const files: [string, string][] = reviewed ? [["Cargo.toml", H(await fs.readFile(pkg.manifest_path))]] : [];
+	const inclusionReview =
+		pkg.source === "registry+https://github.com/rust-lang/crates.io-index"
+			? REVIEWED_INCLUSION_SOURCES[pkg.name + "@" + pkg.version]
+			: undefined;
+	const files: [string, string][] =
+		reviewed || inclusionReview ? [["Cargo.toml", H(await fs.readFile(pkg.manifest_path))]] : [];
+	let needsInclusionReview = false;
+	const includedSources = new Set<string>();
 	const pending = [{ directory, relative: "" }];
 	while (pending.length) {
 		const current = pending.pop()!;
@@ -1236,623 +1262,53 @@ async function assertNoPackageLinkDirectives(
 			if (entry.isDirectory()) pending.push({ directory: filename, relative });
 			else if (entry.isFile() && entry.name.endsWith(".rs")) {
 				const rust = await readText(filename);
-				if (reviewed) files.push([relative, H(Buffer.from(rust))]);
-				if (hasNativeSourceLinkage(rust, sourceLinksOnly, target) && !reviewed)
+				const inactiveTests =
+					pkg.source === "registry+https://github.com/rust-lang/crates.io-index" &&
+					H(Buffer.from(rust)) === REVIEWED_INACTIVE_TEST_SOURCES[pkg.name + "@" + pkg.version + "/" + relative];
+				const reviewedGit =
+					inactiveGit &&
+					pkg.source === "registry+https://github.com/rust-lang/crates.io-index" &&
+					H(Buffer.from(rust)) === REVIEWED_INACTIVE_GIT_SOURCES[pkg.name + "@" + pkg.version + "/" + relative];
+				needsInclusionReview =
+					assertRustSourceIncludes(
+						rust,
+						filename,
+						directory,
+						view.exclude || [],
+						pkg.targets.some((item) => item.kind.includes("custom-build")),
+						inactiveTests,
+						reviewedGit,
+						includedSources,
+					) || needsInclusionReview;
+				if (reviewed || inclusionReview) files.push([relative, H(Buffer.from(rust))]);
+				if (!includesOnly && hasNativeSourceLinkage(rust, sourceLinksOnly, target) && !reviewed)
 					fail("unresolved Rust-source native linkage in " + pkg.name);
 			}
 		}
+	}
+	for (const filename of includedSources) {
+		const source = await readText(filename);
+		if (assertRustSourceIncludes(source, filename, directory, view.exclude || [], false, false, false, includedSources))
+			fail("unreviewed dynamic included Rust source in " + pkg.name);
+		if (!includesOnly && hasNativeSourceLinkage(source, sourceLinksOnly, target))
+			fail("unresolved included Rust-source native linkage in " + pkg.name);
 	}
 	if (reviewed) {
 		files.sort((a, b) => utf8Compare(a[0], b[0]));
 		if (H(Buffer.from(JSON.stringify(files))) !== reviewed)
 			fail("unreviewed cfg-gated native linkage source in " + pkg.name);
 	}
+	if (needsInclusionReview) {
+		files.sort((a, b) => utf8Compare(a[0], b[0]));
+		if (!inclusionReview || H(Buffer.from(JSON.stringify(files))) !== inclusionReview)
+			fail("unreviewed dynamic Rust source inclusion in " + pkg.name);
+	}
 }
-type MetadataToken = { text: string; literal?: string };
-type MetadataFunction = { name: string; parameters: string[]; body: MetadataToken[] };
-function metadataScriptTokens(source: string): MetadataToken[] | null {
-	const tokens: MetadataToken[] = [];
-	const pattern = /"(?:[^"\\\r\n]|\\.)*"|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|::|->|==|!=|&&|\|\||=>|[{}()[\].,:;!&|=<>+?*-]/y;
-	let offset = 0;
-	while (offset < source.length) {
-		if (/\s/.test(source[offset])) {
-			offset++;
-			continue;
-		}
-		if (source.startsWith("//", offset)) {
-			const end = source.indexOf("\n", offset + 2);
-			offset = end < 0 ? source.length : end + 1;
-			continue;
-		}
-		if (source.startsWith("/*", offset)) {
-			let depth = 1;
-			offset += 2;
-			while (offset < source.length && depth) {
-				if (source.startsWith("/*", offset)) {
-					depth++;
-					offset += 2;
-				} else if (source.startsWith("*/", offset)) {
-					depth--;
-					offset += 2;
-				} else offset++;
-			}
-			if (depth) return null;
-			continue;
-		}
-		pattern.lastIndex = offset;
-		const match = pattern.exec(source);
-		if (!match) return null;
-		offset = pattern.lastIndex;
-		if (match[0].startsWith('"')) {
-			let literal: unknown;
-			try {
-				literal = parseJSON(Buffer.from(match[0], "utf8"));
-			} catch {
-				return null;
-			}
-			if (typeof literal !== "string" || /[\x00-\x1f\x7f]/.test(literal)) return null;
-			tokens.push({ text: JSON.stringify(literal), literal });
-		} else tokens.push({ text: match[0] });
-	}
-	return tokens;
-}
-function tokenPattern(tokens: readonly MetadataToken[], pattern: readonly string[]): Map<string, MetadataToken> | null {
-	if (tokens.length !== pattern.length) return null;
-	const captured = new Map<string, MetadataToken>();
-	for (let index = 0; index < pattern.length; index++) {
-		const expected = pattern[index],
-			actual = tokens[index];
-		if (!expected.startsWith("$")) {
-			if (actual.text !== expected) return null;
-			continue;
-		}
-		const previous = captured.get(expected);
-		if (previous && previous.text !== actual.text) return null;
-		captured.set(expected, actual);
-	}
-	return captured;
-}
-function tokenBlockEnd(tokens: readonly MetadataToken[], start: number): number {
-	let depth = 0;
-	for (let index = start; index < tokens.length; index++) {
-		if (tokens[index].text === "{") depth++;
-		else if (tokens[index].text === "}" && --depth === 0) return index;
-	}
-	return -1;
-}
-function targetConditionValue(
-	tokens: readonly MetadataToken[],
-	configuration: ReadonlyMap<string, string[]>,
-): boolean | undefined {
-	let position = 0;
-	let valid = true;
-	function primary(): boolean | undefined {
-		const current = tokens[position]?.text;
-		if (current === "true" || current === "false") {
-			position++;
-			return current === "true";
-		}
-		if (current === "(") {
-			position++;
-			const result = disjunction();
-			if (tokens[position++]?.text !== ")") valid = false;
-			return result;
-		}
-		const start = position;
-		if (tokens[position]?.text === "std" && tokens[position + 1]?.text === "::") position += 2;
-		const comparison = tokenPattern(tokens.slice(position, position + 15), [
-			"env",
-			"::",
-			"var",
-			"(",
-			"$name",
-			")",
-			".",
-			"as_deref",
-			"(",
-			")",
-			"==",
-			"Ok",
-			"(",
-			"$value",
-			")",
-		]);
-		const name = comparison?.get("$name")?.literal,
-			value = comparison?.get("$value")?.literal;
-		if (!name || value === undefined || !/^CARGO_CFG_TARGET_(?:OS|ENV|ARCH|VENDOR|ENDIAN|POINTER_WIDTH)$/.test(name)) {
-			position = start;
-			valid = false;
-			return undefined;
-		}
-		position += 15;
-		const values = configuration.get(name.slice("CARGO_CFG_".length).toLowerCase());
-		return values?.length === 1 ? values[0] === value : undefined;
-	}
-	function unary(): boolean | undefined {
-		if (tokens[position]?.text !== "!") return primary();
-		position++;
-		const result = unary();
-		return result === undefined ? undefined : !result;
-	}
-	function equality(): boolean | undefined {
-		let result = unary();
-		while (valid && ["==", "!="].includes(tokens[position]?.text)) {
-			const operator = tokens[position++].text,
-				right = unary();
-			result =
-				result === undefined || right === undefined
-					? undefined
-					: operator === "=="
-						? result === right
-						: result !== right;
-		}
-		return result;
-	}
-	function conjunction(): boolean | undefined {
-		let result = equality();
-		while (valid && tokens[position]?.text === "&&") {
-			position++;
-			const right = equality();
-			result = result === undefined || right === undefined ? undefined : result && right;
-		}
-		return result;
-	}
-	function disjunction(): boolean | undefined {
-		let result = conjunction();
-		while (valid && tokens[position]?.text === "||") {
-			position++;
-			const right = conjunction();
-			result = result === undefined || right === undefined ? undefined : result || right;
-		}
-		return result;
-	}
-	const result = disjunction();
-	return valid && position === tokens.length ? result : undefined;
-}
-async function metadataForwardingProvider(
-	context: AdapterContext,
-	pkg: MetadataPackage,
-	source: string,
-	packages: ReadonlyMap<string, MetadataPackage>,
-	rustc: string,
-	target: string,
-	discovery: ToolDiscovery[],
-): Promise<string | null> {
-	if (!pkg.attestationDependencies || Object.keys(context.effectiveEnv).some((name) => name.startsWith("DEP_")))
-		return null;
-	const original = metadataScriptTokens(source);
-	if (!original) return null;
-	const disabled = new Set<number>();
-	let targetConfiguration: Map<string, string[]> | undefined;
-	for (let index = 0; index < original.length; index++) {
-		if (original[index].text !== "if") continue;
-		let opening = index + 1;
-		while (opening < original.length && original[opening].text !== "{") opening++;
-		if (opening === original.length) return null;
-		const condition = original.slice(index + 1, opening);
-		if (!targetConfiguration) {
-			const actual = await context.probe([rustc, "--print", "cfg", "--target", target]);
-			discovery.push(actual.identity);
-			targetConfiguration = new Map();
-			for (const line of probeText(actual).split(/\r?\n/)) {
-				const field = /^([a-z_]+)="([^"]*)"$/.exec(line);
-				if (!field) continue;
-				const values = targetConfiguration.get(field[1]);
-				if (values) values.push(field[2]);
-				else targetConfiguration.set(field[1], [field[2]]);
-			}
-		}
-		if (targetConditionValue(condition, targetConfiguration) === false) {
-			const closing = tokenBlockEnd(original, opening);
-			if (closing < 0) return null;
-			for (let offset = opening + 1; offset < closing; offset++) disabled.add(offset);
-			index = closing;
-		}
-	}
-	const tokens = original.filter((_, index) => !disabled.has(index));
-	const functions: MetadataFunction[] = [];
-	let position = 0;
-	while (position < tokens.length) {
-		if (tokenPattern(tokens.slice(position, position + 5), ["use", "std", "::", "env", ";"])) {
-			position += 5;
-			continue;
-		}
-		if (tokens[position++].text !== "fn") return null;
-		const name = tokens[position++]?.text;
-		if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || tokens[position++]?.text !== "(") return null;
-		const parameters: string[] = [];
-		while (tokens[position]?.text !== ")") {
-			const argument = tokens[position++]?.text;
-			if (
-				!argument ||
-				!/^[A-Za-z_][A-Za-z0-9_]*$/.test(argument) ||
-				tokens[position++]?.text !== ":" ||
-				tokens[position++]?.text !== "&" ||
-				tokens[position++]?.text !== "str"
-			)
-				return null;
-			parameters.push(argument);
-			if (tokens[position]?.text === ",") position++;
-			else if (tokens[position]?.text !== ")") return null;
-		}
-		position++;
-		if (tokens[position]?.text !== "{") return null;
-		const end = tokenBlockEnd(tokens, position);
-		if (end < 0) return null;
-		functions.push({ name, parameters, body: tokens.slice(position + 1, end) });
-		position = end + 1;
-	}
-	if (functions.length !== 3 || new Set(functions.map((fn) => fn.name)).size !== 3) return null;
-	const main = functions.find((fn) => fn.name === "main" && !fn.parameters.length);
-	const collector = functions.find((fn) => fn.parameters.length === 1);
-	const forwarder = functions.find((fn) => fn.parameters.length === 3);
-	if (!main || !collector || !forwarder) return null;
-	const [selectedParameter, nameParameter, valueParameter] = forwarder.parameters;
-	const forwardedKey = forwarder.body[17]?.text,
-		diagnostic = forwarder.body[10];
-	if (!forwardedKey || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(forwardedKey) || diagnostic?.literal === undefined) return null;
-	const forwarding = [
-		"assert",
-		"!",
-		"(",
-		"!",
-		selectedParameter,
-		".",
-		"is_empty",
-		"(",
-		")",
-		",",
-		diagnostic.text,
-		")",
-		";",
-		"if",
-		"let",
-		"Some",
-		"(",
-		forwardedKey,
-		")",
-		"=",
-		nameParameter,
-		".",
-		"strip_prefix",
-		"(",
-		selectedParameter,
-		")",
-		"{",
-		"eprintln",
-		"!",
-		"(",
-		JSON.stringify("cargo:rerun-if-env-changed={" + nameParameter + "}"),
-		")",
-		";",
-		"let",
-		forwardedKey,
-		"=",
-		forwardedKey,
-		".",
-		"to_lowercase",
-		"(",
-		")",
-		";",
-		"println",
-		"!",
-		"(",
-		JSON.stringify("cargo:{" + forwardedKey + "}={" + valueParameter + "}"),
-		")",
-		";",
-		"}",
-	];
-	if (!tokenPattern(forwarder.body, forwarding)) return null;
-	const carrier = tokenPattern(collector.body, [
-		"let",
-		"$prefix",
-		"=",
-		"if",
-		collector.parameters[0],
-		"==",
-		"$dependency",
-		"{",
-		"$firstPrefix",
-		"}",
-		"else",
-		"{",
-		"$secondPrefix",
-		"}",
-		";",
-		"let",
-		"mut",
-		"$selected",
-		"=",
-		"String",
-		"::",
-		"default",
-		"(",
-		")",
-		";",
-		"let",
-		"mut",
-		"$candidates",
-		"=",
-		"vec",
-		"!",
-		"[",
-		"]",
-		";",
-		"for",
-		"(",
-		"$name",
-		",",
-		"$value",
-		")",
-		"in",
-		"std",
-		"::",
-		"env",
-		"::",
-		"vars",
-		"(",
-		")",
-		"{",
-		"if",
-		"!",
-		"$selected",
-		".",
-		"is_empty",
-		"(",
-		")",
-		"{",
-		forwarder.name,
-		"(",
-		"&",
-		"$selected",
-		",",
-		"&",
-		"$name",
-		",",
-		"&",
-		"$value",
-		")",
-		";",
-		"continue",
-		";",
-		"}",
-		"if",
-		"let",
-		"Some",
-		"(",
-		"$version",
-		")",
-		"=",
-		"$name",
-		".",
-		"strip_prefix",
-		"(",
-		"$prefix",
-		")",
-		"{",
-		"if",
-		"let",
-		"Some",
-		"(",
-		"$version",
-		")",
-		"=",
-		"$version",
-		".",
-		"strip_suffix",
-		"(",
-		JSON.stringify("_INCLUDE"),
-		")",
-		"{",
-		"$selected",
-		"=",
-		"format",
-		"!",
-		"(",
-		"$selectedFormat",
-		")",
-		";",
-		forwarder.name,
-		"(",
-		"&",
-		"$selected",
-		",",
-		"&",
-		"$name",
-		",",
-		"&",
-		"$value",
-		")",
-		";",
-		"}",
-		"else",
-		"{",
-		"$candidates",
-		".",
-		"push",
-		"(",
-		"(",
-		"$name",
-		",",
-		"$value",
-		")",
-		")",
-		";",
-		"}",
-		"}",
-		"}",
-		"assert",
-		"!",
-		"(",
-		"!",
-		"$selected",
-		".",
-		"is_empty",
-		"(",
-		")",
-		",",
-		"$missing",
-		")",
-		";",
-		"for",
-		"(",
-		"$name",
-		",",
-		"$value",
-		")",
-		"in",
-		"$candidates",
-		"{",
-		forwarder.name,
-		"(",
-		"&",
-		"$selected",
-		",",
-		"&",
-		"$name",
-		",",
-		"&",
-		"$value",
-		")",
-		";",
-		"}",
-	]);
-	if (!carrier) return null;
-	for (const name of ["$prefix", "$selected", "$candidates", "$name", "$value", "$version"])
-		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(carrier.get(name)!.text)) return null;
-	if (
-		carrier.get("$selectedFormat")?.literal !==
-			"{" + carrier.get("$prefix")!.text + "}{" + carrier.get("$version")!.text + "}_" ||
-		carrier.get("$missing")?.literal === undefined
-	)
-		return null;
-	const permittedCalls: Record<string, true> = {
-		cfg: true,
-		assert: true,
-		panic: true,
-		println: true,
-		eprintln: true,
-		var: true,
-		contains: true,
-		as_deref: true,
-		is_ok_and: true,
-		Some: true,
-		Ok: true,
-		unwrap: true,
-		if: true,
-		while: true,
-		match: true,
-	};
-	let dependencyName: string | undefined;
-	let dependencyVariable: string | undefined;
-	for (let index = 0; index < main.body.length; index++) {
-		const item = main.body[index];
-		if (
-			item.text === "fn" ||
-			item.text === "use" ||
-			["unsafe", "extern", "mod", "impl", "trait", "struct", "enum", "type", "static"].includes(item.text)
-		)
-			return null;
-		if (
-			item.text === "let" &&
-			main.body[index + 2]?.text === "=" &&
-			main.body[index + 3]?.text === "if" &&
-			main.body[index + 4]?.text === "cfg"
-		) {
-			const variable = main.body[index + 1].text;
-			let cursor = index + 3,
-				chosen: string | undefined;
-			while (true) {
-				const branch = tokenPattern(main.body.slice(cursor, cursor + 11), [
-					"if",
-					"cfg",
-					"!",
-					"(",
-					"feature",
-					"=",
-					"$feature",
-					")",
-					"{",
-					"$dependency",
-					"}",
-				]);
-				if (
-					!branch ||
-					branch.get("$feature")?.literal === undefined ||
-					branch.get("$dependency")?.literal === undefined
-				)
-					return null;
-				if (chosen === undefined && pkg.attestationFeatures?.includes(branch.get("$feature")!.literal!))
-					chosen = branch.get("$dependency")!.literal!;
-				cursor += 11;
-				if (main.body[cursor++]?.text !== "else") return null;
-				if (main.body[cursor]?.text === "if") continue;
-				if (main.body[cursor]?.text !== "{" || main.body[cursor + 1]?.text !== "panic") return null;
-				const closing = tokenBlockEnd(main.body, cursor);
-				if (closing < 0 || main.body[closing + 1]?.text !== ";") return null;
-				break;
-			}
-			const calls = main.body.filter(
-				(token, offset) =>
-					token.text === collector.name &&
-					main.body[offset + 1]?.text === "(" &&
-					main.body[offset + 2]?.text === variable &&
-					main.body[offset + 3]?.text === ")",
-			);
-			if (calls.length !== 1 || !chosen || dependencyName !== undefined) return null;
-			dependencyName = chosen;
-			dependencyVariable = variable;
-		}
-		if (
-			/^[A-Za-z_][A-Za-z0-9_]*$/.test(item.text) &&
-			(main.body[index + 1]?.text === "(" ||
-				(main.body[index + 1]?.text === "!" && ["(", "[", "{"].includes(main.body[index + 2]?.text)))
-		) {
-			if (!permittedCalls[item.text] && item.text !== collector.name) return null;
-			if (
-				item.text === collector.name &&
-				(!dependencyVariable ||
-					main.body[index + 1]?.text !== "(" ||
-					main.body[index + 2]?.text !== dependencyVariable ||
-					main.body[index + 3]?.text !== ")")
-			)
-				return null;
-			if (main.body[index - 1]?.text === "::" && !(item.text === "var" && main.body[index - 2]?.text === "env"))
-				return null;
-		}
-		if (item.text === "println") {
-			const output = main.body[index + 3]?.literal;
-			if (
-				!output ||
-				!/^cargo::?(?:rustc-check-cfg|rustc-cfg|rerun-if-env-changed|rerun-if-changed|warning)=/.test(output)
-			)
-				return null;
-		}
-		if (item.text === "var" && main.body[index + 1]?.text === "(") {
-			const name = main.body[index + 2]?.literal;
-			if (name === undefined || /[\x00-\x1f\x7f]/.test(context.effectiveEnv[name] || "")) return null;
-		}
-	}
-	if (!dependencyName) return null;
-	const providers = pkg.attestationDependencies
-		.map((id) => packages.get(id))
-		.filter((provider): provider is MetadataPackage => Boolean(provider?.links));
-	const chosen = providers.filter((provider) => provider.name === dependencyName);
-	if (chosen.length !== 1) return null;
-	const comparison = carrier.get("$dependency")?.literal;
-	const prefix =
-		dependencyName === comparison ? carrier.get("$firstPrefix")?.literal : carrier.get("$secondPrefix")?.literal;
-	if (!prefix || !/^DEP_[A-Z0-9_]+_$/.test(prefix)) return null;
-	const matching = providers.filter((provider) =>
-		("DEP_" + provider.links!.toUpperCase().replaceAll("-", "_") + "_").startsWith(prefix),
-	);
-	if (matching.length !== 1 || matching[0].id !== chosen[0].id) return null;
-	return chosen[0].id;
-}
+
 // Exact installed build programs, not package names, select the bounded native/compiler cases.
 const REVIEWED_BUILD_SCRIPTS: Record<
 	string,
-	{ kind: "native" | "compiler" | "framework"; hash: string; files?: Record<string, string> }
+	{ kind: "native" | "compiler" | "framework" | "metadata"; hash: string; files?: Record<string, string> }
 > = {
 	"blst@0.3.16": { kind: "native", hash: "sha256:3b0a6eea2bf5c4d0c327fbe48f81b900e6896bdf92d4cfafcc1010d999b0fea7" },
 	"blst@0.3.17": { kind: "native", hash: "sha256:3b0a6eea2bf5c4d0c327fbe48f81b900e6896bdf92d4cfafcc1010d999b0fea7" },
@@ -1914,12 +1370,142 @@ const REVIEWED_BUILD_SCRIPTS: Record<
 			"no_atomic.rs": "sha256:fc1baa4489d9842988bacaaa545a7d7d0e2f8b93cfa0b7d1ae31f21256e4cb0a",
 		},
 	},
+	"ahash@0.8.12": { kind: "compiler", hash: "sha256:d7dd5428c78b80bb3c99068561641ec661f0f94defbda17f85b443e358ab6396" },
+	"aws-lc-rs@1.18.0": {
+		kind: "metadata",
+		hash: "sha256:791f97e6abdb685bcc722342d49f2646b3146b209f68753669c178716f6cee01",
+	},
+	"commonware-macros-impl@2026.7.1": {
+		kind: "compiler",
+		hash: "sha256:3fcd6fc94492b0da173358d5c213bcfe1159060e333de0cb771a66857d0f6988",
+	},
+	"crossbeam-epoch@0.9.20": {
+		kind: "compiler",
+		hash: "sha256:e40cf96d7d7b1650f9f53a3f578633a178324dbea1d905b3f71a75b45d3982a1",
+	},
+	"curve25519-dalek@4.1.3": {
+		kind: "compiler",
+		hash: "sha256:c479ea95fa9cac8b3374564261c15cfcb110738ddcaa5e0852644b6083bd9189",
+	},
+	"curve25519-dalek@5.0.0": {
+		kind: "compiler",
+		hash: "sha256:f13e2e0acd42c676532e115850473120531beec43439b335e1753a2f026f3713",
+	},
+	"generic-array@0.14.7": {
+		kind: "compiler",
+		hash: "sha256:08fa30c4a2c1ad24fe5f987e721dfb20131f45ea5b5dc3e836dcf88a8e33248c",
+	},
+	"getrandom@0.4.3": {
+		kind: "compiler",
+		hash: "sha256:662faa06d7b2a9c5bea2c17a127a90e00b9f9b31105b0360da516e47cf816e95",
+	},
+	"num-traits@0.2.19": {
+		kind: "compiler",
+		hash: "sha256:d3969209fc1c9d201c66ed11820d0b328600d75b3971f8ceebeab04900bc0587",
+	},
+	"owo-colors@4.3.0": {
+		kind: "compiler",
+		hash: "sha256:afffaf4540849a8daf1e5a2efbb7eba25ede31c77060ca4f14dc43f8b7aadbeb",
+	},
+	"parking_lot_core@0.9.12": {
+		kind: "compiler",
+		hash: "sha256:3698c936b75f8332d9b6b30a8a6838ea116c1ff0a819a025c9ea9696e4d8ce72",
+	},
+	"paste@1.0.15": { kind: "compiler", hash: "sha256:dba46ae4291317fb644ba2143f44eaf54a8ab946ba1367a33d055d694715f68a" },
+	"quote@1.0.45": { kind: "compiler", hash: "sha256:cd6808c02e476b09a520105e2c6f6d325cccb1ecd542cbbcc836a0ae6f6fb0f1" },
+	"rayon-core@1.13.0": {
+		kind: "compiler",
+		hash: "sha256:fa31cb198b772600d100a7c403ddedccef637d2e6b2da431fa7f02ca41307fc6",
+	},
+	"ref-cast@1.0.25": {
+		kind: "compiler",
+		hash: "sha256:743b6af556ae46ab03ab547850bed4e96d66270b9ad29183dac0a005a801e76e",
+	},
+	"schemars@0.8.22": {
+		kind: "compiler",
+		hash: "sha256:5ef3c87640a839e95aa892c4dbc9557d8b6437caa697b53a598954cf471e2303",
+	},
+	"serde@1.0.228": {
+		kind: "compiler",
+		hash: "sha256:c99c25e1a11f3e51b61dd8c25bdbfbd090e43e5f1f2014f41f28e214dd8310d5",
+	},
+	"serde_core@1.0.228": {
+		kind: "compiler",
+		hash: "sha256:a5fdacb9913eeede5fc08f39acbd31b2508483fdc20c79d6bc274d74407a1816",
+	},
+	"serde_json@1.0.150": {
+		kind: "compiler",
+		hash: "sha256:a681e754be844c7dbef957f5d2d00b01f37c5dca160ef1055a8d8f975697a881",
+	},
+	"typeid@1.0.3": { kind: "compiler", hash: "sha256:688afbcaa398ea159c3481b26d74fde6ce3a675d48364d772557c8e91100de46" },
+	"zerocopy@0.8.52": {
+		kind: "compiler",
+		hash: "sha256:916639a8cc523f6b7551c946706f551b24352cd50c84a2284ca313798bc77ee5",
+	},
+	"zmij@1.0.21": { kind: "compiler", hash: "sha256:13201b550236a9ff2186b5303c77341d3b0874989fdaf39613a7452e4ce57817" },
 };
+const REVIEWED_BUILD_HELPERS: Record<string, string> = {
+	"autocfg@1.5.1": "sha256:aa7e410fca7287d61d0824601c0d3e45b9842589ff2819a74ea39d2522e6e87b",
+	"cc@1.2.64": "sha256:a936b5254b323fa504bd79446fd272e14094c3bff144d3697a97bd756d0ffc39",
+	"cmake@0.1.58": "sha256:1a8c1153c631ffd5a0ca9ebbf73d1a6dcda592e978824b85cbbde94eacea2864",
+	"dunce@1.0.5": "sha256:2690b64863794377deb65d6af0293c6a6a1ead5f7b92d0d315f18057e532503c",
+	"find-msvc-tools@0.1.9": "sha256:ef2beb3ec38bff67c6b8ef8a70d6a28818e73f7a4cc3abd0df7b008f03f7c874",
+	"fs_extra@1.3.0": "sha256:75c631a4108c96632b600adbce5a610874ddad9ef61611bec2f77f134eb7d705",
+	"jobserver@0.1.34": "sha256:059bd857a7d7234832e7e498693765a9cdd3cf3f1c296701452b6fbd0fc23d5f",
+	"libc@0.2.186": "sha256:53979fbb809cab984c26d7b22e28b06dd76c1902c0943b7a156073047f85bed7",
+	"pkg-config@0.3.34": "sha256:47068b241becabad5d8380787bf2ac205f520139c33a9930c7e20b64049942b7",
+	"rustc_version@0.4.1": "sha256:70ca6d542316238ecc59e1719a7d8c561317e4e8527f4150a4fb5fc53af183c5",
+	"semver@1.0.28": "sha256:995768eb9622177f303318ad015425bcc8501cc29c1baf76ff53af2572d2ec25",
+	"shlex@2.0.1": "sha256:a891d7e74817dd33c7ef81b05e76351374702bf54458e27aaa219ba574e1c53e",
+	"version_check@0.9.5": "sha256:0c117a46e907111ce7b768e87344be06ab64f74a3d89f94864c78db8ecf718e1",
+};
+async function packageRustFingerprint(pkg: MetadataPackage): Promise<string> {
+	const directory = path.dirname(pkg.manifest_path);
+	const files: [string, string][] = [["Cargo.toml", H(await fs.readFile(pkg.manifest_path))]];
+	async function collect(parent: string, relative = ""): Promise<void> {
+		for (const entry of await fs.readdir(parent, { withFileTypes: true })) {
+			if (entry.name === ".git" || entry.name === "target") continue;
+			const name = relative ? relative + "/" + entry.name : entry.name;
+			const filename = path.join(parent, entry.name);
+			if (entry.isSymbolicLink()) fail("aliased reviewed Rust source in " + pkg.name);
+			if (entry.isDirectory()) await collect(filename, name);
+			else if (entry.isFile() && entry.name.endsWith(".rs")) files.push([name, H(await fs.readFile(filename))]);
+		}
+	}
+	await collect(directory);
+	files.sort((a, b) => utf8Compare(a[0], b[0]));
+	return H(Buffer.from(JSON.stringify(files)));
+}
+
+async function assertReviewedBuildHelpers(
+	pkg: MetadataPackage,
+	packages: ReadonlyMap<string, MetadataPackage>,
+	checked: Set<string>,
+): Promise<void> {
+	for (const id of pkg.attestationBuildDependencies || []) await visit(id);
+	async function visit(id: string): Promise<void> {
+		if (checked.has(id)) return;
+		const helper = packages.get(id);
+		if (
+			!helper ||
+			helper.source !== "registry+https://github.com/rust-lang/crates.io-index" ||
+			(await packageRustFingerprint(helper)) !== REVIEWED_BUILD_HELPERS[helper.name + "@" + helper.version]
+		)
+			fail("unreviewed build-script dependency " + (helper?.name || id));
+		checked.add(id);
+		for (const dependency of [
+			...(helper.attestationDependencies || []),
+			...(helper.attestationBuildDependencies || []),
+		])
+			await visit(dependency);
+	}
+}
+
 async function reviewedBuildScript(
 	pkg: MetadataPackage,
 	source: string,
 	target: string,
-): Promise<"native" | "compiler" | "framework" | undefined> {
+): Promise<"native" | "compiler" | "framework" | "metadata" | undefined> {
 	if (
 		pkg.source !== "registry+https://github.com/rust-lang/crates.io-index" ||
 		!/(?:-apple-darwin|-unknown-linux-(?:gnu|musl))$/.test(target)
@@ -2036,6 +1622,99 @@ async function assertBoundNativeFlags(
 			fail("unclassified native flag input: " + argument);
 	}
 }
+function assertReviewedRustFlags(value: Value | undefined, name: string, target: string): void {
+	const arguments_ =
+		typeof value === "string"
+			? value.split(/\s+/).filter(Boolean)
+			: Array.isArray(value) && value.every((item) => typeof item === "string")
+				? (value as string[])
+				: value === undefined
+					? []
+					: fail(`unsupported ${name} value`);
+	for (let index = 0; index < arguments_.length; index++) {
+		const argument = arguments_[index];
+		if (argument === "--sysroot" || argument.startsWith("--sysroot="))
+			fail(`${name} --sysroot requires an unsupported selected-sysroot closure`);
+		const codegen =
+			argument === "-C" || argument === "--codegen"
+				? arguments_[++index]
+				: argument.startsWith("-C")
+					? argument.slice(2)
+					: argument.startsWith("--codegen=")
+						? argument.slice(10)
+						: undefined;
+		if (name === "rustflags" && target === "wasm32-unknown-unknown" && codegen === "link-arg=--allow-undefined")
+			continue;
+		fail(`unsupported ${name} token ${argument}; only reviewed wasm --allow-undefined codegen is admitted`);
+	}
+}
+
+function assertReviewedCargoConfiguration(
+	context: AdapterContext,
+	config: Configuration,
+	target: string,
+	host: string,
+): void {
+	const build = table(config.values.build);
+	const buildKeys = [
+		"target",
+		"target-dir",
+		"build-dir",
+		"rustc",
+		"rustc-wrapper",
+		"rustc-workspace-wrapper",
+		"rustflags",
+		"rustdocflags",
+		"jobs",
+		"incremental",
+	];
+	for (const key of Object.keys(build))
+		if (!buildKeys.includes(key)) fail("unsupported Cargo build configuration " + key);
+	assertReviewedRustFlags(build.rustflags, "rustflags", target);
+	assertReviewedRustFlags(build.rustdocflags, "rustdocflags", target);
+	for (const [triple, value] of Object.entries(table(config.values.target))) {
+		if (!/^[A-Za-z0-9._-]+$/.test(triple)) fail("unsupported Cargo target selection key " + triple);
+		const selected = table(value);
+		for (const key of Object.keys(selected))
+			if (!["linker", "runner", "rustflags", "rustdocflags"].includes(key))
+				fail(`unsupported Cargo target configuration ${triple}.${key}`);
+		if (selected.runner !== undefined) fail("Cargo target runner is unsupported");
+		if (triple === host && selected.linker !== undefined) fail("Cargo host linker is unsupported");
+		assertReviewedRustFlags(selected.rustflags, "rustflags", triple);
+		assertReviewedRustFlags(selected.rustdocflags, "rustdocflags", triple);
+	}
+	for (const [name, value] of Object.entries(context.effectiveEnv)) {
+		if (name === "RUSTDOC") fail("configured rustdoc requires an unsupported selected-tool closure");
+		if (name.startsWith("CARGO_PROFILE_"))
+			fail("Cargo profile environment requires an explicit reviewed configuration: " + name);
+		if (name.startsWith("CARGO_UNSTABLE_")) fail("unstable Cargo environment is unsupported: " + name);
+		if (name.startsWith("CARGO_BUILD_") && !buildKeys.includes(name.slice(12).toLowerCase().replaceAll("_", "-")))
+			fail("unsupported Cargo build environment " + name);
+		const targetKey = /^CARGO_TARGET_(.+)_(LINKER|RUNNER|RUSTFLAGS|RUSTDOCFLAGS)$/.exec(name);
+		if (name.startsWith("CARGO_TARGET_") && name !== "CARGO_TARGET_DIR" && !targetKey)
+			fail("unsupported Cargo target environment " + name);
+		if (targetKey?.[2] === "RUNNER") fail("Cargo target runner is unsupported: " + name);
+		if (targetKey?.[2] === "LINKER" && targetKey[1] === host.toUpperCase().replaceAll("-", "_"))
+			fail("Cargo host linker is unsupported: " + name);
+		if (name === "CARGO_ENCODED_RUSTFLAGS" || name === "CARGO_ENCODED_RUSTDOCFLAGS")
+			assertReviewedRustFlags(
+				value ? value.split("\x1f") : [],
+				name.includes("RUSTDOCFLAGS") ? "rustdocflags" : "rustflags",
+				target,
+			);
+		else if (
+			["RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_RUSTDOCFLAGS"].includes(name) ||
+			targetKey?.[2] === "RUSTFLAGS" ||
+			targetKey?.[2] === "RUSTDOCFLAGS"
+		)
+			assertReviewedRustFlags(
+				value,
+				name.includes("RUSTDOCFLAGS") ? "rustdocflags" : "rustflags",
+				targetKey ? targetKey[1].toLowerCase().replaceAll("_", "-") : target,
+			);
+	}
+}
+
 async function nativeDependencies(
 	context: AdapterContext,
 	config: Configuration,
@@ -2080,44 +1759,6 @@ async function nativeDependencies(
 		await assertBoundNativeFlags(value.split(/\s+/).filter(Boolean), roots, nativeDirectories);
 	}
 	const flags: string[] = [];
-	const encoded = context.effectiveEnv.CARGO_ENCODED_RUSTFLAGS;
-	const rustflags: Value | undefined =
-		encoded !== undefined
-			? encoded.split("\x1f")
-			: context.effectiveEnv.RUSTFLAGS !== undefined
-				? context.effectiveEnv.RUSTFLAGS.split(/\s+/).filter(Boolean)
-				: context.effectiveEnv[`CARGO_TARGET_${targetKey}_RUSTFLAGS`] !== undefined
-					? context.effectiveEnv[`CARGO_TARGET_${targetKey}_RUSTFLAGS`].split(/\s+/).filter(Boolean)
-					: (targetConfig.rustflags ?? build.rustflags);
-	const rustArguments =
-		typeof rustflags === "string"
-			? rustflags.split(/\s+/).filter(Boolean)
-			: Array.isArray(rustflags) && rustflags.every((x) => typeof x === "string")
-				? (rustflags as string[])
-				: rustflags === undefined
-					? []
-					: fail("unsupported rustflags value");
-	for (let index = 0; index < rustArguments.length; index++) {
-		const argument = rustArguments[index];
-		if (argument === "--sysroot" || argument.startsWith("--sysroot="))
-			fail("rustflags --sysroot requires an unsupported selected-sysroot closure");
-		const codegen =
-			argument === "-C" ? rustArguments[++index] : argument.startsWith("-C") ? argument.slice(2) : undefined;
-		if (codegen?.startsWith("linker=")) drivers.linker = codegen.slice(7);
-		else if (codegen?.startsWith("link-arg=")) flags.push(codegen.slice(9));
-		else if (codegen?.startsWith("link-args=")) flags.push(...codegen.slice(10).split(/\s+/));
-		if (
-			argument === "-L" ||
-			argument.startsWith("-L") ||
-			argument === "-l" ||
-			argument.startsWith("-l") ||
-			argument.startsWith("@") ||
-			codegen?.startsWith("llvm-args=")
-		)
-			fail("external rustflags linkage needs an incorporated native source closure");
-	}
-	await assertBoundNativeFlags(flags, roots, [context.cwd]);
-	const rustFlagCount = flags.length;
 	for (const [key, environment, role] of [
 		["rustc-wrapper", "RUSTC_WRAPPER", "rust-wrapper"],
 		["rustc-workspace-wrapper", "RUSTC_WORKSPACE_WRAPPER", "workspace-wrapper"],
@@ -2136,20 +1777,19 @@ async function nativeDependencies(
 	let native = false;
 	const additionalDiscovery: ToolDiscovery[] = [];
 	const absenceExecutables: string[] = [];
-	let hostConfiguration: Set<string> | undefined;
 	const packagesById = new Map(graph.map((pkg) => [pkg.id, pkg]));
 	const nativeProviders = new Set<string>();
 	const forwardedProviders = new Map<string, string>();
+	const checkedHelpers = new Set<string>();
 	for (const pkg of graph) {
 		const buildTargets = pkg.targets.filter((item) => item.kind.includes("custom-build"));
-		if (!buildTargets.length)
-			await assertNoPackageLinkDirectives(
-				pkg,
-				roots,
-				true,
-				target,
-				!rustArguments.some((argument) => argument === "--cfg" || argument.startsWith("--cfg=")),
-			);
+		let inactiveGit = false;
+		if (pkg.name === "serde_derive_internals" && !buildTargets.length) {
+			const cfg = await context.probe([rustc, "--print", "cfg", "--target", pkg.attestationHost ? host : target]);
+			additionalDiscovery.push(cfg.identity);
+			inactiveGit = !probeText(cfg).split(/\r?\n/).includes("serde_build_from_git");
+		}
+		await assertNoPackageLinkDirectives(pkg, roots, true, target, true, buildTargets.length > 0, inactiveGit);
 		for (const item of buildTargets) {
 			const source = await readText(item.src_path);
 			const reviewed = await reviewedBuildScript(pkg, source, target);
@@ -2158,6 +1798,8 @@ async function nativeDependencies(
 			const usesCC = pkg.dependencies.some((dep) => dep.kind === "build" && dep.name === "cc");
 			if (usesCC && target !== host && pkg.attestationHost)
 				fail("cross-target host build/proc-macro native compilation requires a distinct host context in " + pkg.name);
+			if (!reviewed && !usesCC) fail("unreviewed build-script process/input closure in " + pkg.name);
+			if (reviewed) await assertReviewedBuildHelpers(pkg, packagesById, checkedHelpers);
 			if (usesCC) {
 				if (reviewed !== "native") fail(`unresolved native build-script compiler selection in ${pkg.name}`);
 				if (pkg.name === "blst" && !(await exists(path.join(path.dirname(pkg.manifest_path), "blst"))))
@@ -2191,135 +1833,20 @@ async function nativeDependencies(
 			} else if (reviewed === "framework") {
 				await assertNoPackageLinkDirectives(pkg, roots, true, target);
 				continue;
-			} else if (pkg.links) {
-				if (!rebuildOnlyScript(source)) {
-					const provider = await metadataForwardingProvider(
-						context,
-						pkg,
-						source,
-						packagesById,
-						rustc,
-						target,
-						additionalDiscovery,
-					);
-					if (!provider) fail(`unresolved native linkage in ${pkg.name}`);
-					forwardedProviders.set(pkg.id, provider);
-				}
-				await assertNoPackageLinkDirectives(pkg, roots);
+			} else if (reviewed === "metadata") {
+				const features = pkg.attestationFeatures || [];
+				const name = features.includes("fips")
+					? "aws-lc-fips-sys"
+					: features.includes("aws-lc-sys")
+						? "aws-lc-sys"
+						: undefined;
+				const providers = (pkg.attestationDependencies || [])
+					.map((id) => packagesById.get(id))
+					.filter((provider): provider is MetadataPackage => provider?.name === name && Boolean(provider.links));
+				if (!name || providers.length !== 1) fail(`unresolved native linkage in ${pkg.name}`);
+				forwardedProviders.set(pkg.id, providers[0].id);
+				await assertNoPackageLinkDirectives(pkg, roots, true, target);
 			}
-			let processCode = rustSourceCode(source);
-			if (processCode === null) fail("unclassified build-script syntax in " + pkg.name);
-			const classifiedProcesses: { start: number; end: number }[] = [];
-			for (const match of source.matchAll(
-				/\b(?:(?:std\s*::\s*)?process\s*::\s*)?Command\s*::\s*new\s*\(\s*"([^"\\]+)"\s*\)/g,
-			)) {
-				const suffix = source.slice(match.index! + match[0].length);
-				if (match[1] === "rustc") {
-					const literal = await context.resolveCommand("rustc", path.dirname(pkg.manifest_path));
-					if (literal.realpath !== rustc) fail("literal rustc differs from Cargo's selected RUSTC in " + pkg.name);
-					if (!/^\s*\.\s*arg\s*\(\s*"--version"\s*\)\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/.test(suffix))
-						fail("unsupported literal rustc build-script query in " + pkg.name);
-					const version = await context.probe([rustc, "--version"]);
-					additionalDiscovery.push(version.identity);
-					if (version.code !== 0) fail("selected Cargo RUSTC version query failed");
-				} else {
-					if (!OPTIONAL_PROCESS_OUTPUT.test(suffix))
-						fail("unresolved build-script process " + match[1] + " in " + pkg.name);
-					await bindOptionalProcessAbsence(
-						context,
-						source,
-						match[1],
-						path.dirname(pkg.manifest_path),
-						rustc,
-						absenceExecutables,
-						additionalDiscovery,
-					);
-				}
-				classifiedProcesses.push({
-					start: match.index!,
-					end: match.index! + match[0].length + OPTIONAL_PROCESS_OUTPUT.exec(suffix)![0].length,
-				});
-			}
-			for (const match of source.matchAll(
-				/\b(?:(?:std\s*::\s*)?process\s*::\s*)?Command\s*::\s*new\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)/g,
-			)) {
-				if (!OPTIONAL_PROCESS_OUTPUT.test(source.slice(match.index! + match[0].length)))
-					fail("unresolved build-script process selector " + match[1] + " in " + pkg.name);
-				classifiedProcesses.push({
-					start: match.index!,
-					end:
-						match.index! +
-						match[0].length +
-						OPTIONAL_PROCESS_OUTPUT.exec(source.slice(match.index! + match[0].length))![0].length,
-				});
-				const selector = match[1];
-				if (cargoRustcSelector(source, selector, match.index!)) {
-					if (
-						!/^\s*\.\s*arg\s*\(\s*"--version"\s*\)\s*\.\s*output\s*\(\s*\)\s*\.\s*ok\s*\(\s*\)\s*\?/.test(
-							source.slice(match.index! + match[0].length),
-						)
-					)
-						fail("unsupported Cargo RUSTC build-script query in " + pkg.name);
-					const compilerVersion = await context.probe([rustc, "--version"]);
-					if (compilerVersion.code !== 0) fail("selected Cargo RUSTC version query failed");
-					additionalDiscovery.push(compilerVersion.identity);
-					continue;
-				}
-				const bindings = [
-					...source.matchAll(
-						new RegExp(
-							"\\blet\\s+" +
-								selector +
-								'\\s*=\\s*if\\s+cfg!\\(\\s*(target_[a-z_]+)\\s*=\\s*"([A-Za-z0-9_-]+)"\\s*\\)\\s*\\{\\s*"([A-Za-z0-9_.+-]+)"\\s*\\}\\s*else\\s*\\{\\s*"([A-Za-z0-9_.+-]+)"\\s*\\}\\s*;',
-							"g",
-						),
-					),
-				];
-				const assignments = [...source.matchAll(new RegExp("\\b" + selector + "\\s*=(?!=|>)", "g"))];
-				if (bindings.length !== 1 || assignments.length !== 1)
-					fail("unresolved optional build-script process selector " + selector + " in " + pkg.name);
-				const binding = bindings[0];
-				if (
-					![
-						"target_os",
-						"target_arch",
-						"target_env",
-						"target_vendor",
-						"target_family",
-						"target_pointer_width",
-						"target_endian",
-					].includes(binding[1])
-				)
-					fail("unsupported optional process cfg selector " + binding[1]);
-				if (hostConfiguration === undefined) {
-					const configuration = await context.probe([rustc, "--print", "cfg", "--target", host]);
-					additionalDiscovery.push(configuration.identity);
-					hostConfiguration = new Set(probeText(configuration).split(/\r?\n/));
-				}
-				const command = hostConfiguration.has(binding[1] + '="' + binding[2] + '"') ? binding[3] : binding[4];
-				await bindOptionalProcessAbsence(
-					context,
-					source,
-					command,
-					path.dirname(pkg.manifest_path),
-					rustc,
-					absenceExecutables,
-					additionalDiscovery,
-				);
-			}
-			for (const span of classifiedProcesses)
-				processCode =
-					processCode.slice(0, span.start) + " ".repeat(span.end - span.start) + processCode.slice(span.end);
-			processCode = processCode.replace(/\buse\s+std\s*::\s*process\s*::\s*Command\s*;/g, "");
-			if (
-				/\b(?:Command|ProcessBuilder|process|subprocess)\b|\b(?:struct|enum|type|trait)\s+env\b|\.\s*(?:spawn|status|output|exec)\s*\(|\bmod\s+[A-Za-z_][A-Za-z0-9_]*\s*;|\binclude\s*!/.test(
-					processCode,
-				) ||
-				(classifiedProcesses.length > 0 && /\b(?:mod|macro_rules|macro)\b/.test(processCode))
-			)
-				fail("unclassified build-script process/command form in " + pkg.name);
-			if (/\b(?:pkg_config|cmake|bindgen|vcpkg)::/.test(source))
-				fail(`unresolved native generator/configuration in ${pkg.name}`);
 		}
 	}
 	const visiting = new Set<string>();
@@ -2376,7 +1903,7 @@ async function nativeDependencies(
 		)
 			drivers["compiler-wrapper"] = fallback;
 	}
-	await assertBoundNativeFlags(flags.slice(rustFlagCount), roots, nativeDirectories);
+	await assertBoundNativeFlags(flags, roots, nativeDirectories);
 	const result = await context.native(
 		absenceExecutables.length ? [...executables, ...absenceExecutables] : executables,
 		{ target, host, drivers, flags, sdk: context.effectiveEnv.SDKROOT },
@@ -2643,6 +2170,7 @@ export async function discoverRustAdapter(context: AdapterContext): Promise<Adap
 	if (selectedTarget !== undefined && (typeof selectedTarget !== "string" || !/^[A-Za-z0-9._-]+$/.test(selectedTarget)))
 		fail("unsupported Cargo target selection");
 	const targetValue = typeof selectedTarget === "string" ? selectedTarget : runtime.host;
+	assertReviewedCargoConfiguration(context, config, targetValue, runtime.host);
 	if (kani && selected.solver && selected.solver !== "kissat")
 		fail(`solver ${selected.solver} is not the installed pinned Kani solver selection`);
 	if (selected.runtimeOnly) {

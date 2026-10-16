@@ -13,6 +13,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import fv_project
 from fv_evidence_v4_schema import (
@@ -303,13 +304,87 @@ def _tool(value, declaration=None, environment=None):
             "tool system provenance contradicts producer platform",
         )
     if declaration is not None:
+        derived_tree = (
+            declaration["kind"] in ("executable", "file")
+            and declaration["locator"]["mode"] != "adapter"
+            and value["kind"] == "tree"
+        )
         _check(
-            all(
-                value[key] == declaration[key]
-                for key in ("id", "kind", "locator", "requires")
-            ),
+            all(value[key] == declaration[key] for key in ("id", "locator", "requires"))
+            and (value["kind"] == declaration["kind"] or derived_tree),
             "tool declaration binding mismatch",
         )
+        if derived_tree:
+            library_prefix = "native/non-system-libraries/"
+            libraries = [
+                entry
+                for entry in value["files"]
+                if entry["path"].startswith(library_prefix)
+            ]
+            driver_paths = {"native/drivers/cargo-0", "native/drivers/rustc-0"}
+            drivers = [by_path[name] for name in driver_paths if name in by_path]
+            directories = {"native", "native/non-system-libraries", "native/drivers"}
+            _check(
+                value["system_dependencies"]["os"] == "darwin"
+                and (libraries or drivers)
+                and by_path.get("selected-file", {}).get("kind") == "file"
+                and all(
+                    (entry["path"] == "selected-file" and entry["kind"] == "file")
+                    or (entry["path"] in directories and entry["kind"] == "directory")
+                    or (entry["path"] in driver_paths and entry["kind"] == "file")
+                    or (
+                        entry["path"].startswith(library_prefix)
+                        and entry["kind"] == "file"
+                    )
+                    for entry in value["files"]
+                ),
+                "invalid derived native tool roots",
+            )
+            if declaration["kind"] == "executable":
+                _check(
+                    _file_has_bytes(by_path["selected-file"], executable=True),
+                    "empty derived executable tool identity",
+                )
+            if drivers:
+                driver_names = {
+                    entry["path"].rsplit("/", 1)[-1][:-2] for entry in drivers
+                }
+                _check(
+                    declaration["locator"]["mode"] in ("command", "path")
+                    and Path(declaration["locator"]["value"]).name in driver_names,
+                    "derived Rustup driver differs from locator",
+                )
+            for entry in drivers:
+                _check(
+                    _file_has_bytes(entry, executable=True),
+                    "empty derived Rustup driver identity",
+                )
+                name = entry["path"].rsplit("/", 1)[-1][:-2]
+                _check(
+                    any(
+                        len(probe["command"]) == 3
+                        and Path(probe["command"][0]).name == "rustup"
+                        and probe["command"][1:] == ["which", name]
+                        and probe["exit_code"] == 0
+                        for probe in value["discovery"]
+                    ),
+                    "derived Rustup driver has no selection probe",
+                )
+            for entry in libraries:
+                encoded = entry["path"][len(library_prefix) :]
+                try:
+                    decoded = unquote(encoded, errors="strict")
+                except UnicodeError as error:
+                    raise V4Error("invalid derived native library root") from error
+                _check(
+                    "/" not in encoded
+                    and decoded
+                    and "\0" not in decoded
+                    and quote(decoded, safe="-_.!~*'()") == encoded
+                    and entry["kind"] == "file"
+                    and _file_has_bytes(entry),
+                    "invalid derived native library root",
+                )
         version = value["version"]
         if declaration["version_command"] is None:
             _check(version is None, "undeclared version probe")
@@ -1955,6 +2030,7 @@ def _read_entry(root, records_path):
     candidate = Path(records_path)
     if not candidate.is_absolute():
         candidate = root / candidate
+    candidate = Path(os.path.normpath(candidate))
     _check(candidate.is_relative_to(root), "records path outside project root")
     relative = candidate.relative_to(root).as_posix()
     if candidate.is_dir():
@@ -2306,10 +2382,10 @@ def _report(root, records_path, recompute):
         "verdict": "ERROR",
         "trust_assumptions": None,
         "counts": {
-            "logical_associations": 0,
-            "unique_physical_executions": 0,
-            "actual_dispatches": 0,
-            "cache_hits": 0,
+            "logical_associations": None,
+            "unique_physical_executions": None,
+            "actual_dispatches": None,
+            "cache_hits": None,
             "missing_associations": 0,
             "failed_associations": 0,
             "error_associations": 0,

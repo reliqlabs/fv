@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,9 @@ function kernel(records, failed = {}, restricted = {}) {
   return {
     ptr: value => value,
     currentErrno: () => errno,
+    forcedWaiter: false,
+    getenv: () => null,
+    sigaction(_signal, _action, output) { output.fill(0); return 0; },
     proc_pidinfo(pid, _flavor, _argument, output) {
       if (Object.hasOwn(failed, pid)) { errno = failed[pid]; return 0; }
       const value = records[pid];
@@ -64,6 +68,7 @@ function kernel(records, failed = {}, restricted = {}) {
       if (!value || value.error) { errno = value?.error ?? constants.errno.EPERM; return -1; }
       const count = (reads.get(pid) ?? 0) + 1;
       reads.set(pid, count);
+      if (value.zeroAt === count) { length.writeBigUInt64LE(0n); return 0; }
       output.fill(0);
       output.writeInt32LE(pid, 40);
       output.writeInt32LE(value.reparented && count > 1 ? 1 : value.parent_pid, 560);
@@ -89,7 +94,7 @@ async function finish(session, value) {
 """
 
 
-def native(program: str, request=None) -> dict:
+def native(program: str, request=None, *, before_import="", environment=None) -> dict:
     with tempfile.TemporaryDirectory(prefix="r38-native-review-") as directory:
         module = Path(directory) / "native.ts"
         module.write_text(
@@ -99,7 +104,8 @@ def native(program: str, request=None) -> dict:
             + SEAMS
         )
         command = (
-            "const native = await import("
+            before_import
+            + "const native = await import("
             + json.dumps(module.as_uri())
             + ");\n"
             + PRELUDE
@@ -111,6 +117,7 @@ def native(program: str, request=None) -> dict:
             capture_output=True,
             text=True,
             timeout=60,
+            env=environment,
         )
         if result.returncode:
             raise AssertionError(result.stdout + result.stderr)
@@ -227,6 +234,84 @@ try {
                 result,
             )
 
+    def test_released_hosted_pid_reuse_is_ignored_or_admitted_by_new_birth(self):
+        for mode in ("foreign", "descendant"):
+            with (
+                self.subTest(mode=mode),
+                tempfile.TemporaryDirectory(prefix="r38-released-pid-") as directory,
+            ):
+                root = Path(directory).resolve()
+                collector = root / "collector.py"
+                collector.write_text(
+                    COLLECTOR.replace(
+                        "    sys.exit(code)",
+                        "    import time\n    time.sleep(0.4)\n    sys.exit(code)",
+                    )
+                )
+                result = native(
+                    r"""
+const realIdentity = native.readProcessIdentity, realTable = native.review.processTable;
+const session = await native.createNativeSession({cwd: input.cwd, runId: randomUUID()});
+const realSpawn = Bun.spawn;
+let direct, hosted, registered = false, retired = false, censused = false;
+Bun.spawn = options => { direct = realSpawn(options); return direct; };
+const reused = () => ({
+  ...hosted, parent_pid: direct.pid,
+  process_group: input.mode === 'descendant' ? direct.pid : hosted.pid + 100000,
+  session_id: input.mode === 'descendant' ? direct.pid : hosted.pid + 100000,
+  process_start_id: 'reused-after-release',
+});
+native.review.setIdentity(async pid => {
+  if (hosted?.pid === pid && retired)
+    return direct.exitCode === null && direct.signalCode === null ? reused() : null;
+  const current = await realIdentity(pid);
+  if (current && current.pid !== direct?.pid && current.parent_pid === direct?.pid) hosted ??= current;
+  if (hosted && session.owner.children.some(value => value.pid === hosted.pid)) registered = true;
+  return current;
+});
+native.review.setTable(owned => {
+  const rows = realTable(owned);
+  if (hosted && registered && !session.owner.children.some(value => value.pid === hosted.pid)) retired = true;
+  if (retired && direct.exitCode === null && direct.signalCode === null) {
+    censused = true;
+    const current = reused();
+    rows.push({pid: current.pid, ppid: current.parent_pid, pgid: current.process_group});
+  }
+  return rows;
+});
+try {
+  const value = await session.run({command: [input.python, '-I', '-B', input.collector, input.true],
+    ownershipProtocol: 'dossier-quint-private-pipes/v1', environment: input.environment, timeoutSeconds: null});
+  emit({...await finish(session, value), censused, hostedPid: hosted?.pid});
+} finally { Bun.spawn = realSpawn; }
+""",
+                    {
+                        "cwd": str(root),
+                        "mode": mode,
+                        "python": str(Path(sys.executable).resolve()),
+                        "collector": str(collector),
+                        "true": shutil.which("true"),
+                        "environment": native_environment(root),
+                    },
+                )
+                self.assertTrue(result["censused"], result)
+                self.assertIsNone(result["error"], result)
+                self.assertIsNone(result["releaseError"], result)
+                registrations = [
+                    entry["process"]
+                    for entry in result["ownership"]["children"]
+                    if entry["process"]["pid"] == result["hostedPid"]
+                ]
+                self.assertEqual(
+                    len(registrations), 2 if mode == "descendant" else 1, result
+                )
+                if mode == "descendant":
+                    self.assertEqual(
+                        registrations[-1]["process_start_id"],
+                        "reused-after-release",
+                        result,
+                    )
+
     def test_signal_refuses_recycled_reaped_descendant_foreign_and_unchecked_runtime(
         self,
     ):
@@ -266,6 +351,108 @@ emit({results});
                 self.assertTrue(row["error"], row)
                 self.assertEqual(row["calls"], [], row)
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin native startup environment")
+    def test_startup_waiter_survives_js_environment_deletion(self):
+        for deletion in ("before-import", "after-import"):
+            with self.subTest(deletion=deletion):
+                result = native(
+                    r"""
+delete process.env.BUN_FEATURE_FLAG_FORCE_WAITER_THREAD;
+const lib = await native.review.darwin();
+const leader = identity(41001);
+native.review.setIdentity(async () => leader);
+native.review.setTable(() => [{pid: leader.pid, ppid: process.pid, pgid: leader.pid}]);
+const calls = [];
+process.kill = (...args) => { calls.push(args); return true; };
+let error = null;
+try { await native.review.signalOwned(leader, 'SIGTERM', [leader],
+  {pid: leader.pid, exitCode: null, signalCode: null}); }
+catch (failure) { error = String(failure); }
+emit({error, calls, forcedWaiter: lib.forcedWaiter,
+  jsPresent: Object.hasOwn(process.env, 'BUN_FEATURE_FLAG_FORCE_WAITER_THREAD')});
+""",
+                    before_import=(
+                        "delete process.env.BUN_FEATURE_FLAG_FORCE_WAITER_THREAD;\n"
+                        if deletion == "before-import"
+                        else ""
+                    ),
+                    environment=os.environ
+                    | {"BUN_FEATURE_FLAG_FORCE_WAITER_THREAD": "1"},
+                )
+                self.assertFalse(result["jsPresent"], result)
+                self.assertTrue(result["forcedWaiter"], result)
+                self.assertTrue(result["error"], result)
+                self.assertEqual(result["calls"], [], result)
+
+    def test_signal_requires_non_autoreaping_sigchld_disposition(self):
+        result = native(r"""
+Object.defineProperty(process, 'platform', {value: 'darwin'});
+Object.defineProperty(process.versions, 'bun', {value: '1.3.14'});
+const leader = identity(41001), results = [];
+native.review.setIdentity(async () => leader);
+native.review.setTable(() => [{pid: leader.pid, ppid: process.pid, pgid: leader.pid}]);
+for (const mode of ['default', 'ignored', 'no-cldwait', 'unavailable']) {
+  const lib = kernel({[leader.pid]: leader});
+  lib.sigaction = (signal, action, output) => {
+    if (signal !== 20 || action !== null) throw Error('incorrect sigaction query');
+    if (mode === 'unavailable') return -1;
+    output.fill(0);
+    output.writeBigUInt64LE(mode === 'ignored' ? 1n : 0n, 0);
+    output.writeUInt32LE(mode === 'no-cldwait' ? 0x20 : 0, 12);
+    return 0;
+  };
+  native.review.setDarwin(lib);
+  const calls = [];
+  process.kill = (...args) => { calls.push(args); return true; };
+  let error = null;
+  try { await native.review.signalOwned(leader, 'SIGTERM', [leader],
+    {pid: leader.pid, exitCode: null, signalCode: null}); }
+  catch (failure) { error = String(failure); }
+  results.push({mode, error, calls});
+}
+emit({results});
+""")
+        for row in result["results"]:
+            with self.subTest(mode=row["mode"]):
+                if row["mode"] == "default":
+                    self.assertIsNone(row["error"], row)
+                    self.assertEqual(row["calls"], [[-41001, "SIGTERM"]], row)
+                else:
+                    self.assertIn("SIGCHLD", row["error"], row)
+                    self.assertEqual(row["calls"], [], row)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin sigaction ABI")
+    def test_real_sigchld_autoreaping_dispositions_refuse_signaling(self):
+        result = native(r"""
+const lib = await native.review.darwin(), saved = Buffer.alloc(16), results = [];
+if (lib.sigaction(20, null, lib.ptr(saved)) !== 0) throw Error('could not save SIGCHLD disposition');
+const leader = identity(41001);
+native.review.setIdentity(async () => leader);
+native.review.setTable(() => [{pid: leader.pid, ppid: process.pid, pgid: leader.pid}]);
+try {
+  for (const mode of ['ignored', 'no-cldwait']) {
+    const action = Buffer.alloc(16);
+    action.writeBigUInt64LE(mode === 'ignored' ? 1n : 0n, 0);
+    action.writeUInt32LE(mode === 'no-cldwait' ? 0x20 : 0, 12);
+    if (lib.sigaction(20, lib.ptr(action), null) !== 0) throw Error('could not set test SIGCHLD disposition');
+    const calls = [];
+    process.kill = (...args) => { calls.push(args); return true; };
+    let error = null;
+    try { await native.review.signalOwned(leader, 'SIGTERM', [leader],
+      {pid: leader.pid, exitCode: null, signalCode: null}); }
+    catch (failure) { error = String(failure); }
+    results.push({mode, error, calls});
+  }
+} finally {
+  if (lib.sigaction(20, lib.ptr(saved), null) !== 0) throw Error('could not restore SIGCHLD disposition');
+}
+emit({results});
+""")
+        for row in result["results"]:
+            with self.subTest(mode=row["mode"]):
+                self.assertIn("automatic SIGCHLD reaping", row["error"], row)
+                self.assertEqual(row["calls"], [], row)
+
     def test_darwin_census_zero_skips_only_esrch(self):
         result = native(r"""
 Object.defineProperty(process, 'platform', {value: 'darwin'});
@@ -288,6 +475,26 @@ emit({results, esrch: constants.errno.ESRCH});
                     self.assertIsNone(row["stopped"], row)
                     self.assertIn("errno=" + str(row["errno"]), row["error"], row)
 
+    def test_darwin_zero_length_restricted_snapshot_means_vanished(self):
+        result = native(r"""
+Object.defineProperty(process, 'platform', {value: 'darwin'});
+const results = [];
+for (const zeroAt of [1, 2]) {
+  const row = {...identity(41002, 41001), zeroAt};
+  const makeKernel = () => kernel({}, {41002: constants.errno.EPERM}, {41002: row});
+  native.review.setDarwin(makeKernel());
+  const observed = await native.readProcessIdentity(41002);
+  native.review.setDarwin(makeKernel());
+  const stopped = await native.review.groupStopped(identity(41001));
+  results.push({zeroAt, observed, stopped});
+}
+emit({results});
+""")
+        for row in result["results"]:
+            with self.subTest(snapshot=row["zeroAt"]):
+                self.assertIsNone(row["observed"], row)
+                self.assertTrue(row["stopped"], row)
+
     def test_darwin_eperm_preserves_owned_birth_and_excludes_foreign_churn(self):
         result = native(r"""
 Object.defineProperty(process, 'platform', {value: 'darwin'});
@@ -298,7 +505,7 @@ for (const mode of ['outside', 'group', 'session', 'sysctl-error', 'gone', 'shor
   const row = identity(41002, inGroup ? 41001 : 42001);
   if (mode === 'session') row.session_id = 41001;
   if (mode === 'sysctl-error') row.error = constants.errno.EIO;
-  if (mode === 'gone') row.error = constants.errno.ESRCH;
+  if (mode === 'gone') row.zeroAt = 1;
   if (mode === 'short') row.short = true;
   if (mode.endsWith('-birth')) row.changed = true;
   if (mode.endsWith('-group')) row.nextGroup = 42002;

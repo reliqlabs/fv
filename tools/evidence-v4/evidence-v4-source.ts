@@ -25,7 +25,7 @@ import {
 	type SourceFile,
 	type ToolIdentity,
 } from "./evidence-v4-model";
-import { expandPolicy, safeSourcePath, type LoadedPolicy } from "./evidence-v4-policy";
+import { expandPolicy, safeDirectoryPath, safeSourcePath, type LoadedPolicy } from "./evidence-v4-policy";
 export { safeSourcePath } from "./evidence-v4-policy";
 
 export type SourceProbe = (
@@ -244,27 +244,44 @@ export function sourceClosure(input: InputState, recipe: Recipe, commonPaths: re
 	const value = { mode, prefixes, basis: [...basis], files };
 	return { ...value, hash: D("source-closure", value) };
 }
-// Lake resolves modules as <srcDir>/**/*.lean; `.lake` holds only Lake's own build outputs.
+// Module roots require Lean files; declared input directories require every file.
 export async function assertSourceRequirements(
 	root: string,
 	closure: Closure,
-	required: { readonly directories: readonly string[]; readonly files: readonly string[] },
+	required: {
+		readonly directories: readonly string[];
+		readonly files: readonly string[];
+		readonly inputDirectories?: readonly string[];
+		readonly excludedPaths?: readonly string[];
+	},
 ): Promise<void> {
 	const bound = new Set(closure.files.map((file) => file.path));
 	const require = (relative: string): void => {
 		if (!bound.has(relative)) throw new Error(`tool source input outside recipe closure: ${relative}`);
 	};
-	required.files.forEach(require);
-	const walk = async (relative: string): Promise<void> => {
-		for (const entry of await fs.readdir(path.join(root, relative), { withFileTypes: true })) {
+	for (const relative of required.files) {
+		await safeSourcePath(root, relative);
+		require(relative);
+	}
+	const walk = async (relative: string, all: boolean): Promise<void> => {
+		const directory = await safeDirectoryPath(root, relative);
+		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
 			const child = relative === "." ? entry.name : `${relative}/${entry.name}`;
+			if (
+				!all &&
+				(entry.name === ".git" ||
+					entry.name === ".lake" ||
+					required.excludedPaths?.some((excluded) => child === excluded || child.startsWith(excluded + "/")))
+			)
+				continue;
 			if (entry.isSymbolicLink()) throw new Error(`symlink inside tool source directory: ${child}`);
-			if (entry.isDirectory()) {
-				if (entry.name !== ".lake") await walk(child);
-			} else if (entry.name.endsWith(".lean")) require(child);
+			if (entry.isDirectory()) await walk(child, all);
+			else if (!entry.isFile()) throw new Error(`nonregular tool source input: ${child}`);
+			else if (all || /\.lean$/iu.test(entry.name)) require(child);
 		}
 	};
-	for (const directory of required.directories) await walk(directory);
+	for (const directory of required.directories) await walk(directory, false);
+	for (const directory of required.inputDirectories ?? []) await walk(directory, true);
 }
 export function buildEnvironment(
 	policy: Policy,
@@ -310,6 +327,49 @@ export function validateEnvironmentBinding(policy: Policy, identity: Environment
 			throw new Error(`environment literal hash mismatch: ${name}`);
 	}
 	return identity;
+}
+const LIBRARY_PREFIX = "native/non-system-libraries/";
+const RUSTUP_DRIVERS = new Map([
+	["native/drivers/cargo-0", "cargo"],
+	["native/drivers/rustc-0", "rustc"],
+]);
+// Darwin executable/file tools with non-system dylibs or a rustup-selected driver are hashed as a derived tree.
+function derivedNativeTree(declaration: Policy["toolchains"][number], identity: ToolIdentity): boolean {
+	if (
+		(declaration.kind !== "executable" && declaration.kind !== "file") ||
+		declaration.locator.mode === "adapter" ||
+		identity.kind !== "tree" ||
+		identity.system_dependencies.os !== "darwin"
+	)
+		return false;
+	const isLibrary = (relative: string) =>
+		relative.startsWith(LIBRARY_PREFIX) && !relative.slice(LIBRARY_PREFIX.length).includes("/");
+	const shapeOk = identity.files.every((file) =>
+		["native", "native/non-system-libraries", "native/drivers"].includes(file.path)
+			? file.kind === "directory"
+			: file.kind === "file" &&
+				(file.path === "selected-file" || RUSTUP_DRIVERS.has(file.path) || isLibrary(file.path)),
+	);
+	const drivers = identity.files.flatMap((file) => RUSTUP_DRIVERS.get(file.path) ?? []);
+	const selected = identity.files.some((file) => file.path === "selected-file");
+	const closure = drivers.length > 0 || identity.files.some((file) => isLibrary(file.path));
+	if (!shapeOk || !selected || !closure) return false;
+	if (!drivers.length) return true;
+	const locator = declaration.locator;
+	return (
+		(locator.mode === "command" || locator.mode === "path") &&
+		drivers.includes(path.basename(locator.value)) &&
+		drivers.every((name) =>
+			identity.discovery.some(
+				(probe) =>
+					probe.command.length === 3 &&
+					path.basename(probe.command[0]!) === "rustup" &&
+					probe.command[1] === "which" &&
+					probe.command[2] === name &&
+					probe.exit_code === 0,
+			),
+		)
+	);
 }
 export function materializeDescriptor(options: {
 	loaded: LoadedPolicy;
@@ -365,8 +425,9 @@ export function materializeDescriptor(options: {
 			throw new Error(`tool platform differs from environment: ${identity.id}`);
 		if (identity.id === "fv-producer") continue;
 		const declaration = declarations.get(identity.id)!;
+		const derivedTree = derivedNativeTree(declaration, identity);
 		if (
-			identity.kind !== declaration.kind ||
+			(identity.kind !== declaration.kind && !derivedTree) ||
 			H(C(identity.locator)) !== H(C(declaration.locator)) ||
 			H(C(identity.requires)) !== H(C(declaration.requires))
 		)

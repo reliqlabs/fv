@@ -30,6 +30,9 @@ private def readPackage (cfg : LoadConfig) : LogIO (Package × NameMap String) :
     | .lean => do
       let env ← elabConfigFile cfg.pkgIdx cfg.pkgName cfg.pkgDir cfg.lakeOpts cfg.leanOpts cfg.configFile
       LakefileConfig.loadFromEnv env cfg.leanOpts
+  if !fileCfg.facetDecls.isEmpty || !fileCfg.scripts.isEmpty ||
+      !fileCfg.defaultScripts.isEmpty || !fileCfg.postUpdateHooks.isEmpty then
+    error "Unsupported Lake custom facets, scripts or hooks"
   return (mkPackage cfg fileCfg, options)
 
 private def packageJSON (pkg : Package) (env : Lake.Env) (cfg : LoadConfig) (options : NameMap String) : Json := Json.mkObj [
@@ -71,12 +74,22 @@ private def packageJSON (pkg : Package) (env : Lake.Env) (cfg : LoadConfig) (opt
   ("archiver", toJson env.lean.ar.toString),
   ("nativeArguments", toJson (pkg.config.weakLeancArgs ++ pkg.config.moreLeancArgs ++ pkg.config.weakLinkArgs ++ pkg.config.moreLinkArgs)),
   ("leanArguments", toJson (pkg.config.weakLeanArgs ++ pkg.config.moreLeanArgs)),
-  ("unresolvedNativeTargets", toJson (!pkg.config.moreLinkObjs.isEmpty || !pkg.config.moreLinkLibs.isEmpty || pkg.targetDecls.any fun decl =>
+  ("unresolvedNativeTargets", toJson (!pkg.config.moreLinkObjs.isEmpty || !pkg.config.moreLinkLibs.isEmpty ||
+    !pkg.config.plugins.isEmpty || !pkg.config.dynlibs.isEmpty || pkg.targetDecls.any fun decl =>
     if let some config := decl.toConfigDecl.leanLibConfig? then
-      !config.moreLinkObjs.isEmpty || !config.moreLinkLibs.isEmpty
+      !config.moreLinkObjs.isEmpty || !config.moreLinkLibs.isEmpty ||
+      !config.plugins.isEmpty || !config.dynlibs.isEmpty ||
+      !config.needs.isEmpty || !config.extraDepTargets.isEmpty ||
+      config.defaultFacets != #[LeanLib.leanArtsFacet] ||
+      (config.nativeFacets false).map (·.name) != #[Module.oFacet] ||
+      (config.nativeFacets true).map (·.name) != #[Module.oExportFacet]
     else if let some config := decl.toConfigDecl.leanExeConfig? then
-      !config.moreLinkObjs.isEmpty || !config.moreLinkLibs.isEmpty
-    else decl.kind.isAnonymous || decl.kind == ExternLib.configKind)),
+      !config.moreLinkObjs.isEmpty || !config.moreLinkLibs.isEmpty ||
+      !config.plugins.isEmpty || !config.dynlibs.isEmpty ||
+      !config.needs.isEmpty || !config.extraDepTargets.isEmpty ||
+      (config.nativeFacets false).map (·.name) != #[Module.oFacet] ||
+      (config.nativeFacets true).map (·.name) != #[Module.oExportFacet]
+    else !(decl.kind == InputFile.configKind || decl.kind == InputDir.configKind))),
   ("targetArguments", Json.arr (pkg.targetDecls.filterMap fun decl =>
     if let some config := decl.toConfigDecl.leanLibConfig? then
       some (Json.mkObj [("native", toJson (config.weakLeancArgs ++ config.moreLeancArgs ++ config.weakLinkArgs ++ config.moreLinkArgs)), ("lean", toJson (config.weakLeanArgs ++ config.moreLeanArgs))])

@@ -26,8 +26,13 @@ export type AdapterResult = {
 	cacheNamespaces?: CacheNamespaceSelection[];
 	preDispatch?: () => Promise<void>;
 	resourceRequirements?: readonly string[];
-	fileRequirements?: readonly { ids: readonly string[]; files: readonly string[] }[];
-	sourceRequirements?: { directories: readonly string[]; files: readonly string[] };
+	fileRequirements?: readonly { ids: readonly string[]; files: readonly string[]; shared?: boolean }[];
+	sourceRequirements?: {
+		directories: readonly string[];
+		files: readonly string[];
+		inputDirectories?: readonly string[];
+		excludedPaths?: readonly string[];
+	};
 };
 export type AdapterContext = {
 	root: string;
@@ -40,6 +45,11 @@ export type AdapterContext = {
 	session: NativeSession;
 	applicationContexts: readonly { recipe: Recipe; subject: readonly string[]; cwd: string }[];
 	commandContexts?: readonly { subject: readonly string[]; cwd: string; toolchain: readonly string[] }[];
+	otherCommandBound?(command: {
+		subject: readonly string[];
+		cwd: string;
+		toolchain: readonly string[];
+	}): Promise<boolean>;
 	probe(command: readonly string[], options?: { cwd?: string; env?: Record<string, string> }): Promise<ProbeResult>;
 	resolveCommand(
 		command: string,
@@ -130,6 +140,7 @@ export function parseMachOLoadCommands(text: string): { dependencies: string[]; 
 	for (const block of blocks.slice(1)) {
 		const command = /^[ \t]*cmd (LC_[A-Z0-9_]+)[ \t]*$/mu.exec(block)?.[1];
 		if (!command) throw new Error("Mach-O load-command type is absent");
+		if (command === "LC_DYLD_ENVIRONMENT") throw new Error("Unsupported Mach-O LC_DYLD_ENVIRONMENT");
 		if (command === "LC_RPATH") {
 			const rpath = /^[ \t]*path (.+?) \(offset [0-9]+\)[ \t]*$/mu.exec(block)?.[1];
 			if (!rpath) throw new Error("Mach-O LC_RPATH path is absent");

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import stat
 import sys
@@ -58,10 +59,18 @@ def _copy_owned_file(
         staged = Path(handle.name)
     try:
         shutil.copy2(source, staged)
+        with staged.open("rb") as handle:
+            os.fsync(handle.fileno())
         staged.replace(destination)
+        results.append(("overwrote" if existed else "wrote", destination))
+        for directory in (destination.parent, destination.parent.parent):
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
     finally:
         staged.unlink(missing_ok=True)
-    results.append(("overwrote" if existed else "wrote", destination))
 
 
 def install_project_scripts(
@@ -84,6 +93,8 @@ def install_project_scripts(
                 f"script directory is not a directory: {directory}"
             )
     for destination in destinations:
+        if destination.exists() and not force:
+            continue
         try:
             info = destination.lstat()
         except FileNotFoundError:
@@ -497,11 +508,17 @@ def main() -> int:
         return 1
 
     if args.refresh_project_scripts:
+        results: list[tuple[str, Path]] = []
         try:
             project = fv_project.resolve_project_root(args.project)
-            results: list[tuple[str, Path]] = []
+            if not (project / ".fv").is_dir():
+                raise fv_project.ProjectError(
+                    "refresh requires an existing .fv directory; initialize the project first"
+                )
             install_project_scripts(project, True, results)
         except (fv_project.ProjectError, OSError) as error:
+            for action, path in results:
+                print(f"  [{action:>9}] {path.relative_to(project)}")
             print(f"FATAL: {error}")
             return 1
         for action, path in results:
@@ -539,6 +556,8 @@ def main() -> int:
     try:
         install_project_scripts(project, args.force, results)
     except (fv_project.ProjectError, OSError) as error:
+        for action, path in results:
+            print(f"  [{action:>9}] {path.relative_to(project)}")
         print(f"FATAL: {error}")
         return 1
     errors.extend(

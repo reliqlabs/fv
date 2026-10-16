@@ -780,8 +780,9 @@ class Invocation {
 								? "FAIL"
 								: "PASS";
 			let reason: string | null = actual.error ?? (result === "PASS" ? null : `execution ${result.toLowerCase()}`);
-			let marker = false;
-			const raw = reconstructRawOutput(actual.stdout, actual.stderr, actual.termination, result);
+			let streamsValid = true,
+				marker = false,
+				normalRaw: Uint8Array | null = null;
 			try {
 				for (const bytes of [actual.stdout, actual.stderr])
 					if (
@@ -790,15 +791,18 @@ class Invocation {
 							.some((line) => RESERVED_TRAILER.test(line))
 					)
 						throw new Error("command emitted a reserved evidence trailer");
-				marker = markerMatches(raw, recipe);
-				if (result === "PASS" && !marker) {
-					result = "FAIL";
-					reason = "required pass marker was absent";
+				if (normal(actual)) {
+					normalRaw = reconstructRawOutput(actual.stdout, actual.stderr, actual.termination, result);
+					marker = markerMatches(normalRaw, recipe);
+					if (result === "PASS" && !marker) {
+						result = "FAIL";
+						reason = "required pass marker was absent";
+					}
 				}
 			} catch (error) {
 				result = "ERROR";
 				reason = message(error);
-				marker = false;
+				streamsValid = false;
 			}
 			if (result !== "PASS") this.halted = true;
 			if (result === "ERROR") this.fail(reason ?? "execution error");
@@ -837,7 +841,6 @@ class Invocation {
 			const files = new Map<string, Uint8Array>([
 				["stdout.bin", actual.stdout],
 				["stderr.bin", actual.stderr],
-				["raw.log", raw],
 			]);
 			try {
 				for (const [name, bytes] of await retainCollectorAttachments(this.root, recipe, actual.stdout))
@@ -849,6 +852,9 @@ class Invocation {
 					this.fail(error);
 				}
 			}
+			const raw = normalRaw ?? reconstructRawOutput(actual.stdout, actual.stderr, actual.termination, result);
+			if (normalRaw === null) marker = streamsValid && markerMatches(raw, recipe);
+			files.set("raw.log", raw);
 			const directory = `${BASE}/executions/${key.slice(7)}/${attempt}`;
 			const ownership = { ...actual.ownership };
 			if (ownership.protocol_log) {
