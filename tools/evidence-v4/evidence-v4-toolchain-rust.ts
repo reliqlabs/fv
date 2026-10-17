@@ -1217,7 +1217,7 @@ function assertRustSourceIncludes(
 ): boolean {
 	let code = rustSourceCode(source);
 	if (code === null) fail("unclassified Rust source inclusion syntax in " + filename);
-	for (const match of code.matchAll(/(?<![#\w])(?:use|extern\s+crate)\b[^;]*/g)) {
+	for (const match of code.matchAll(/(?<![#\p{XID_Continue}])(?:use|extern\s+crate)(?!\p{XID_Continue})[^;]*/gu)) {
 		const declaration = match[0];
 		if (
 			/\bsolver\b/.test(declaration) ||
@@ -1237,12 +1237,12 @@ function assertRustSourceIncludes(
 		if (depth) fail("unclassified Rust attribute syntax in " + filename);
 		const attribute = code
 			.slice(match.index! + match[0].length, end - 1)
-			.replace(/(^|[(,])\s*(?:::)?(?:r#)?kani\s*::\s*(?:r#)?solver\s*\(\s*kissat\s*,?\s*\)/g, "$1");
+			.replace(/(^|[(,])\s*(?:::)?(?:r#)?kani\s*::\s*(?:r#)?solver\s*\(\s*(?:r#)?kissat\s*,?\s*\)/g, "$1");
 		if (/\bsolver\b/.test(attribute))
 			fail("Kani solver attribute requires the installed pinned kissat selection in " + filename);
 	}
 	for (const match of code.matchAll(/\bkani\s*::\s*solver\s*\(([^)]*)\)/g))
-		if (!/^kissat\s*,?$/.test(match[1].trim()))
+		if (!/^(?:r#)?kissat\s*,?$/.test(match[1].trim()))
 			fail("Kani solver attribute requires the installed pinned kissat selection in " + filename);
 	if (inactiveTests) {
 		const start = code.search(/#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*\{/);

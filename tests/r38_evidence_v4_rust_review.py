@@ -1118,6 +1118,8 @@ pub fn call() { crate::solver("", ""); }
             "#[cfg_attr(kani, kani::solver(kissat))]",
             "#[cfg_attr(kani, cfg_attr(test, ::kani::solver(kissat,)))]",
             "#[r#kani::r#solver(kissat)]",
+            "#[kani::solver(r#kissat)]",
+            "#[cfg_attr(kani, kani::solver(r#kissat,))]",
             "#[kani /* namespace */ :: solver(/* argument */ kissat,)]",
         ):
             with self.subTest(attribute=attribute):
@@ -1136,6 +1138,20 @@ pub fn call() { crate::solver("", ""); }
                     ),
                     str(Path(fixture.env["KANI_HOME"]) / "bin/kissat"),
                 )
+
+    def test_solver_scan_preserves_unicode_identifier_boundaries(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        fixture.kani()
+        for name in ("réuse", "use\u0301", "r#use"):
+            fixture.write("src/lib.rs", f"pub fn {name}(solver: u8) -> u8 {{ solver }}")
+            for command, adapter in (
+                ("test", "cargo-toolchain"),
+                ("kani", "kani-toolchain"),
+            ):
+                with self.subTest(name=name, adapter=adapter):
+                    result = fixture.capture(command, adapter=adapter)
+                    self.assertTrue(result["ok"], result)
 
     def test_r3_ca04_kani_manifest_overrides_refuse(self):
         for scope in ("package", "workspace"):
