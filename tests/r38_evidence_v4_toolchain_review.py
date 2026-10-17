@@ -391,6 +391,14 @@ class ToolchainReview(unittest.TestCase):
             "holder = {}\nholder['loader'] = sys.modules['importlib']",
             "holder.loader = sys.modules['importlib']",
             "class Holder:\n loader = sys.modules['importlib']",
+            "loader = sys.modules['importlib']\nclass Holder:\n loader = loader\nHolder.loader.import_module('external_plugin')",
+            "registry = sys.modules\nclass Holder:\n registry = registry\nHolder.registry['importlib'].import_module('external_plugin')",
+            "saved = {name: sys.modules.get(name) for name in ('importlib',)}\nclass Holder:\n saved = saved\nHolder.saved['importlib'].import_module('external_plugin')",
+            "loader = sys.modules['importlib']\nclass Holder:\n if condition:\n  loader = loader\nHolder.loader.import_module('external_plugin')",
+            "class Holder:\n loader = importlib\nHolder.loader.import_module('external_plugin')",
+            "loader = sys.modules['importlib']\nclass Holder:\n loader = 1\n def find(self):\n  return loader\nHolder().find().import_module('external_plugin')",
+            "loader = sys.modules['importlib']\nclass Holder:\n loader = 1\n class Nested:\n  loader = loader\nHolder.Nested.loader.import_module('external_plugin')",
+            "loader = sys.modules['importlib']\nclass Holder:\n loader = 1\n find = lambda: loader\nHolder.find().import_module('external_plugin')",
             "def load():\n return sys.modules['importlib']",
             "holder = sys.modules['importlib'] or missing",
             "if condition:\n loader = sys.modules['importlib']\nloader.import_module('external_plugin')",
@@ -411,6 +419,8 @@ class ToolchainReview(unittest.TestCase):
                 "registry = sys.modules\nlookup = registry.get\n"
                 "previous = lookup('fixture', previous)\n"
                 "registry['fixture'] = previous\n"
+                "class Ordinary:\n value = 1\n def result(self):\n  return 1\n"
+                " def previous(self):\n  return 1\n identity = lambda previous: previous\n"
             )
         )
         self.assertTrue(result["ok"], result)

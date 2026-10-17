@@ -605,7 +605,7 @@ export async function discoverPythonAdapter(context: AdapterContext): Promise<Ad
 		}
 	}
 	const code = String.raw`
-import ast,hashlib,importlib.machinery,json,os,pathlib,site,sys,sysconfig
+import ast,hashlib,importlib.machinery,json,os,pathlib,site,symtable,sys,sysconfig
 root=os.path.realpath(sys.argv[1]); requests=json.loads(sys.argv[2]); stdlib=os.path.realpath(sysconfig.get_path('stdlib')); extensions=os.path.realpath(sysconfig.get_config_var('DESTSHARED')); startup=[]; startup_hooks=set(); required=set(); seen=set(); active=set(); import_roots=[]
 def within(base,p): return p==base or p.startswith(base+os.sep)
 for p in sys.path:
@@ -687,13 +687,15 @@ class PathSnapshot(list):
  __slots__=()
 
 SYS=object(); PATHLIB=object(); OS=object(); OSPATH=object(); PATH_FACTORY=object(); IMPORTLIB=object(); IMPORT_MODULE=object(); BUILTIN_IMPORT=object(); BUILTINS=object(); IMPORT_UTIL=object(); SPEC_FACTORY=object(); MODULE_FACTORY=object(); PROJECT_INPUT=object(); FORBIDDEN=object(); REFLECTION=object(); RUNPY=object(); RUN_PATH=object()
+RUNTIME_SELECTORS=(SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)
+CLASS_GLOBALS=object()
 SYS_MODULES=object(); MODULE_LOOKUP=object(); OPAQUE_MODULE=object(); MODULE_ITEMS=object(); LOGGING=object()
 class ModuleSnapshot: pass
 class ModuleSnapshotItems: pass
 OPAQUE_SELECTORS=(SYS_MODULES,MODULE_LOOKUP,OPAQUE_MODULE,MODULE_ITEMS)
 def opaque(value): return isinstance(value,(ModuleSnapshot,ModuleSnapshotItems)) or any(value is selector for selector in OPAQUE_SELECTORS)
 def refuse_opaque(value):
- if opaque(value): raise RuntimeError('unsupported opaque Python module escape')
+ if opaque(value) or any(value is selector for selector in RUNTIME_SELECTORS): raise RuntimeError('unsupported Python runtime-selector escape')
 class ProjectLocation:
  def __init__(self,file): self.file=file
 class LoadSpec:
@@ -766,6 +768,15 @@ def expression_children(node):
 def expression(node,values,paths,cwd,argv,flags):
  if isinstance(node,ast.Constant): return node.value
  if isinstance(node,ast.Name): return values.get(node.id,UNKNOWN)
+ if isinstance(node,ast.Lambda):
+  for default in [*node.args.defaults,*node.args.kw_defaults]:
+   if default is not None: refuse_opaque(expression(default,values,paths,cwd,argv,flags))
+  local=dict(values.get(CLASS_GLOBALS,values))
+  for arg in [*node.args.posonlyargs,*node.args.args,*node.args.kwonlyargs,node.args.vararg,node.args.kwarg]:
+   if arg is not None: local[arg.arg]=UNKNOWN
+  if path_changes(node.body,local,paths,cwd,argv,flags) or argv_changes(node.body,local,paths,cwd,argv,flags): raise RuntimeError('unsupported Python lambda selector mutation')
+  refuse_opaque(expression(node.body,local,paths,cwd,argv,flags))
+  return UNKNOWN
  # Bound only literal-name registry snapshots; their values stay opaque through restoration.
  if isinstance(node,ast.DictComp) and len(node.generators)==1:
   generator=node.generators[0]; lookup=node.value
@@ -773,7 +784,7 @@ def expression(node,values,paths,cwd,argv,flags):
    if isinstance(lookup,ast.Call) and not lookup.keywords and len(lookup.args)==1 and isinstance(lookup.args[0],ast.Name) and lookup.args[0].id==generator.target.id and isinstance(lookup.func,ast.Attribute) and lookup.func.attr=='get' and expression(lookup.func.value,values,paths,cwd,argv,flags) is SYS_MODULES: return ModuleSnapshot()
  if isinstance(node,(ast.List,ast.Tuple)):
   items=[expression(item,values,paths,cwd,argv,flags) for item in node.elts]
-  if any(item is paths or isinstance(item,PathMethod) or opaque(item) or any(item is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
+  if any(item is paths or isinstance(item,PathMethod) or opaque(item) or any(item is module for module in RUNTIME_SELECTORS) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
   return UNKNOWN if any(item is UNKNOWN for item in items) else items
  if isinstance(node,ast.UnaryOp) and isinstance(node.op,ast.USub):
   operand=expression(node.operand,values,paths,cwd,argv,flags)
@@ -895,7 +906,6 @@ def expression(node,values,paths,cwd,argv,flags):
   args=[expression(arg,values,paths,cwd,argv,flags) for arg in node.args]
   keywords={keyword.arg:expression(keyword.value,values,paths,cwd,argv,flags) for keyword in node.keywords}
   if target is REFLECTION and args and (any(args[0] is module for module in (SYS,SYS_MODULES,OPAQUE_MODULE,IMPORTLIB,IMPORT_UTIL,BUILTINS,FORBIDDEN,paths)) or isinstance(args[0],(PathSnapshot,LoadSpec))): raise RuntimeError('unsupported reflective Python runtime selector')
-  if any(any(arg is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for arg in [*args,*keywords.values()]): raise RuntimeError('unsupported Python runtime-selector escape')
   for arg in [*args,*keywords.values()]: refuse_opaque(arg)
   if any(arg is paths or isinstance(arg,(PathSnapshot,PathMethod)) for arg in args) and not (isinstance(node.func,ast.Name) and node.func.id in ('list','len','tuple') and node.func.id not in values): raise RuntimeError('unsupported Python import-path escape')
   if any(arg is UNKNOWN for arg in args) or any(value is UNKNOWN for value in keywords.values()): return UNKNOWN
@@ -934,7 +944,7 @@ def expression(node,values,paths,cwd,argv,flags):
   if isinstance(node.ops[0],ast.NotEq): return left!=right
  for child in expression_children(node):
   value=expression(child,values,paths,cwd,argv,flags)
-  if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or opaque(value) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector escape')
+  if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or opaque(value) or any(value is module for module in RUNTIME_SELECTORS): raise RuntimeError('unsupported Python runtime-selector escape')
  return UNKNOWN
 
 def argv_changes(node,scope,paths,cwd,argv,flags):
@@ -1012,6 +1022,10 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
    specializations[function]=cases
  deferred=[]
  def calls(node):
+  if isinstance(node,ast.Lambda):
+   for default in [*node.args.defaults,*node.args.kw_defaults]:
+    if default is not None: yield from calls(default)
+   return
   if isinstance(node,ast.Call): yield node
   for child in ast.iter_child_nodes(node):
    if not isinstance(child,ast.stmt): yield from calls(child)
@@ -1066,7 +1080,7 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
       elif opaque(value):
        if value is not OPAQUE_MODULE or not isinstance(target,ast.Subscript) or expression(target.value,scope,search,cwd,argv,flags) is not SYS_MODULES: raise RuntimeError('unsupported opaque Python module escape')
        refuse_opaque(expression(target.slice,scope,search,cwd,argv,flags))
-      elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)):
+      elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in RUNTIME_SELECTORS):
        if not isinstance(target,ast.Subscript): raise RuntimeError('unsupported Python import-path escape')
        receiver=expression(target.value,scope,search,cwd,argv,flags)
        if receiver is not search and not isinstance(receiver,PathSnapshot): raise RuntimeError('unsupported Python import-path escape')
@@ -1126,14 +1140,19 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
     elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
      for default in [*node.args.defaults,*node.args.kw_defaults]:
       value=expression(default,scope,search,cwd,argv,flags) if default is not None else UNKNOWN
-      if value is search or opaque(value) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector default argument')
+      if value is search or opaque(value) or any(value is module for module in RUNTIME_SELECTORS): raise RuntimeError('unsupported Python runtime-selector default argument')
      for decorator in node.decorator_list: refuse_opaque(expression(decorator,scope,search,cwd,argv,flags))
-     deferred.append((node,scope))
+     deferred.append((node,scope.get(CLASS_GLOBALS,scope)))
+     if CLASS_GLOBALS in scope: scope[node.name]=UNKNOWN
     elif isinstance(node,ast.ClassDef):
      for value in [*node.bases,*node.decorator_list,*[keyword.value for keyword in node.keywords]]: refuse_opaque(expression(value,scope,search,cwd,argv,flags))
-     local=dict(scope); walk(node.body,local,search,allow_path)
-     for name,value in local.items():
-      if name not in scope or value is not scope[name]: refuse_opaque(value)
+     enclosing=scope.get(CLASS_GLOBALS,scope)
+     local=dict(enclosing); local[CLASS_GLOBALS]=enclosing; walk(node.body,local,search,allow_path)
+     namespace=symtable.symtable(ast.unparse(node),filename or '<inline>','exec').lookup(node.name).get_namespace()
+     if namespace.get_type()!='class': raise RuntimeError('unsupported Python class namespace')
+     for symbol in namespace.get_symbols():
+      if symbol.is_assigned() or symbol.is_imported(): refuse_opaque(local.get(symbol.get_name(),UNKNOWN))
+     scope[node.name]=UNKNOWN
     elif isinstance(node,ast.Return):
      if node.value is not None: refuse_opaque(expression(node.value,scope,search,cwd,argv,flags))
     elif isinstance(node,ast.Expr): expression(node.value,scope,search,cwd,argv,flags)
