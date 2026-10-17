@@ -1201,6 +1201,10 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
      if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported block Python import-path mutation')
      walk_branch(node.body,scope,search,bindings)
      if hasattr(node,'orelse'): walk_branch(node.orelse,scope,search)
+    elif isinstance(node,(ast.Assert,ast.Raise)):
+     for value in expression_children(node): refuse_opaque(expression(value,scope,search,cwd,argv,flags))
+    elif not isinstance(node,(ast.Pass,ast.Break,ast.Continue,ast.Global,ast.Nonlocal)):
+     raise RuntimeError('unsupported Python statement: '+type(node).__name__)
    except (RuntimeError,TypeError,ValueError,OSError) as error:
     if isinstance(error,MissingImport): raise
     raise RuntimeError(f"{filename or '<inline cwd='+cwd+'>'}:{getattr(node,'lineno','?')}: {error}") from error
