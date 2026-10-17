@@ -1237,7 +1237,19 @@ export class NativeSession {
 		};
 		const stopped = async (identity: OwnedProcess) => {
 			try {
-				return await groupStopped(identity);
+				if (!(await groupStopped(identity))) return false;
+				for (const entry of owned) {
+					if (
+						entry.terminated_at ||
+						entry.process.process_group !== identity.process_group ||
+						entry.process.session_id !== identity.session_id
+					)
+						continue;
+					const current = await readProcessIdentity(entry.process.pid);
+					if (current && sameProcess(current, entry.process))
+						throw new Error("registered process survives outside its stopped group");
+				}
+				return true;
 			} catch (failure) {
 				escaped = true;
 				throw failure;
