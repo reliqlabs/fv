@@ -157,11 +157,11 @@ Classification: implementation-only, enforcing the existing provenance/refusal c
 |---|---|
 | Base CA-16, CA-17 | Open: root-by-name and imported-helper argument/target analysis remain incomplete. |
 | Base CA-18, CA-19 | Runtime-family gates and hardlink aliases are checked; unsupported Python source/loader formats refuse. |
-| Base CA-20 | Partial: direct opaque-module forms refuse, but the independent review found a dictionary/container escape. |
+| Base CA-20 | Dictionary/container escape corrected; the class-namespace follow-up is implemented and awaiting final confirmation. |
 | Base CA-21 | Partial: reviewed startup-hook imports use actual request paths; direct split-stdlib imports refuse. Transitive split-stdlib paths remain open. |
 | Base CA-22, CA-23 | Literal loader paths use command cwd; symlinked Python source and hidden interpreter-wrapper contexts refuse. |
 | Base CA-24 | Generic Darwin tree linkage remains open. Dossier's separately retained frozen-installation disposition does not close it. |
-| Base CA-25 | Partial: pnpm configuration options are checked; the independent review found unbound options in a preferred Node wrapper. |
+| Base CA-25 | Configuration and actual preferred-runtime option checks are closed for the reported mechanisms by runtime review 2. |
 | Proof CA-01..CA-04 | Quint family/subcommand gates, symlink-safe Lake `-d`, absolute Apalache JAR selection and Elan nearest-directory precedence are implemented. |
 | Source CA-12..CA-14 | Unbound prebuilt imports refuse; generated-path Lean sources remain mandatory; Rustup hardlink selection and derived-tree validation match the retained selector and Python byte checks. |
 
@@ -179,4 +179,6 @@ Runtime review CA-03, CA-05 and CA-07 are implemented by FixHybridResiduals. Opa
 
 Three regression methods produced 22 failed assertions against the pre-correction `2c7bd3c` adapters. The initial corrected suite passed 45 methods, but actual Dossier Python discovery then refused its module-registry snapshot/restore. The follow-up admits only literal-key snapshots, key iteration and direct two-name `.items()` iteration; values remain opaque, including after restoration. There is no module-name exception. The final suite passed 46 methods, and actual capture admitted both Dossier `mobile-node-toolchain` and `python-runtime`. This is metadata acceptance, not proof evidence or a fresh full-policy collection.
 
-Independent residual re-review remains pending. Root-value CA-16, imported-helper CA-17, transitive split-stdlib CA-21 and generic Darwin-tree CA-24 remain open, including their fresh-provenance implications. No generic reuse or activation qualification is claimed.
+Runtime review 2 closed CA-05 and CA-07, while retaining CA-03 through class namespace publication. The report is `.fv/code-adversarial/2026-10-16-hybrid-runtime-review2.md`. Four class-publication assertions failed before correction. Further lexical-scope cases exposed three escapes and one false refusal, also corrected. Python symbol tables now identify class-written names; method, nested-class and lambda lookup retains the enclosing lexical scope. The shared escape guard covers opaque and known import selectors. Unresolved namespace forms refuse. The complete toolchain suite again passed 46 methods, the direct/snapshot class cases passed, and actual Dossier Python/Node capture succeeded. Class correction confirmation remains pending.
+
+Root-value CA-16, imported-helper CA-17, transitive split-stdlib CA-21 and generic Darwin-tree CA-24 remain open, including their fresh-provenance implications. No generic reuse or activation qualification is claimed.
