@@ -498,6 +498,80 @@ def event(fixture, name, recipe_id=None):
 
 @unittest.skipUnless(os.name == "posix", "v4 requires POSIX process ownership")
 class EvidenceV4Scheduling(unittest.TestCase):
+    def test_normal_exit_allows_bounded_descendant_drain(self):
+        for child_finishes in (True, False):
+            with self.subTest(child_finishes=child_finishes):
+                with EvidenceV4Fixture(claims=("A",)) as fixture:
+                    fixture.set_control(
+                        spawn_child=True,
+                        await_child=False,
+                        wait_for_gate="parent-release",
+                        child_gate="parent-release"
+                        if child_finishes
+                        else "child-release",
+                        child_delay_ms=1000 if child_finishes else 0,
+                    )
+                    process = fixture.start_call(jobs=1, resume=False)
+                    try:
+                        child = wait_for(
+                            lambda: event(fixture, "child-started"),
+                            process=process,
+                            label="same-group descendant",
+                        )
+                        child_pid = child.get("child_pid", child["pid"])
+                        wait_for(
+                            lambda: any(
+                                entry["pid"] == child_pid
+                                for entry in read_json(owner_path(fixture.root))[
+                                    "children"
+                                ]
+                            ),
+                            process=process,
+                            label="registered descendant",
+                        )
+                        fixture.release("parent-release")
+                        result = fixture.finish_call(process)
+                        self.assertEqual(
+                            result["result"],
+                            "PASS" if child_finishes else "ERROR",
+                            result,
+                        )
+                        artifact = fixture.artifacts()[-1][1]
+                        self.assertEqual(artifact["termination"]["exit_code"], 0)
+                        windows = artifact["ownership"]["spawn_windows"]
+                        if child_finishes:
+                            self.assertTrue(
+                                all(window["state"] == "closed" for window in windows),
+                                artifact,
+                            )
+                            self.assertTrue(
+                                all(
+                                    entry["terminated_at"]
+                                    for entry in artifact["ownership"]["children"]
+                                ),
+                                artifact,
+                            )
+                            self.assertIsNone(identity(child_pid))
+                        else:
+                            self.assertIn("surviving descendants", result["reason"])
+                            self.assertTrue(
+                                any(
+                                    window["state"] == "indeterminate"
+                                    for window in windows
+                                ),
+                                artifact,
+                            )
+                            self.assertIsNotNone(identity(child_pid))
+                    finally:
+                        fixture.release("parent-release")
+                        fixture.release("child-release")
+                        if process.poll() is None:
+                            fixture.finish_call(process)
+                        wait_for(
+                            lambda: event(fixture, "child-finished"),
+                            label="descendant completion",
+                        )
+
     def test_fail_fast_preserves_first_checkpoint_and_unadmitted_work(self):
         with EvidenceV4Fixture(claims=("A",), recipe_count=3) as fixture:
             fixture.set_control("recipe-2", exit_code=7)

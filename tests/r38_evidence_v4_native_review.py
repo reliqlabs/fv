@@ -688,6 +688,81 @@ emit({results});
                     self.assertIsNone(row["observed"], row)
                     self.assertTrue(row["error"], row)
 
+    def test_registered_child_cannot_escape_during_post_exit_drain(self):
+        with tempfile.TemporaryDirectory(
+            prefix="r38-native-drain-escape-"
+        ) as directory:
+            root = Path(directory).resolve()
+            (root / "child.py").write_text(
+                "import os,time\nfrom pathlib import Path\n"
+                "while not Path('escape').exists(): time.sleep(0.005)\n"
+                "os.setsid()\nPath('escaped').write_text(str(os.getpid()))\n"
+                "while not Path('stop').exists(): time.sleep(0.005)\n"
+            )
+            (root / "subject.py").write_text(
+                "import subprocess,sys,time\nfrom pathlib import Path\n"
+                "child=subprocess.Popen([sys.executable,'-B','child.py'],"
+                "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                "Path('child-pid').write_text(str(child.pid))\n"
+                "while not Path('parent-exit').exists(): time.sleep(0.005)\n"
+                "print('SUBJECT_DONE',flush=True)\n"
+            )
+            result = native(
+                r"""
+const fs = await import('node:fs');
+const session = await native.createNativeSession({cwd:input.cwd,runId:randomUUID()});
+const originalSpawn = Bun.spawn, originalTable = native.review.processTable;
+let direct, childPid, postExitPoll = false;
+async function until(predicate) {
+  const deadline = performance.now()+10000;
+  while (!(await predicate())) {
+    if (performance.now() >= deadline) throw Error('escape fixture did not reach its boundary');
+    await Bun.sleep(5);
+  }
+}
+Bun.spawn = options => { const value=originalSpawn(options); direct??=value; return value; };
+native.review.setTable(scope => {
+  const rows=originalTable(scope);
+  if (direct?.exitCode !== null && direct && scope.length===1 && scope[0].pid===direct.pid)
+    postExitPoll=true;
+  return rows;
+});
+try {
+  const work=session.run({command:[input.python,'-B','subject.py'],environment:input.environment,timeoutSeconds:20});
+  await until(()=>fs.existsSync(input.cwd+'/child-pid'));
+  childPid=Number(fs.readFileSync(input.cwd+'/child-pid','utf8'));
+  await until(()=>session.owner.children.some(child=>child.pid===childPid));
+  fs.writeFileSync(input.cwd+'/parent-exit','1');
+  await until(()=>postExitPoll);
+  fs.writeFileSync(input.cwd+'/escape','1');
+  await until(()=>fs.existsSync(input.cwd+'/escaped'));
+  emit(await finish(session,await work));
+} finally {
+  Bun.spawn=originalSpawn;
+  native.review.setTable(originalTable);
+  fs.writeFileSync(input.cwd+'/parent-exit','1');
+  fs.writeFileSync(input.cwd+'/escape','1');
+  fs.writeFileSync(input.cwd+'/stop','1');
+  if (childPid) await until(async()=>!(await native.readProcessIdentity(childPid)));
+}
+""",
+                {
+                    "cwd": str(root),
+                    "python": str(Path(sys.executable).resolve()),
+                    "environment": native_environment(root),
+                },
+            )
+            self.assertEqual(result["termination"]["exit_code"], 0, result)
+            self.assertIn("survives outside", result["error"], result)
+            self.assertIsNotNone(result["releaseError"], result)
+            self.assertTrue(
+                any(
+                    window["state"] == "indeterminate"
+                    for window in result["ownership"]["spawn_windows"]
+                ),
+                result,
+            )
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin compiler discovery")
     def test_real_darwin_cc_discovery_releases_native_ownership(self):
         with tempfile.TemporaryDirectory(prefix="r38-native-cc-") as directory:

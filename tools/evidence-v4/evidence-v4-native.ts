@@ -1237,7 +1237,19 @@ export class NativeSession {
 		};
 		const stopped = async (identity: OwnedProcess) => {
 			try {
-				return await groupStopped(identity);
+				if (!(await groupStopped(identity))) return false;
+				for (const entry of owned) {
+					if (
+						entry.terminated_at ||
+						entry.process.process_group !== identity.process_group ||
+						entry.process.session_id !== identity.session_id
+					)
+						continue;
+					const current = await readProcessIdentity(entry.process.pid);
+					if (current && sameProcess(current, entry.process))
+						throw new Error("registered process survives outside its stopped group");
+				}
+				return true;
 			} catch (failure) {
 				escaped = true;
 				throw failure;
@@ -1669,15 +1681,10 @@ export class NativeSession {
 				throw failure;
 			});
 			if (killWork) await killWork;
+			// The exited direct child no longer anchors a safe group signal.
 			for (const entry of owned) {
 				if (entry.terminated_at) continue;
-				if (!(await stopped(entry.process))) {
-					await signal(entry.process, "SIGTERM");
-					const until = performance.now() + MAX_GRACE;
-					while (performance.now() < until && !(await stopped(entry.process))) await sleep(25);
-					if (!(await stopped(entry.process))) await signal(entry.process, "SIGKILL");
-				}
-				const until = performance.now() + 5000;
+				const until = performance.now() + MAX_GRACE;
 				while (performance.now() < until && !(await stopped(entry.process))) await sleep(25);
 				await terminated(entry);
 			}

@@ -400,6 +400,47 @@ class PortableReviewRegressions(unittest.TestCase):
         )
         return result
 
+    def test_canonical_tool_minimum_keeps_additional_slots_required(self):
+        for missing, extra_fails in ((False, False), (False, True), (True, False)):
+            with self.subTest(missing=missing, extra_fails=extra_fails):
+                with EvidenceV4Fixture(recipe_count=2) as fixture:
+                    manifest_path = fixture.root / ".fv/obligations.json"
+                    manifest = load_json(manifest_path)
+                    system = manifest["witnesses"].pop(0)
+                    system.update(
+                        depends_on=["B"],
+                        required_evidence=["missing-tool" if missing else "fixture-1"],
+                    )
+                    manifest["system_claims"] = [system]
+                    rewrite_json(manifest_path, manifest)
+                    fixture.commit("declare canonical tool minimum")
+                    if missing:
+                        with self.assertRaisesRegex(
+                            V4Error, "required evidence coverage"
+                        ):
+                            portable._policy(
+                                portable.Reader(fixture.root), fixture.policy_path
+                            )
+                        planned = fixture.plan()
+                        self.assertEqual(planned["result"], "ERROR", planned)
+                        self.assertIn("drops required evidence", planned["reason"])
+                        self.assertEqual(fixture.count(), 0)
+                        continue
+                    if extra_fails:
+                        fixture.set_control("recipe-2", observation_fail=["A"])
+                    result = fixture.run(jobs=1, resume=False)
+                    expected = "FAIL" if extra_fails else "PASS"
+                    self.assertEqual(result["result"], expected, result)
+                    report, code = fixture.assess()
+                    self.assertEqual(code, 1 if extra_fails else 0, report)
+                    self.assertEqual(rows(report)["A"]["result"], expected, report)
+                    slots = {
+                        slot["tool"]: slot for slot in rows(report)["A"]["executions"]
+                    }
+                    self.assertEqual(set(slots), {"fixture-1", "fixture-2"})
+                    self.assertEqual(slots["fixture-1"]["state"], "PASS")
+                    self.assertEqual(slots["fixture-2"]["state"], expected)
+
     def test_ca01_required_runtime_root_cannot_be_empty(self):
         with EvidenceV4Fixture(claims=("A",)) as fixture:
             self.produce_pass(fixture)
