@@ -425,6 +425,51 @@ class ToolchainReview(unittest.TestCase):
         )
         self.assertTrue(result["ok"], result)
 
+    def test_ca03_unmodeled_class_comprehensions_refuse(self):
+        for comprehension in (
+            "[loader for item in (1,)]",
+            "{item: loader for item in (1,)}",
+            "{loader for item in (1,)}",
+            "(loader for item in (1,))",
+        ):
+            with self.subTest(comprehension=comprehension):
+                result = invoke(
+                    self.python_request(
+                        "import sys\nloader = sys.modules['importlib']\n"
+                        "class Holder:\n loader = 1\n saved = " + comprehension + "\n"
+                    )
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python", result["error"])
+        ordinary = invoke(
+            self.python_request(
+                "values = [value for value in (1, 2)]\n"
+                "class Ordinary:\n def values(self):\n"
+                "  return [value for value in (1, 2)]\n"
+            )
+        )
+        self.assertTrue(ordinary["ok"], ordinary)
+
+    def test_ca08_known_selectors_survive_branch_joins(self):
+        for branch in (
+            "if bool(1):\n loader = importlib",
+            "for item in (1,):\n loader = importlib",
+            "try:\n loader = importlib\nexcept Exception:\n pass",
+        ):
+            for class_scope in (False, True):
+                with self.subTest(branch=branch, class_scope=class_scope):
+                    source = "import importlib\n"
+                    if class_scope:
+                        source += "class Holder:\n" + "\n".join(
+                            " " + line for line in branch.splitlines()
+                        )
+                        source += "\nHolder.loader.import_module('external_plugin')\n"
+                    else:
+                        source += branch + "\nloader.import_module('external_plugin')\n"
+                    result = invoke(self.python_request(source))
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn("Python", result["error"])
+
     def test_ca03_literal_registry_snapshot_restore_retains_opaque_modules(self):
         self.write(self.root / "exercise.py", "VALUE = 1\n")
         source = """import runpy, sys

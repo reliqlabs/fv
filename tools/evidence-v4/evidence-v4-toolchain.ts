@@ -694,8 +694,9 @@ class ModuleSnapshot: pass
 class ModuleSnapshotItems: pass
 OPAQUE_SELECTORS=(SYS_MODULES,MODULE_LOOKUP,OPAQUE_MODULE,MODULE_ITEMS)
 def opaque(value): return isinstance(value,(ModuleSnapshot,ModuleSnapshotItems)) or any(value is selector for selector in OPAQUE_SELECTORS)
+def runtime_selector(value): return opaque(value) or any(value is selector for selector in RUNTIME_SELECTORS)
 def refuse_opaque(value):
- if opaque(value) or any(value is selector for selector in RUNTIME_SELECTORS): raise RuntimeError('unsupported Python runtime-selector escape')
+ if runtime_selector(value): raise RuntimeError('unsupported Python runtime-selector escape')
 class ProjectLocation:
  def __init__(self,file): self.file=file
 class LoadSpec:
@@ -768,6 +769,8 @@ def expression_children(node):
 def expression(node,values,paths,cwd,argv,flags):
  if isinstance(node,ast.Constant): return node.value
  if isinstance(node,ast.Name): return values.get(node.id,UNKNOWN)
+ # shortcut: class comprehensions are unmodeled, add lexical-scope analysis before admitting them.
+ if CLASS_GLOBALS in values and isinstance(node,(ast.ListComp,ast.SetComp,ast.DictComp,ast.GeneratorExp)): raise RuntimeError('unsupported Python class comprehension')
  if isinstance(node,ast.Lambda):
   for default in [*node.args.defaults,*node.args.kw_defaults]:
    if default is not None: refuse_opaque(expression(default,values,paths,cwd,argv,flags))
@@ -784,7 +787,7 @@ def expression(node,values,paths,cwd,argv,flags):
    if isinstance(lookup,ast.Call) and not lookup.keywords and len(lookup.args)==1 and isinstance(lookup.args[0],ast.Name) and lookup.args[0].id==generator.target.id and isinstance(lookup.func,ast.Attribute) and lookup.func.attr=='get' and expression(lookup.func.value,values,paths,cwd,argv,flags) is SYS_MODULES: return ModuleSnapshot()
  if isinstance(node,(ast.List,ast.Tuple)):
   items=[expression(item,values,paths,cwd,argv,flags) for item in node.elts]
-  if any(item is paths or isinstance(item,PathMethod) or opaque(item) or any(item is module for module in RUNTIME_SELECTORS) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
+  if any(item is paths or isinstance(item,PathMethod) or runtime_selector(item) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
   return UNKNOWN if any(item is UNKNOWN for item in items) else items
  if isinstance(node,ast.UnaryOp) and isinstance(node.op,ast.USub):
   operand=expression(node.operand,values,paths,cwd,argv,flags)
@@ -944,7 +947,7 @@ def expression(node,values,paths,cwd,argv,flags):
   if isinstance(node.ops[0],ast.NotEq): return left!=right
  for child in expression_children(node):
   value=expression(child,values,paths,cwd,argv,flags)
-  if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or opaque(value) or any(value is module for module in RUNTIME_SELECTORS): raise RuntimeError('unsupported Python runtime-selector escape')
+  if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or runtime_selector(value): raise RuntimeError('unsupported Python runtime-selector escape')
  return UNKNOWN
 
 def argv_changes(node,scope,paths,cwd,argv,flags):
@@ -1029,13 +1032,13 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
   if isinstance(node,ast.Call): yield node
   for child in ast.iter_child_nodes(node):
    if not isinstance(child,ast.stmt): yield from calls(child)
- def retain_opaque(scope,selected):
+ def retain_selectors(scope,selected):
   for name,value in selected.items():
-   if opaque(value): scope[name]=value
+   if runtime_selector(value): scope[name]=value
  def walk_branch(nodes,scope,search,bindings=None):
   selected=dict(scope)
   if bindings: selected.update(bindings)
-  walk(nodes,selected,list(search),False); retain_opaque(scope,selected)
+  walk(nodes,selected,list(search),False); retain_selectors(scope,selected)
  def walk(nodes,scope,search,allow_path=True):
   for node in nodes:
    try:
@@ -1080,7 +1083,7 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
       elif opaque(value):
        if value is not OPAQUE_MODULE or not isinstance(target,ast.Subscript) or expression(target.value,scope,search,cwd,argv,flags) is not SYS_MODULES: raise RuntimeError('unsupported opaque Python module escape')
        refuse_opaque(expression(target.slice,scope,search,cwd,argv,flags))
-      elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in RUNTIME_SELECTORS):
+      elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or runtime_selector(value):
        if not isinstance(target,ast.Subscript): raise RuntimeError('unsupported Python import-path escape')
        receiver=expression(target.value,scope,search,cwd,argv,flags)
        if receiver is not search and not isinstance(receiver,PathSnapshot): raise RuntimeError('unsupported Python import-path escape')
@@ -1140,7 +1143,7 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
     elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
      for default in [*node.args.defaults,*node.args.kw_defaults]:
       value=expression(default,scope,search,cwd,argv,flags) if default is not None else UNKNOWN
-      if value is search or opaque(value) or any(value is module for module in RUNTIME_SELECTORS): raise RuntimeError('unsupported Python runtime-selector default argument')
+      if value is search or runtime_selector(value): raise RuntimeError('unsupported Python runtime-selector default argument')
      for decorator in node.decorator_list: refuse_opaque(expression(decorator,scope,search,cwd,argv,flags))
      deferred.append((node,scope.get(CLASS_GLOBALS,scope)))
      if CLASS_GLOBALS in scope: scope[node.name]=UNKNOWN
@@ -1180,7 +1183,7 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
       else:
        for handler in node.handlers: walk_branch(handler.body,scope,search)
        walk(node.orelse,body_scope,body_search,False)
-      retain_opaque(scope,body_scope)
+      retain_selectors(scope,body_scope)
       walk(node.finalbody,scope,search,False)
     elif isinstance(node,(ast.For,ast.AsyncFor,ast.While,ast.With,ast.AsyncWith)):
      bindings={}
