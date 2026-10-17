@@ -470,6 +470,32 @@ class ToolchainReview(unittest.TestCase):
                     self.assertFalse(result["ok"], result)
                     self.assertIn("Python", result["error"])
 
+    def test_ca09_unhandled_statement_forms_refuse(self):
+        self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        for source in (
+            "match 1:\n case 1:\n  import external_plugin\n",
+            "import importlib, sys\nloader = sys.modules['importlib']\n"
+            "class Holder:\n loader = 1\n match 1:\n  case 1:\n"
+            "   saved = [loader for item in (1,)]\n",
+            "try:\n raise ExceptionGroup('group', [ValueError()])\n"
+            "except* ValueError:\n import external_plugin\n",
+            "type Loader = object\n",
+        ):
+            with self.subTest(source=source):
+                result = invoke(self.python_request(source))
+                self.assertFalse(result["ok"], result)
+        ordinary = invoke(
+            self.python_request(
+                "state = None\n"
+                "def update():\n global state\n state = 1\n assert state == 1\n"
+                "def outer():\n value = 0\n def inner():\n"
+                "  nonlocal value\n  value = 1\n return inner\n"
+                "for item in (1,):\n if item:\n  continue\n break\n"
+                "try:\n raise ValueError('expected')\nexcept ValueError:\n pass\n"
+            )
+        )
+        self.assertTrue(ordinary["ok"], ordinary)
+
     def test_ca03_literal_registry_snapshot_restore_retains_opaque_modules(self):
         self.write(self.root / "exercise.py", "VALUE = 1\n")
         source = """import runpy, sys
