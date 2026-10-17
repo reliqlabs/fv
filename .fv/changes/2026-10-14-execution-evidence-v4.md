@@ -214,3 +214,12 @@ Root-value CA-16, imported-helper CA-17, transitive split-stdlib CA-21 and gener
 While preparing this worktree, the collection-repair merge was accidentally executed in the installed FV checkout. That checkout was clean and its new merge had only `e36b939` and `437beea` as parents. The merge is preserved as `765025e` on `perf/evidence-collection-recovered-merge`; `git reset --keep` restored the installed checkout to `e36b939`. No Dossier record or lock was modified by that operation. Subsequent integration merges run only in `evidence-final-union`.
 
 The final integration combines the independently reviewed native/coverage and Kani corrections with the hybrid adapter changes. Full frozen-tree regression verification and the residual runtime re-review remain pending. The original Dossier owner remains blocked; this integration does not authorize recovery or promote failed evidence.
+
+## Split-stdlib discovery correction (2026-10-16)
+
+Classification: implementation-only, enforcing the existing input-closure contract. Discovery inventories `sys.stdlib_module_names` under admitted search-path states without importing those modules. Builtin/frozen precedence, positive and negative availability, project shadows and external source requirements enter the retained metadata. Unsupported external packages, namespace/zip/bytecode loaders and native distributions refuse. Native stdlib payloads are included in native discovery.
+
+The initial targeted run failed before namespace analysis because the framework's configured Python library lies outside `stdlib` and `DESTSHARED`. The failure classification is `.fv/classifications/2026-10-16-split-stdlib-runtime.md`. Native inventory now admits only the exact sysconfig-selected runtime library as an additional native input, retaining its content and linkage; ordinary module/package admission is unchanged.
+
+Nine targeted methods passed, including framework-library content binding and external native-distribution refusal. Actual Dossier `python-runtime` capture succeeded at `fv-stdlib-real-selection-g_3jknmo`. This is metadata acceptance, not proof evidence. Post-commit review and frozen integration regressions remain pending; CA-16/17 and the other generic boundaries remain open.
+

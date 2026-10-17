@@ -211,6 +211,13 @@ Refresh installed Python helpers separately; this does not switch the runtime
 extension or rebind old evidence. Legacy migration still preserves historical
 records without converting them to v4.
 
+Python discovery inventories the selected interpreter's stdlib namespace under
+each admitted search-path state, including unavailable names. External source
+modules must be bound; unsupported external packages and native distributions
+refuse. Native inventory binds the exact sysconfig-selected runtime library,
+including framework builds, without treating its surrounding directory as
+standard-library input.
+
 ### Evidence records (`fv-evidence-run/v3`)
 
 The `fv_evidence_run` tool (`tools/evidence-run.ts`) writes one record per claim at

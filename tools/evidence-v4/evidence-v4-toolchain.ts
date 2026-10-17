@@ -631,20 +631,78 @@ def catches_missing_import(handler,scope):
  if handler.type is None: return False
  types=handler.type.elts if isinstance(handler.type,ast.Tuple) else [handler.type]
  return any(isinstance(value,ast.Name) and value.id not in scope and value.id in ('ImportError','ModuleNotFoundError') for value in types)
+stdlib_selections=[]; inventory_seen=set(); project_stdlib_files=set(); stdlib_native=set()
+class ImportPaths(list):
+ def __init__(self,values):
+  super().__init__(values); self.snapshots=[tuple(self)]
+ def insert(self,index,value):
+  super().insert(index,value); self.snapshots.append(tuple(self))
+ def append(self,value):
+  super().append(value); self.snapshots.append(tuple(self))
+ def __setitem__(self,index,value):
+  super().__setitem__(index,value); self.snapshots.append(tuple(self))
+def runtime_spec(name,search):
+ return importlib.machinery.BuiltinImporter.find_spec(name) or importlib.machinery.FrozenImporter.find_spec(name) or importlib.machinery.PathFinder.find_spec(name,search)
+def inventory_stdlib(search,cwd=None,argv=None,flags=None,project=True):
+ search=search if search is not None else sys.path
+ key=(tuple(search),tuple(import_roots),cwd,tuple(argv or ()),tuple(sorted((flags or {}).items())),project)
+ if key in inventory_seen: return
+ inventory_seen.add(key)
+ search=tuple(search)
+ observations=[]
+ # Inventory the whole interpreter-declared stdlib namespace, not just directly imported names.
+ for name in sorted(sys.stdlib_module_names):
+  spec=runtime_spec(name,search)
+  if spec is None and import_roots: spec=runtime_spec(name,list(reversed(import_roots)))
+  if spec is None:
+   observations.append(dict(name=name,origin=None,locations=None)); continue
+  locations=None if spec.submodule_search_locations is None else list(spec.submodule_search_locations)
+  origin=spec.origin
+  observations.append(dict(name=name,origin=origin,realpath=os.path.realpath(origin) if origin not in (None,'built-in','frozen') else None,locations=locations))
+  if origin in ('built-in','frozen'): continue
+  if origin is None or not isinstance(spec.loader,(importlib.machinery.SourceFileLoader,importlib.machinery.SourcelessFileLoader,importlib.machinery.ExtensionFileLoader)):
+   raise RuntimeError('unsupported selected Python stdlib loader: '+name)
+  real=os.path.realpath(origin)
+  if locations is not None and (not standard_input(real) or any(not standard_input(os.path.realpath(p)) for p in locations)):
+   raise RuntimeError('unsupported selected Python stdlib package outside runtime roots: '+name)
+  if standard_input(real): continue
+  if isinstance(spec.loader,importlib.machinery.ExtensionFileLoader):
+   # Linker edges alone do not identify native packages' runtime-loaded code/data.
+   raise RuntimeError('unsupported selected Python stdlib native distribution outside runtime roots: '+name)
+  elif real.endswith('.py'):
+   if within(root,real): project_stdlib_files.add(real)
+   else: external(real)
+   visit(origin,ImportPaths(search),cwd,argv,name,flags,project)
+  else: raise RuntimeError('unsupported selected Python stdlib source: '+real)
+ stdlib_selections.append(dict(paths=search,import_roots=list(import_roots),modules=observations))
+def inventory_native_stdlib():
+ library=sysconfig.get_config_var('LDLIBRARY')
+ library_dir=sysconfig.get_config_var('PYTHONFRAMEWORKPREFIX') if sysconfig.get_config_var('PYTHONFRAMEWORK') else sysconfig.get_config_var('LIBDIR')
+ runtime_library=os.path.realpath(os.path.join(library_dir,library)) if library_dir and library else None
+ visited=set()
+ for base in (stdlib,extensions):
+  for directory,children,files in os.walk(base,followlinks=True):
+   real=os.path.realpath(directory)
+   if real in visited: children[:]=[]; continue
+   visited.add(real); children[:]=sorted(n for n in children if n!='site-packages')
+   for name in sorted(files):
+    if name.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)+('.dylib',)):
+     selected=os.path.realpath(os.path.join(directory,name))
+     if not standard_input(selected) and selected!=runtime_library: raise RuntimeError('unsupported Python stdlib native distribution outside runtime roots: '+selected)
+     stdlib_native.add(selected)
 def resolve(name,search,parents=None):
  parts=name.split('.')
  if parts[0] in ('tkinter','dbm'): raise RuntimeError('unsupported Python split-formula stdlib dependency: '+name)
  if name in ('pickle','_pickle','shelve','pydoc','logging.config'): raise RuntimeError('unsupported dynamic Python loader API: '+name)
- if parts[0] in sys.builtin_module_names: return None
+ preferred=runtime_spec(parts[0],search)
+ if preferred is not None and preferred.origin in ('built-in','frozen'): return None
  selected=None
  for index,part in enumerate(parts):
   selected=importlib.machinery.PathFinder.find_spec('.'.join(parts[:index+1]),search)
   if selected is None and index==0 and import_roots: selected=importlib.machinery.PathFinder.find_spec(parts[0],list(reversed(import_roots)))
   if selected is None:
-   if parts[0] in sys.stdlib_module_names: return None
    if index==0: raise MissingImport(name)
    raise RuntimeError('unknown Python import dependency: '+name)
-  # shortcut: CA21 transitive split-stdlib closure remains open for fresh provenance and reuse; bind split distributions before qualification.
   if index==0 and parts[0] in sys.stdlib_module_names and selected.origin and standard_input(os.path.realpath(selected.origin)): return None
   if parents is not None: parents.append(('.'.join(parts[:index+1]),selected))
   search=selected.submodule_search_locations
@@ -652,6 +710,7 @@ def resolve(name,search,parents=None):
  return selected
 
 def dependency(name,search,cwd,argv,flags,project):
+ inventory_stdlib(search,cwd,argv,flags,project)
  parents=[]; spec=resolve(name,search,parents)
  for module,selected in parents:
   if selected.origin not in (None,'built-in','frozen'):
@@ -974,7 +1033,7 @@ def path_changes(node,scope,paths,cwd,argv,flags):
 
 
 def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__main__',flags=None,project=True):
- paths=paths if paths is not None else [os.path.abspath(p or os.getcwd()) for p in sys.path]
+ paths=paths if paths is not None else ImportPaths(os.path.abspath(p or os.getcwd()) for p in sys.path)
  cwd=cwd or os.getcwd(); argv=argv if argv is not None else list(sys.argv)
  flags=flags or dict(isolated=bool(sys.flags.isolated),safe_path=bool(getattr(sys.flags,'safe_path',False)))
  values={'__name__':name,'__import__':BUILTIN_IMPORT,'__builtins__':BUILTINS,'exec':FORBIDDEN,'eval':FORBIDDEN,'compile':FORBIDDEN,'getattr':REFLECTION,'setattr':REFLECTION,'delattr':REFLECTION,'vars':REFLECTION}
@@ -1217,6 +1276,8 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
    function_paths=list(paths)
    walk(function.body,selected,function_paths,False)
    if function_paths!=paths: raise RuntimeError('unsupported deferred Python import-path mutation')
+ if isinstance(paths,ImportPaths):
+  for snapshot in paths.snapshots: inventory_stdlib(snapshot,cwd,argv,flags,project)
 
 source_inputs={}
 def visit(file,paths=None,cwd=None,argv=None,name='__main__',flags=None,project=True):
@@ -1244,6 +1305,8 @@ def visit(file,paths=None,cwd=None,argv=None,name='__main__',flags=None,project=
   try: scan(data.decode('utf-8'),os.path.dirname(real),paths,cwd,argv,real,name,flags,project)
   finally: active.remove((real,name))
 
+inventory_native_stdlib()
+inventory_stdlib(list(sys.path))
 for module in list(sys.modules.values()):
  file=getattr(module,'__file__',None)
  if file: external(file)
@@ -1256,7 +1319,7 @@ for p in startup:
    if line.startswith(('import ','import'+chr(9))): scan(line,os.path.dirname(p),project=False)
 requirements=[dict(ids=json.loads(sys.argv[3]),files=sorted(required),paths=list(sys.path),inputs=sorted(source_inputs.items()))]
 for request in requests:
- required=set(); seen=set(); source_inputs={}; startup_search=list(request['startup_paths'])
+ required=set(); seen=set(); source_inputs={}; inventory_seen=set(); startup_search=list(request['startup_paths'])
  if not request['flags'].get('no_site',False):
   hooks=['sitecustomize']+([] if request['flags'].get('no_user_site',False) else ['usercustomize'])
   for name in hooks:
@@ -1265,7 +1328,8 @@ for request in requests:
     external(spec.origin)
     # Bootstrap hook path setup is already reflected in the interpreter query.
     visit(spec.origin,startup_search,request['cwd'],request['argv'],name,request['flags'],project=os.path.realpath(spec.origin) not in startup_hooks)
- paths=([] if request['flags']['safe_path'] else [os.path.dirname(os.path.realpath(request['file'])) if 'file' in request else request['cwd']])+startup_search
+ paths=ImportPaths(([] if request['flags']['safe_path'] else [os.path.dirname(os.path.realpath(request['file'])) if 'file' in request else request['cwd']])+startup_search)
+ inventory_stdlib(paths,request['cwd'],request['argv'],request['flags'])
  if 'file' in request: visit(request['file'],paths,request['cwd'],request['argv'],flags=request['flags'])
  elif 'code' in request: scan(request['code'],request['cwd'],paths,request['cwd'],request['argv'],flags=request['flags'])
  else:
@@ -1279,7 +1343,7 @@ for request in requests:
    elif spec.origin not in (None,'built-in','frozen'):
     external(spec.origin); visit(spec.origin,paths,request['cwd'],[spec.origin]+request['argv'][1:],'__main__',request['flags'])
  requirements.append(dict(ids=request['ids'],files=sorted(required),paths=paths,inputs=sorted(source_inputs.items())))
-print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,extensions=extensions,startup=sorted(startup),requirements=requirements),sort_keys=True))
+print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,extensions=extensions,startup=sorted(startup),requirements=requirements,stdlib_selections=stdlib_selections,stdlib_native=sorted(stdlib_native),project_stdlib_files=sorted(project_stdlib_files)),sort_keys=True))
 `;
 	const result = await context.probe([
 		selected.invoked,
@@ -1296,6 +1360,8 @@ print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,
 		stdlib: string;
 		extensions: string;
 		startup: string[];
+		stdlib_native: string[];
+		project_stdlib_files: string[];
 		requirements: { ids: string[]; files: string[] }[];
 	}>(result);
 	if (
@@ -1303,6 +1369,10 @@ print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,
 		!data.stdlib ||
 		!data.extensions ||
 		!Array.isArray(data.startup) ||
+		!Array.isArray(data.stdlib_native) ||
+		data.stdlib_native.some((file) => typeof file !== "string") ||
+		!Array.isArray(data.project_stdlib_files) ||
+		data.project_stdlib_files.some((file) => typeof file !== "string") ||
 		!Array.isArray(data.requirements) ||
 		data.requirements.some(
 			(value) =>
@@ -1321,8 +1391,13 @@ print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,
 	for (const [index, file] of data.startup.entries())
 		roots.push({ label: `startup/${index}/${path.basename(file)}`, path: file });
 	const native = await context.native([
-		...(await nativePayloads(roots)),
-		...data.requirements.flatMap((value) => value.files.filter((file) => /\.(?:so(?:\.\d+)*|dylib|node)$/u.test(file))),
+		...new Set([
+			...(await nativePayloads(roots)),
+			...data.stdlib_native,
+			...data.requirements.flatMap((value) =>
+				value.files.filter((file) => /\.(?:so(?:\.\d+)*|dylib|node)$/u.test(file)),
+			),
+		]),
 	]);
 	roots.push(...native.roots.map((root) => ({ ...root, label: `native/${root.label}` })));
 	return {
@@ -1330,6 +1405,7 @@ print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,
 		discovery: [...new Set([...pathDiscovery, result.identity, ...(native.discovery ?? [])])],
 		sdk: native.sdk,
 		fileRequirements: data.requirements,
+		sourceRequirements: { directories: [], files: data.project_stdlib_files },
 	};
 }
 

@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -85,7 +87,7 @@ try{
   }else{
     const result=await (input.op==='node'?discoverNodeAdapter(context):input.op==='native'?discoverNativeAdapter(context):discoverPythonAdapter(context));
     const files=input.hash?await hashToolRoots(result.roots):[];
-    process.stdout.write(JSON.stringify({ok:true,requirements:result.fileRequirements??[],roots:result.roots,files,digest:D('test-tool-files',files)}));
+    process.stdout.write(JSON.stringify({ok:true,requirements:result.fileRequirements??[],sourceRequirements:result.sourceRequirements,discovery:result.discovery??[],roots:result.roots,files,digest:D('test-tool-files',files)}));
   }
 }catch(error){process.stdout.write(JSON.stringify({ok:false,error:error instanceof Error?error.message:String(error)}));}
 finally{if(input.real_native)await session.release();}
@@ -535,6 +537,206 @@ load_exercise()
                 result = invoke(self.python_request("import " + module + "\n"))
                 self.assertFalse(result["ok"], result)
                 self.assertIn("split-formula", result["error"])
+
+    def test_ca21_transitive_stdlib_inventory_binds_external_parts_without_loading(
+        self,
+    ):
+        split = self.write(
+            self.external / "_tkinter.py",
+            "raise AssertionError('stdlib discovery must not execute this module')\n",
+        )
+        for source in ("import _tkinter\n", "import turtle\n"):
+            with self.subTest(source=source):
+                result = invoke(self.python_request(source))
+                self.assertTrue(result["ok"], result)
+                self.assertIn(
+                    str(split),
+                    {
+                        file
+                        for requirement in result["requirements"]
+                        for file in requirement["files"]
+                    },
+                )
+        undeclared = self.capture_python("import turtle\n")
+        self.assertFalse(undeclared["ok"], undeclared)
+        self.assertIn("explicit installed tool declaration", undeclared["error"])
+        self.assertIn("_tkinter.py", undeclared["error"])
+        request = self.python_request("import turtle\n")
+        runtime = declaration(
+            "python", "python-runtime", [self.python], requires=["split"]
+        )
+        request.update(
+            op="capture",
+            ids=["python"],
+            policy={
+                "toolchains": [
+                    runtime,
+                    {
+                        "id": "split",
+                        "kind": "file",
+                        "locator": {"mode": "path", "value": str(split)},
+                        "requires": [],
+                        "version_command": None,
+                        "version_cwd": None,
+                        "accept": {"sha256": [], "version_contains": []},
+                    },
+                ],
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {
+                    "command": request["commands"][0]["subject"],
+                    "cwd": ".",
+                    "toolchain": ["python"],
+                },
+            },
+        )
+        declared = invoke(request)
+        self.assertTrue(declared["ok"], declared)
+
+    def test_ca21_transitive_external_stdlib_packages_refuse(self):
+        self.write(self.external / "tkinter/__init__.py", "VALUE = 1\n")
+        result = invoke(self.python_request("import turtle\n"))
+        self.assertFalse(result["ok"], result)
+        self.assertIn("stdlib package outside runtime roots: tkinter", result["error"])
+
+    def test_ca21_absent_stdlib_availability_is_revalidated(self):
+        self.assertNotEqual(sys.platform, "win32")
+        request = self.python_request("import argparse, json, pathlib\n")
+        request.update(
+            op="optional-install",
+            ids=["python"],
+            install_file=str(self.external / "winreg.py"),
+            policy={
+                "toolchains": [declaration("python", "python-runtime", [self.python])],
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {
+                    "command": request["commands"][0]["subject"],
+                    "cwd": ".",
+                    "toolchain": ["python"],
+                },
+            },
+        )
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["accepted"], result)
+        self.assertIn("changed: python", result["error"])
+
+    def test_ca21_project_stdlib_shadows_require_sources_and_path_history(self):
+        shadow = self.write(self.root / "plugins/string.py", "import external_plugin\n")
+        plugin = self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        result = invoke(
+            self.python_request(
+                "import sys\nfrom pathlib import Path\n"
+                "previous = sys.path.copy()\n"
+                "sys.path.insert(0, str(Path(__file__).parent / 'plugins'))\n"
+                "VALUE = 1\n"
+                "sys.path[:] = previous\n"
+            )
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertIn(str(shadow), result["sourceRequirements"]["files"])
+        required = {
+            file
+            for requirement in result["requirements"]
+            for file in requirement["files"]
+        }
+        self.assertIn(str(plugin), required)
+        self.assertNotIn(str(shadow), required)
+
+    def test_ca21_ordinary_dossier_setup_and_builtin_precedence_preserved(self):
+        shadow = self.write(
+            self.root / "sys.py",
+            "raise AssertionError('builtin precedence must ignore this file')\n",
+        )
+        self.write(self.external / "unselected_package/__init__.py", "import missing\n")
+        request = self.python_request(
+            "import argparse, hashlib, importlib.util, json, os, pathlib, re, subprocess, sys\n"
+            "ROOT = pathlib.Path(__file__).resolve().parents[0]\n"
+        )
+        isolated = dict(request["commands"][0])
+        isolated["subject"] = [self.python, "-I", "-B", isolated["subject"][-1]]
+        request["commands"].append(isolated)
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn(str(shadow), result["sourceRequirements"]["files"])
+        self.assertFalse(
+            any(
+                "unselected_package" in file
+                for requirement in result["requirements"]
+                for file in requirement["files"]
+            )
+        )
+
+    @unittest.skipUnless(
+        sysconfig.get_config_var("PYTHONFRAMEWORK"),
+        "selected interpreter is not a framework build",
+    )
+    def test_ca21_framework_runtime_library_is_content_bound(self):
+        library = (
+            Path(sysconfig.get_config_var("PYTHONFRAMEWORKPREFIX"))
+            / sysconfig.get_config_var("LDLIBRARY")
+        ).resolve()
+        result = self.capture_python("import json\n")
+        self.assertTrue(result["ok"], result)
+        expected = "sha256:" + hashlib.sha256(library.read_bytes()).hexdigest()
+        self.assertIn(
+            expected,
+            {
+                entry.get("hash")
+                for identity in result["identities"]
+                for entry in identity["files"]
+            },
+        )
+
+    @unittest.skipUnless(
+        importlib.machinery.FrozenImporter.find_spec("os") is not None,
+        "selected interpreter does not freeze os",
+    )
+    def test_ca21_frozen_precedence_ignores_project_shadow(self):
+        shadow = self.write(self.root / "os.py", "import absent_frozen_shadow_plugin\n")
+        result = invoke(self.python_request("import os\n"))
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn(str(shadow), result["sourceRequirements"]["files"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O linkage requires Darwin")
+    def test_ca21_transitive_native_stdlib_distribution_refuses_even_with_linkage(self):
+        library_source = self.write(
+            self.root / "library.c", "int fixture(void) { return 0; }\n"
+        )
+        library = self.external / "libstdlib-fixture.dylib"
+        extension_source = self.write(
+            self.root / "extension.c",
+            "int fixture(void); int stdlib_fixture(void) { return fixture(); }\n",
+        )
+        extension = self.external / "_tkinter.so"
+        for command in (
+            [
+                "/usr/bin/cc",
+                "-dynamiclib",
+                "-install_name",
+                str(library),
+                str(library_source),
+                "-o",
+                str(library),
+            ],
+            [
+                "/usr/bin/cc",
+                "-dynamiclib",
+                str(extension_source),
+                str(library),
+                "-o",
+                str(extension),
+            ],
+        ):
+            subprocess.run(command, capture_output=True, text=True, check=True)
+        request = self.python_request("import turtle\n")
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn(
+            "stdlib native distribution outside runtime roots: _tkinter",
+            result["error"],
+        )
 
     def test_ca21_reviewed_startup_hook_binds_shadowed_imports(self):
         hook = self.write(
