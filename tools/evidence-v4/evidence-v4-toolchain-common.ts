@@ -621,3 +621,52 @@ export async function packageRoots(context: AdapterContext, entryRoots: readonly
 	for (const root of entryRoots) await visit(root);
 	return roots.sort((a, b) => utf8Compare(a.label, b.label));
 }
+
+export async function linkedPackageRoots(context: AdapterContext, root: ToolRoot, label: string): Promise<ToolRoot[]> {
+	if (!root.linkBoundary) throw new Error("Missing linked package root boundary");
+	const boundary = await canonicalToolPath(root.linkBoundary),
+		roots: ToolRoot[] = [],
+		targets = new Set<string>(),
+		directories = new Set<string>(),
+		packages = new Set<string>();
+	const select = async (real: string): Promise<void> => {
+		if (!inside(boundary, real)) throw new Error("Tool symlink escapes root boundary: " + real);
+		if (real === boundary) throw new Error("Unsupported whole pnpm store selection");
+		if (targets.has(real)) return;
+		targets.add(real);
+		roots.push({
+			label: label + "/" + path.relative(boundary, real).split(path.sep).join("/"),
+			path: real,
+			linkBoundary: boundary,
+		});
+		if ((await fs.stat(real)).isDirectory() && !packages.has(real)) {
+			const manifest = await fs.stat(path.join(real, "package.json")).catch((error) => {
+				if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+				throw error;
+			});
+			if (manifest) {
+				const dependencies = await packageRoots(context, [real]);
+				for (const dependency of dependencies) packages.add(dependency.path);
+				for (const dependency of dependencies) await select(dependency.path);
+			}
+		}
+		await walk(real);
+	};
+	const walk = async (file: string, relative = ""): Promise<void> => {
+		if (root.exclude?.some((ex) => relative === ex || relative.startsWith(ex.replace(/\/$/u, "") + "/"))) return;
+		const stat = await fs.lstat(file);
+		if (stat.isSymbolicLink()) {
+			await select(await canonicalToolPath(file));
+		} else if (stat.isDirectory()) {
+			if (directories.has(file)) return;
+			directories.add(file);
+			for (const name of (await fs.readdir(file)).sort(utf8Compare))
+				await walk(path.join(file, name), relative ? relative + "/" + name : name);
+		} else if (!stat.isFile()) throw new Error("Unsupported tool entry: " + file);
+	};
+	const selected = await canonicalToolPath(root.path);
+	if (!inside(boundary, selected)) throw new Error("Tool symlink escapes root boundary: " + selected);
+	if (selected === boundary) throw new Error("Unsupported whole pnpm store selection");
+	await walk(selected);
+	return roots.sort((a, b) => utf8Compare(a.label, b.label));
+}

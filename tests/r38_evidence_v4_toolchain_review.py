@@ -376,6 +376,104 @@ class ToolchainReview(unittest.TestCase):
         )
         self.assertTrue(result["ok"], result)
 
+    def test_ca03_opaque_module_container_default_and_escape_paths_refuse(self):
+        for statement in (
+            "holder = {'loader': sys.modules['importlib']}\nholder['loader'].import_module('external_plugin')",
+            "holder = {'registry': sys.modules}",
+            "holder = {'lookup': sys.modules.get}",
+            "holder = [sys.modules['importlib']]",
+            "holder = (sys.modules.get,)",
+            "holder = {sys.modules['importlib']}",
+            "holder = [loader for loader in sys.modules]",
+            "def load(loader=sys.modules['importlib']):\n loader.import_module('external_plugin')",
+            "def load(*, loader=sys.modules.get):\n pass",
+            "load = lambda loader=sys.modules['importlib']: loader",
+            "holder = {}\nholder['loader'] = sys.modules['importlib']",
+            "holder.loader = sys.modules['importlib']",
+            "class Holder:\n loader = sys.modules['importlib']",
+            "def load():\n return sys.modules['importlib']",
+            "holder = sys.modules['importlib'] or missing",
+            "if condition:\n loader = sys.modules['importlib']\nloader.import_module('external_plugin')",
+            "for item in [1]:\n loader = sys.modules['importlib']\nloader.import_module('external_plugin')",
+            "try:\n loader = sys.modules['importlib']\nexcept Exception:\n pass\nloader.import_module('external_plugin')",
+        ):
+            with self.subTest(statement=statement):
+                result = invoke(
+                    self.python_request("import importlib, sys\n" + statement + "\n")
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python", result["error"])
+        result = invoke(
+            self.python_request(
+                "import sys\nprevious = sys.modules.get('fixture')\n"
+                "if previous is None:\n sys.modules.pop('fixture', None)\n"
+                "else:\n sys.modules['fixture'] = previous\n"
+                "registry = sys.modules\nlookup = registry.get\n"
+                "previous = lookup('fixture', previous)\n"
+                "registry['fixture'] = previous\n"
+            )
+        )
+        self.assertTrue(result["ok"], result)
+
+    def test_ca03_literal_registry_snapshot_restore_retains_opaque_modules(self):
+        self.write(self.root / "exercise.py", "VALUE = 1\n")
+        source = """import runpy, sys
+from pathlib import Path
+
+def load_exercise():
+    previous_path = sys.path[:]
+    previous_modules = {name: sys.modules.get(name) for name in ('provider', 'wire')}
+    try:
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        return runpy.run_path(str(Path(__file__).with_name('exercise.py')))
+    finally:
+        sys.path[:] = previous_path
+        for name, module in previous_modules.items():
+            sys.modules.pop(name, None)
+            if module is not None:
+                sys.modules[name] = module
+
+load_exercise()
+"""
+        result = invoke(self.python_request(source))
+        self.assertTrue(result["ok"], result)
+        for selected_names in ("('alpha',)", "['first', 'second', 'third']"):
+            with self.subTest(selected_names=selected_names):
+                result = invoke(
+                    self.python_request(
+                        source.replace("('provider', 'wire')", selected_names)
+                    )
+                )
+                self.assertTrue(result["ok"], result)
+        for escaped in (
+            ("import importlib\n" + source)
+            .replace("('provider', 'wire')", "('importlib', 'wire')")
+            .replace(
+                "    try:\n",
+                "    previous_modules['importlib'].import_module('external_plugin')\n"
+                "    try:\n",
+                1,
+            ),
+            source.replace(
+                "sys.modules[name] = module",
+                "module.import_module('external_plugin')",
+            ),
+            source.replace(
+                "    try:\n", "    holder = [previous_modules]\n    try:\n", 1
+            ),
+            source.replace(
+                "    try:\n",
+                "    def load(saved=previous_modules):\n        pass\n    try:\n",
+                1,
+            ),
+        ):
+            with self.subTest(escaped=escaped):
+                result = invoke(self.python_request(escaped))
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python", result["error"])
+
     def test_ca21_split_formula_stdlib_imports_refuse(self):
         for module in ("tkinter", "tkinter.ttk", "dbm", "dbm.gnu"):
             with self.subTest(module=module):
@@ -1071,6 +1169,37 @@ else if(args[0]==='exec'){
         self.assertIn("pnpm-injected Node runtime selectors", result["error"])
         self.assertFalse((self.base / "unbound-preload-executed").exists())
 
+    def test_ca05_preferred_node_wrapper_preloads_refuse_before_execution(self):
+        request = self.node_request()
+        marker = self.base / "unbound-preferred-preload-executed"
+        hook = self.write(
+            self.external / "preferred-preload.cjs",
+            "require('node:fs').writeFileSync("
+            + json.dumps(str(marker))
+            + ", 'executed');\n",
+        )
+        for source in (
+            "#!/bin/sh\nexec "
+            + shlex.quote(self.node)
+            + " --require "
+            + shlex.quote(str(hook))
+            + ' "$@"\n',
+            "#!/bin/sh\nexport NODE_OPTIONS="
+            + shlex.quote("--require " + str(hook))
+            + "\nexec "
+            + shlex.quote(self.node)
+            + ' "$@"\n',
+            "#!/bin/sh\nUNMODELED=1\nexec " + shlex.quote(self.node) + ' "$@"\n',
+        ):
+            with self.subTest(source=source):
+                self.preferred_node.write_text(source, encoding="utf-8")
+                result = invoke(request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn(
+                    "Unsupported preferred Node runtime wrapper", result["error"]
+                )
+                self.assertFalse(marker.exists())
+
     def test_pnpm_shim_mutation_invalidates_or_rejects(self):
         request = self.node_request()
         before = invoke(request)
@@ -1108,9 +1237,31 @@ else if(args[0]==='exec'){
         dependency = store / "esbuild@1.0.0/node_modules/esbuild"
         self.write(
             dependency / "package.json",
-            json.dumps({"name": "esbuild", "version": "1.0.0"}),
+            json.dumps(
+                {
+                    "name": "esbuild",
+                    "version": "1.0.0",
+                    "dependencies": {"backend": "1.0.0"},
+                }
+            ),
         )
         implementation = self.write(dependency / "index.js", "module.exports=1;\n")
+        backend = store / "backend@1.0.0/node_modules/backend"
+        self.write(
+            backend / "package.json",
+            json.dumps({"name": "backend", "version": "1.0.0"}),
+        )
+        backend_implementation = self.write(backend / "index.js", "module.exports=1;\n")
+        (dependency.parent / "backend").symlink_to(
+            os.path.relpath(backend, dependency.parent), target_is_directory=True
+        )
+        unrelated = self.write(
+            store / "unrelated@1.0.0/node_modules/unrelated/index.js",
+            "module.exports=1;\n",
+        )
+        (unrelated.parent / "outside").symlink_to(
+            self.external, target_is_directory=True
+        )
         hoisted = store / "node_modules"
         hoisted.mkdir()
         for link in (modules / "esbuild", hoisted / "esbuild"):
@@ -1134,10 +1285,21 @@ else if(args[0]==='exec'){
         self.assertTrue(
             link["resolved_path"].startswith("execution/node-store/0/"), link
         )
+        self.assertFalse(
+            any("unrelated@" in file["path"] for file in before["files"]), before
+        )
+        unrelated.write_text("module.exports=2;\n", encoding="utf-8")
+        retained = invoke(request)
+        self.assertTrue(retained["ok"], retained)
+        self.assertEqual(before["digest"], retained["digest"])
+        backend_implementation.write_text("module.exports=2;\n", encoding="utf-8")
+        dependency_changed = invoke(request)
+        self.assertTrue(dependency_changed["ok"], dependency_changed)
+        self.assertNotEqual(retained["digest"], dependency_changed["digest"])
         implementation.write_text("module.exports=2;\n", encoding="utf-8")
         changed = invoke(request)
         self.assertTrue(changed["ok"], changed)
-        self.assertNotEqual(before["digest"], changed["digest"])
+        self.assertNotEqual(dependency_changed["digest"], changed["digest"])
         (modules / "esbuild").unlink()
         (modules / "esbuild").symlink_to(
             os.path.relpath(self.injected, modules), target_is_directory=True

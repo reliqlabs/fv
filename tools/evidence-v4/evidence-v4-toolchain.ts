@@ -21,6 +21,7 @@ import {
 	canonicalToolPath,
 	isRustupProxy,
 	inside,
+	linkedPackageRoots,
 	packageRoots,
 	probeJSON,
 	probeText,
@@ -643,7 +644,7 @@ def resolve(name,search,parents=None):
    if parts[0] in sys.stdlib_module_names: return None
    if index==0: raise MissingImport(name)
    raise RuntimeError('unknown Python import dependency: '+name)
-  # shortcut: transitive stdlib imports are unscanned; bind split-extension distributions before claiming startup closure.
+  # shortcut: CA21 transitive split-stdlib closure remains open for fresh provenance and reuse; bind split distributions before qualification.
   if index==0 and parts[0] in sys.stdlib_module_names and selected.origin and standard_input(os.path.realpath(selected.origin)): return None
   if parents is not None: parents.append(('.'.join(parts[:index+1]),selected))
   search=selected.submodule_search_locations
@@ -686,7 +687,13 @@ class PathSnapshot(list):
  __slots__=()
 
 SYS=object(); PATHLIB=object(); OS=object(); OSPATH=object(); PATH_FACTORY=object(); IMPORTLIB=object(); IMPORT_MODULE=object(); BUILTIN_IMPORT=object(); BUILTINS=object(); IMPORT_UTIL=object(); SPEC_FACTORY=object(); MODULE_FACTORY=object(); PROJECT_INPUT=object(); FORBIDDEN=object(); REFLECTION=object(); RUNPY=object(); RUN_PATH=object()
-SYS_MODULES=object(); MODULE_LOOKUP=object(); OPAQUE_MODULE=object(); LOGGING=object()
+SYS_MODULES=object(); MODULE_LOOKUP=object(); OPAQUE_MODULE=object(); MODULE_ITEMS=object(); LOGGING=object()
+class ModuleSnapshot: pass
+class ModuleSnapshotItems: pass
+OPAQUE_SELECTORS=(SYS_MODULES,MODULE_LOOKUP,OPAQUE_MODULE,MODULE_ITEMS)
+def opaque(value): return isinstance(value,(ModuleSnapshot,ModuleSnapshotItems)) or any(value is selector for selector in OPAQUE_SELECTORS)
+def refuse_opaque(value):
+ if opaque(value): raise RuntimeError('unsupported opaque Python module escape')
 class ProjectLocation:
  def __init__(self,file): self.file=file
 class LoadSpec:
@@ -751,25 +758,40 @@ def loader_location(node,values,paths,cwd,argv,flags):
  if isinstance(node,ast.Subscript) and isinstance(node.value,ast.Attribute) and node.value.attr=='argv' and expression(node.value.value,values,paths,cwd,argv,flags) is SYS and isinstance(node.slice,ast.Constant) and node.slice.value==0 and '__loader_argv__' in values: return values['__loader_argv__']
  raise RuntimeError('unresolved Python loader location')
 
+def expression_children(node):
+ for child in ast.iter_child_nodes(node):
+  if isinstance(child,ast.expr): yield child
+  else: yield from expression_children(child)
+
 def expression(node,values,paths,cwd,argv,flags):
  if isinstance(node,ast.Constant): return node.value
  if isinstance(node,ast.Name): return values.get(node.id,UNKNOWN)
+ # Bound only literal-name registry snapshots; their values stay opaque through restoration.
+ if isinstance(node,ast.DictComp) and len(node.generators)==1:
+  generator=node.generators[0]; lookup=node.value
+  if not generator.is_async and not generator.ifs and isinstance(generator.target,ast.Name) and isinstance(node.key,ast.Name) and node.key.id==generator.target.id and isinstance(generator.iter,(ast.Tuple,ast.List)) and all(isinstance(item,ast.Constant) and isinstance(item.value,str) for item in generator.iter.elts):
+   if isinstance(lookup,ast.Call) and not lookup.keywords and len(lookup.args)==1 and isinstance(lookup.args[0],ast.Name) and lookup.args[0].id==generator.target.id and isinstance(lookup.func,ast.Attribute) and lookup.func.attr=='get' and expression(lookup.func.value,values,paths,cwd,argv,flags) is SYS_MODULES: return ModuleSnapshot()
  if isinstance(node,(ast.List,ast.Tuple)):
   items=[expression(item,values,paths,cwd,argv,flags) for item in node.elts]
-  if any(item is paths or isinstance(item,PathMethod) or any(item is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
+  if any(item is paths or isinstance(item,PathMethod) or opaque(item) or any(item is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
   return UNKNOWN if any(item is UNKNOWN for item in items) else items
  if isinstance(node,ast.UnaryOp) and isinstance(node.op,ast.USub):
   operand=expression(node.operand,values,paths,cwd,argv,flags)
+  refuse_opaque(operand)
   return -operand if isinstance(operand,int) and not isinstance(operand,bool) else UNKNOWN
  if isinstance(node,ast.BinOp):
   left=expression(node.left,values,paths,cwd,argv,flags); right=expression(node.right,values,paths,cwd,argv,flags)
+  refuse_opaque(left); refuse_opaque(right)
   if isinstance(node.op,ast.Div) and isinstance(left,pathlib.Path) and isinstance(right,(str,pathlib.Path)): return left/right
   if isinstance(node.op,ast.Add) and isinstance(left,str) and isinstance(right,str): return left+right
   return UNKNOWN
  if isinstance(node,ast.Attribute):
   base=expression(node.value,values,paths,cwd,argv,flags)
   if base is LOGGING: return module_value(base,node.attr,paths,argv,flags)
-  if base is OPAQUE_MODULE: raise RuntimeError('unsupported opaque Python module access')
+  if isinstance(base,ModuleSnapshot):
+   if node.attr!='items': raise RuntimeError('unsupported Python module snapshot API: '+node.attr)
+   return MODULE_ITEMS
+  if base is OPAQUE_MODULE or base is MODULE_LOOKUP or base is MODULE_ITEMS or isinstance(base,ModuleSnapshotItems): raise RuntimeError('unsupported opaque Python module access')
   if base is SYS_MODULES:
    if node.attr not in ('get','pop'): raise RuntimeError('unsupported Python module registry API: '+node.attr)
    return MODULE_LOOKUP
@@ -789,12 +811,15 @@ def expression(node,values,paths,cwd,argv,flags):
   return UNKNOWN
  if isinstance(node,ast.Slice):
   bounds=[None if item is None else expression(item,values,paths,cwd,argv,flags) for item in (node.lower,node.upper,node.step)]
+  for bound in bounds: refuse_opaque(bound)
   if any(item is UNKNOWN or (item is not None and (not isinstance(item,int) or isinstance(item,bool))) for item in bounds) or bounds[2]==0: return UNKNOWN
   return slice(*bounds)
  if isinstance(node,ast.Subscript):
   base=expression(node.value,values,paths,cwd,argv,flags); index=expression(node.slice,values,paths,cwd,argv,flags)
+  refuse_opaque(index)
   if base is SYS_MODULES: return OPAQUE_MODULE
-  if base is OPAQUE_MODULE: raise RuntimeError('unsupported opaque Python module access')
+  if isinstance(base,ModuleSnapshot): return OPAQUE_MODULE
+  if base is OPAQUE_MODULE or base is MODULE_LOOKUP or base is MODULE_ITEMS or isinstance(base,ModuleSnapshotItems): raise RuntimeError('unsupported opaque Python module access')
   if base is UNKNOWN or index is UNKNOWN: return UNKNOWN
   if base is BUILTINS: return module_value(base,index,paths,argv,flags)
   try:
@@ -803,7 +828,10 @@ def expression(node,values,paths,cwd,argv,flags):
   except (IndexError,KeyError,TypeError): return UNKNOWN
  if isinstance(node,ast.Call):
   target=expression(node.func,values,paths,cwd,argv,flags)
-  if target is OPAQUE_MODULE: raise RuntimeError('unsupported opaque Python module call')
+  if target is OPAQUE_MODULE or isinstance(target,(ModuleSnapshot,ModuleSnapshotItems)): raise RuntimeError('unsupported opaque Python module call')
+  if target is MODULE_ITEMS:
+   if not isinstance(node.func,ast.Attribute) or node.func.attr!='items' or not isinstance(expression(node.func.value,values,paths,cwd,argv,flags),ModuleSnapshot) or node.args or node.keywords: raise RuntimeError('unsupported Python module snapshot method escape')
+   return ModuleSnapshotItems()
   if target is MODULE_LOOKUP:
    for argument in [*node.args,*[keyword.value for keyword in node.keywords]]: expression(argument,values,paths,cwd,argv,flags)
    return OPAQUE_MODULE
@@ -868,7 +896,7 @@ def expression(node,values,paths,cwd,argv,flags):
   keywords={keyword.arg:expression(keyword.value,values,paths,cwd,argv,flags) for keyword in node.keywords}
   if target is REFLECTION and args and (any(args[0] is module for module in (SYS,SYS_MODULES,OPAQUE_MODULE,IMPORTLIB,IMPORT_UTIL,BUILTINS,FORBIDDEN,paths)) or isinstance(args[0],(PathSnapshot,LoadSpec))): raise RuntimeError('unsupported reflective Python runtime selector')
   if any(any(arg is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for arg in [*args,*keywords.values()]): raise RuntimeError('unsupported Python runtime-selector escape')
-  if any(arg is SYS_MODULES or arg is MODULE_LOOKUP or arg is OPAQUE_MODULE for arg in [*args,*keywords.values()]): raise RuntimeError('unsupported opaque Python module escape')
+  for arg in [*args,*keywords.values()]: refuse_opaque(arg)
   if any(arg is paths or isinstance(arg,(PathSnapshot,PathMethod)) for arg in args) and not (isinstance(node.func,ast.Name) and node.func.id in ('list','len','tuple') and node.func.id not in values): raise RuntimeError('unsupported Python import-path escape')
   if any(arg is UNKNOWN for arg in args) or any(value is UNKNOWN for value in keywords.values()): return UNKNOWN
   target=expression(node.func,values,paths,cwd,argv,flags)
@@ -898,13 +926,15 @@ def expression(node,values,paths,cwd,argv,flags):
   return UNKNOWN
  if isinstance(node,ast.Compare) and len(node.ops)==1:
   left=expression(node.left,values,paths,cwd,argv,flags); right=expression(node.comparators[0],values,paths,cwd,argv,flags)
+  if opaque(left) or opaque(right):
+   if (left is OPAQUE_MODULE and right is None or right is OPAQUE_MODULE and left is None) and isinstance(node.ops[0],(ast.Eq,ast.NotEq,ast.Is,ast.IsNot)): return UNKNOWN
+   raise RuntimeError('unsupported opaque Python module escape')
   if left is UNKNOWN or right is UNKNOWN: return UNKNOWN
   if isinstance(node.ops[0],ast.Eq): return left==right
   if isinstance(node.ops[0],ast.NotEq): return left!=right
- for child in ast.iter_child_nodes(node):
-  if isinstance(child,ast.expr):
-   value=expression(child,values,paths,cwd,argv,flags)
-   if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector escape')
+ for child in expression_children(node):
+  value=expression(child,values,paths,cwd,argv,flags)
+  if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or opaque(value) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector escape')
  return UNKNOWN
 
 def argv_changes(node,scope,paths,cwd,argv,flags):
@@ -940,7 +970,7 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
  parents={child:parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
  functions={node.name:node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}
  specializations={}
- # shortcut: helper roots and cross-module calls need a value-bound loader contract before cross-run reuse is sound.
+ # shortcut: CA16 root values and CA17 imported helpers remain open for fresh provenance and reuse; bind helper values before qualification.
  for function in functions.values():
   args=[arg.arg for arg in function.args.posonlyargs+function.args.args]
   for call in ast.walk(function):
@@ -985,6 +1015,13 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
   if isinstance(node,ast.Call): yield node
   for child in ast.iter_child_nodes(node):
    if not isinstance(child,ast.stmt): yield from calls(child)
+ def retain_opaque(scope,selected):
+  for name,value in selected.items():
+   if opaque(value): scope[name]=value
+ def walk_branch(nodes,scope,search,bindings=None):
+  selected=dict(scope)
+  if bindings: selected.update(bindings)
+  walk(nodes,selected,list(search),False); retain_opaque(scope,selected)
  def walk(nodes,scope,search,allow_path=True):
   for node in nodes:
    try:
@@ -1026,6 +1063,9 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
       if isinstance(target,ast.Name):
        if value is search: raise RuntimeError('unsupported Python import-path alias')
        scope[target.id]=value
+      elif opaque(value):
+       if value is not OPAQUE_MODULE or not isinstance(target,ast.Subscript) or expression(target.value,scope,search,cwd,argv,flags) is not SYS_MODULES: raise RuntimeError('unsupported opaque Python module escape')
+       refuse_opaque(expression(target.slice,scope,search,cwd,argv,flags))
       elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)):
        if not isinstance(target,ast.Subscript): raise RuntimeError('unsupported Python import-path escape')
        receiver=expression(target.value,scope,search,cwd,argv,flags)
@@ -1082,13 +1122,21 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
      if isinstance(condition,bool): walk(node.body if condition else node.orelse,scope,search,allow_path)
      else:
       if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unresolved conditional Python import-path setup')
-      walk(node.body,dict(scope),list(search),False); walk(node.orelse,dict(scope),list(search),False)
+      walk_branch(node.body,scope,search); walk_branch(node.orelse,scope,search)
     elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
      for default in [*node.args.defaults,*node.args.kw_defaults]:
       value=expression(default,scope,search,cwd,argv,flags) if default is not None else UNKNOWN
-      if value is search or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector default argument')
+      if value is search or opaque(value) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector default argument')
+     for decorator in node.decorator_list: refuse_opaque(expression(decorator,scope,search,cwd,argv,flags))
      deferred.append((node,scope))
-    elif isinstance(node,ast.ClassDef): walk(node.body,dict(scope),search,allow_path)
+    elif isinstance(node,ast.ClassDef):
+     for value in [*node.bases,*node.decorator_list,*[keyword.value for keyword in node.keywords]]: refuse_opaque(expression(value,scope,search,cwd,argv,flags))
+     local=dict(scope); walk(node.body,local,search,allow_path)
+     for name,value in local.items():
+      if name not in scope or value is not scope[name]: refuse_opaque(value)
+    elif isinstance(node,ast.Return):
+     if node.value is not None: refuse_opaque(expression(node.value,scope,search,cwd,argv,flags))
+    elif isinstance(node,ast.Expr): expression(node.value,scope,search,cwd,argv,flags)
     elif isinstance(node,ast.Try):
      if not node.handlers:
       mutates=path_changes(node,scope,search,cwd,argv,flags)
@@ -1111,13 +1159,26 @@ def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__ma
        if handler is None: raise
        walk(handler.body,body_scope,body_search,False)
       else:
-       for handler in node.handlers: walk(handler.body,dict(scope),list(search),False)
+       for handler in node.handlers: walk_branch(handler.body,scope,search)
        walk(node.orelse,body_scope,body_search,False)
+      retain_opaque(scope,body_scope)
       walk(node.finalbody,scope,search,False)
     elif isinstance(node,(ast.For,ast.AsyncFor,ast.While,ast.With,ast.AsyncWith)):
+     bindings={}
+     if isinstance(node,(ast.For,ast.AsyncFor)):
+      iterable=expression(node.iter,scope,search,cwd,argv,flags)
+      if isinstance(iterable,ModuleSnapshot):
+       if not isinstance(node.target,ast.Name): raise RuntimeError('unsupported Python module snapshot iteration')
+       bindings[node.target.id]=UNKNOWN
+      elif isinstance(iterable,ModuleSnapshotItems):
+       if not isinstance(node.target,(ast.Tuple,ast.List)) or len(node.target.elts)!=2 or not all(isinstance(item,ast.Name) for item in node.target.elts) or node.target.elts[0].id==node.target.elts[1].id: raise RuntimeError('unsupported Python module snapshot item iteration')
+       bindings={node.target.elts[0].id:UNKNOWN,node.target.elts[1].id:OPAQUE_MODULE}
+      else: refuse_opaque(iterable)
+     if isinstance(node,(ast.With,ast.AsyncWith)):
+      for item in node.items: refuse_opaque(expression(item.context_expr,scope,search,cwd,argv,flags))
      if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported block Python import-path mutation')
-     walk(node.body,dict(scope),list(search),False)
-     if hasattr(node,'orelse'): walk(node.orelse,dict(scope),list(search),False)
+     walk_branch(node.body,scope,search,bindings)
+     if hasattr(node,'orelse'): walk_branch(node.orelse,scope,search)
    except (RuntimeError,TypeError,ValueError,OSError) as error:
     if isinstance(error,MissingImport): raise
     raise RuntimeError(f"{filename or '<inline cwd='+cwd+'>'}:{getattr(node,'lineno','?')}: {error}") from error
@@ -1657,19 +1718,56 @@ async function selectedNodeExecution(
 	await fs.access(node, fs.constants.X_OK);
 	roots.push({ label: "execution/node", path: node });
 	native.push(node);
+	let selectedRuntime = await canonicalToolPath(node);
+	const wrappers = new Set<string>(),
+		header = Buffer.alloc(4);
+	for (;;) {
+		await fs.access(selectedRuntime, fs.constants.X_OK);
+		const handle = await fs.open(selectedRuntime, "r");
+		try {
+			if ((await handle.read(header, 0, header.length, 0)).bytesRead !== header.length)
+				throw new Error("Unsupported preferred Node runtime wrapper: " + selectedRuntime);
+		} finally {
+			await handle.close();
+		}
+		if (MACHO_MAGIC.includes(header.readUInt32BE()) || header.readUInt32BE() === 0x7f454c46) break;
+		if (wrappers.has(selectedRuntime)) throw new Error("Preferred Node runtime wrapper cycle");
+		wrappers.add(selectedRuntime);
+		const source = (await fs.readFile(selectedRuntime, "utf8")).replace(/\r\n/gu, "\n"),
+			wrapper =
+				/^#!\/bin\/sh\nexec (?:'([^'\r\n]+)'|"([^"$`\\\r\n]+)"|(\/[A-Za-z0-9_./+-]+)) "\$@"\n(?:[ \t]*#[^\r\n]*\n|[ \t]*\n)*$/u.exec(
+					source,
+				),
+			target = wrapper?.[1] ?? wrapper?.[2] ?? wrapper?.[3];
+		if (!target || !path.isAbsolute(target))
+			throw new Error("Unsupported preferred Node runtime wrapper: " + selectedRuntime);
+		selectedRuntime = await canonicalToolPath(target);
+		roots.push({ label: "execution/node-wrapper-target/" + wrappers.size, path: selectedRuntime });
+		native.push(selectedRuntime);
+	}
 	environment.NODE_PATH = nodePath;
 	assertNodeEnvironment(environment);
-	const runtime = await context.probe([node, "-p", "JSON.stringify({executable:process.execPath})"], {
-		env: environment,
-	});
+	const runtimeCode =
+		"JSON.stringify({executable:process.execPath,nodeOptions:process.env.NODE_OPTIONS??'',execArgv:process.execArgv})";
+	const runtime = await context.probe([node, "-p", runtimeCode], { env: environment });
 	discovery.push(runtime.identity);
-	const executable = probeJSON<{ executable: string }>(runtime).executable;
+	const selectedRuntimeState = probeJSON<{ executable: string; nodeOptions: string; execArgv: string[] }>(runtime);
+	if (
+		selectedRuntimeState.nodeOptions !== "" ||
+		!Array.isArray(selectedRuntimeState.execArgv) ||
+		selectedRuntimeState.execArgv.length !== 2 ||
+		!["-p", "--print"].includes(selectedRuntimeState.execArgv[0]) ||
+		selectedRuntimeState.execArgv[1] !== runtimeCode
+	)
+		throw new Error("Unsupported preferred Node runtime selectors");
+	const executable = selectedRuntimeState.executable;
 	if (typeof executable !== "string" || !path.isAbsolute(executable))
 		throw new Error("Cannot resolve preferred Node implementation executable");
 	await fs.access(executable, fs.constants.X_OK);
+	if ((await canonicalToolPath(executable)) !== selectedRuntime)
+		throw new Error("Preferred Node runtime selects an unmodeled executable");
 	roots.push({ label: "execution/node-runtime", path: executable });
 	native.push(executable);
-	const stores = new Set<string>();
 	for (const [index, directory] of nodePath.split(path.delimiter).filter(Boolean).entries()) {
 		const selected = path.resolve(context.cwd, directory);
 		try {
@@ -1686,12 +1784,10 @@ async function selectedNodeExecution(
 				linkBoundary = await canonicalToolPath(store);
 				if (!inside(linkBoundary, await canonicalToolPath(selected)))
 					throw new Error("Node module search entry escapes pnpm virtual store: " + selected);
-				if (!stores.has(linkBoundary)) {
-					stores.add(linkBoundary);
-					roots.push({ label: "execution/node-store/" + index, path: linkBoundary, linkBoundary });
-				}
 			}
-			roots.push({ label: "execution/node-path/" + index, path: selected, linkBoundary });
+			const searchRoot = { label: "execution/node-path/" + index, path: selected, linkBoundary };
+			roots.push(searchRoot);
+			if (linkBoundary) roots.push(...(await linkedPackageRoots(context, searchRoot, "execution/node-store/" + index)));
 		} catch (error) {
 			if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
 		}
@@ -2286,7 +2382,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 				throw new Error(`Tool locator kind mismatch: ${id}`);
 			if (declaration.kind === "executable") await fs.access(selected, fs.constants.X_OK);
 			roots = [{ label: ".", path: selected }];
-			// shortcut: Darwin tree child launch environments remain unmodeled; bind actual launcher context before enabling reuse.
+			// shortcut: CA24 generic Darwin tree child linkage remains open for fresh provenance and reuse; bind launch contexts before qualification.
 			if (process.platform === "linux") {
 				const linked = await linuxLinkage(context, await nativePayloads(roots));
 				if (linked.length) {
