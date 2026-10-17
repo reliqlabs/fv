@@ -270,7 +270,6 @@ export async function assertSourceRequirements(
 			if (
 				!all &&
 				(entry.name === ".git" ||
-					entry.name === ".lake" ||
 					required.excludedPaths?.some((excluded) => child === excluded || child.startsWith(excluded + "/")))
 			)
 				continue;
@@ -333,8 +332,9 @@ const RUSTUP_DRIVERS = new Map([
 	["native/drivers/cargo-0", "cargo"],
 	["native/drivers/rustc-0", "rustc"],
 ]);
+const EMPTY_FILE_HASH = H(Buffer.alloc(0));
 // Darwin executable/file tools with non-system dylibs or a rustup-selected driver are hashed as a derived tree.
-function derivedNativeTree(declaration: Policy["toolchains"][number], identity: ToolIdentity): boolean {
+export function derivedNativeTree(declaration: Policy["toolchains"][number], identity: ToolIdentity): boolean {
 	if (
 		(declaration.kind !== "executable" && declaration.kind !== "file") ||
 		declaration.locator.mode === "adapter" ||
@@ -342,18 +342,35 @@ function derivedNativeTree(declaration: Policy["toolchains"][number], identity: 
 		identity.system_dependencies.os !== "darwin"
 	)
 		return false;
-	const isLibrary = (relative: string) =>
-		relative.startsWith(LIBRARY_PREFIX) && !relative.slice(LIBRARY_PREFIX.length).includes("/");
+	const hasBytes = (file: ToolIdentity["files"][number], executable = false): boolean =>
+		file.kind === "file" && file.size > 0 && file.hash !== EMPTY_FILE_HASH && (!executable || file.executable);
+	const isLibrary = (relative: string): boolean => {
+		if (!relative.startsWith(LIBRARY_PREFIX)) return false;
+		const encoded = relative.slice(LIBRARY_PREFIX.length);
+		try {
+			const decoded = decodeURIComponent(encoded);
+			return !!decoded && !decoded.includes("\0") && !encoded.includes("/") && encodeURIComponent(decoded) === encoded;
+		} catch {
+			return false;
+		}
+	};
 	const shapeOk = identity.files.every((file) =>
 		["native", "native/non-system-libraries", "native/drivers"].includes(file.path)
 			? file.kind === "directory"
 			: file.kind === "file" &&
-				(file.path === "selected-file" || RUSTUP_DRIVERS.has(file.path) || isLibrary(file.path)),
+				(file.path === "selected-file" || RUSTUP_DRIVERS.has(file.path) || (isLibrary(file.path) && hasBytes(file))),
 	);
 	const drivers = identity.files.flatMap((file) => RUSTUP_DRIVERS.get(file.path) ?? []);
-	const selected = identity.files.some((file) => file.path === "selected-file");
+	const selected = identity.files.find((file) => file.path === "selected-file");
 	const closure = drivers.length > 0 || identity.files.some((file) => isLibrary(file.path));
-	if (!shapeOk || !selected || !closure) return false;
+	if (
+		!shapeOk ||
+		!selected ||
+		!closure ||
+		(declaration.kind === "executable" && !hasBytes(selected, true)) ||
+		identity.files.some((file) => RUSTUP_DRIVERS.has(file.path) && !hasBytes(file, true))
+	)
+		return false;
 	if (!drivers.length) return true;
 	const locator = declaration.locator;
 	return (

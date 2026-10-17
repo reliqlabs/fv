@@ -148,3 +148,23 @@ Classification: implementation-only. Full Dossier planning at `936b350` failed f
 The properties-discovery JVM now uses `-XX:-UseCompressedOops`. Solver invocations and proof bounds are unchanged; exact discovery-output comparison remains enforced. The paired real-JVM regression failed before the fix and passed afterward. The proof adapter suite passed 34 tests; three existing helper-byte/native-binding/pnpm-boundary regressions passed. A full direct producer plan returned READY in 409,561 ms with 69 required records and 82 physical slots. This is preflight evidence only, not a proof result or activation verdict.
 
 The earlier indexed-origin/file lookup correction remains in the installed lineage; this change also supplies its missing `ToolFile` type import. General cross-run reuse is not qualified by these checks. Dossier's host explicitly disables it while the remaining round-3 findings stay open.
+
+## Isolated hybrid integration (2026-10-16)
+
+Classification: implementation-only, enforcing the existing provenance/refusal contract. HybridBase and HybridProof supplied independent changes; the parent integrated them on `perf/evidence-hybrid-union`, separate from installed producer `e36b939`. The affected boundary is producer tool/source discovery and its TS/Python validation parity. No protocol model, solver recipe, seed, bound, assurance class or activation prerequisite changes.
+
+| Prior finding | Implementation disposition |
+|---|---|
+| Base CA-16, CA-17 | Open: root-by-name and imported-helper argument/target analysis remain incomplete. |
+| Base CA-18, CA-19 | Runtime-family gates and hardlink aliases are checked; unsupported Python source/loader formats refuse. |
+| Base CA-20 | Reported opaque `sys.modules` and stdlib import-by-name forms refuse; no general interpreter analysis is claimed. |
+| Base CA-21 | Partial: reviewed startup-hook imports use actual request paths; direct split-stdlib imports refuse. Transitive split-stdlib paths remain open. |
+| Base CA-22, CA-23 | Literal loader paths use command cwd; symlinked Python source and hidden interpreter-wrapper contexts refuse. |
+| Base CA-24 | Generic Darwin tree linkage remains open. Dossier's separately retained frozen-installation disposition does not close it. |
+| Base CA-25 | pnpm effective Node options and selected child runtime options are checked and retained. |
+| Proof CA-01..CA-04 | Quint family/subcommand gates, symlink-safe Lake `-d`, absolute Apalache JAR selection and Elan nearest-directory precedence are implemented. |
+| Source CA-12..CA-14 | Unbound prebuilt imports refuse; generated-path Lean sources remain mandatory; Rustup hardlink selection and derived-tree validation match the retained selector and Python byte checks. |
+
+The first integrated run reported two Rustup hardlink binding failures. Indexed origin checks now accept a file-root alias only when its device/inode and captured hash/size/executable bit match; an independent byte-identical copy still refuses. Both affected checks passed afterward. A duplicate type-only import introduced by integration was removed after the formatter rejected it.
+
+The frozen integrated toolchain/proof/source/adoption suites passed 112 tests. An actual temporary project returned plan READY, run PASS, one physical dispatch for claims A and B, and portable-checker exit 0. These checks do not qualify generic reuse. Independent re-review and renewed full Dossier admission remain pending; the installed producer is unchanged.

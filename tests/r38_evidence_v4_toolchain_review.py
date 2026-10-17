@@ -25,7 +25,7 @@ PROGRAM = (
     "const input=await Bun.stdin.json();const moduleURL=input.module??"
     + json.dumps(MODULE.as_uri())
     + ";const {discoverPythonAdapter,discoverNodeAdapter,discoverNativeAdapter,createToolchainSession}=await import(moduleURL);"
-    + "const {hashToolRoots,parseMachOLoadCommands}=await import(new URL('evidence-v4-toolchain-common.ts',moduleURL).href);"
+    + "const {hashToolRoots,parseMachOLoadCommands,isRustupProxy}=await import(new URL('evidence-v4-toolchain-common.ts',moduleURL).href);"
     + "const {D,H}=await import(new URL('evidence-v4-model.ts',moduleURL).href);\n"
     + r"""
 let session={async run(request){
@@ -58,6 +58,12 @@ const context={root:input.root,cwd:input.root,cwdRelative:'.',subject:declaratio
 try{
   if(input.op==='macho'){
     process.stdout.write(JSON.stringify({ok:true,result:parseMachOLoadCommands(input.text)}));
+  }else if(input.op==='rustup-proxy'){
+    process.stdout.write(JSON.stringify({ok:true,proxy:await isRustupProxy(await resolveCommand(input.command))}));
+  }else if(input.op==='bound'){
+    const tools=createToolchainSession({root:input.root,env:input.env,policy:input.policy,session});
+    await tools.assertCommandBound(input.command,input.root,input.ids);
+    process.stdout.write(JSON.stringify({ok:true}));
   }else if(input.op==='resolve'){
     const tools=createToolchainSession({root:input.root,env:input.env,policy:{toolchains:[]},session});
     const selected=await Promise.all(input.commands.map(command=>tools.resolveCommand(command)));
@@ -138,6 +144,27 @@ def declaration(identifier, adapter, subject, requires=()):
         "version_cwd": None,
         "accept": {"sha256": [], "version_contains": []},
     }
+
+
+LOADER_SOURCE = """import importlib.util, sys
+from pathlib import Path
+def _input(root, relative):
+ path = root / relative
+ if path.is_symlink() or path.resolve() != path or not path.is_file():
+  raise ValueError('missing or redirected input')
+ return path
+def _module(root, relative, name):
+ path = _input(root, relative)
+ spec = importlib.util.spec_from_file_location(name, path)
+ if spec is None or spec.loader is None:
+  raise ValueError('cannot load collector')
+ module = importlib.util.module_from_spec(spec)
+ sys.modules[name] = module
+ spec.loader.exec_module(module)
+ return module
+"""
+
+REVIEWED_HOMEBREW_HOOK = "# This file is created by Homebrew and is executed on each python startup.\n# Don't print from here, or else python command line scripts may fail!\n# <https://docs.brew.sh/Homebrew-and-Python>\nimport re\nimport os\nimport site\nimport sys\nif sys.version_info[:2] != (3, 14):\n    # This can only happen if the user has set the PYTHONPATH to a mismatching site-packages directory.\n    # Every Python looks at the PYTHONPATH variable and we can't fix it here in sitecustomize.py,\n    # because the PYTHONPATH is evaluated after the sitecustomize.py. Many modules (e.g. PyQt4) are\n    # built only for a specific version of Python and will fail with cryptic error messages.\n    # In the end this means: Don't set the PYTHONPATH permanently if you use different Python versions.\n    exit(f'Your PYTHONPATH points to a site-packages dir for Python 3.14 '\n         f'but you are running Python {sys.version_info[0]}.{sys.version_info[1]}!\\n'\n         f'     PYTHONPATH is currently: \"{os.environ[\"PYTHONPATH\"]}\"\\n'\n         f'     You should `unset PYTHONPATH` to fix this.')\n# Only do this for a brewed python:\nif os.path.realpath(sys.executable).startswith('/opt/homebrew/Cellar/python@3.14'):\n    # the Cellar site-packages is a symlink to the HOMEBREW_PREFIX\n    # site_packages; prefer the shorter paths\n    long_prefix = re.compile(r'/opt/homebrew/Cellar/python@3.14/[0-9\\._abrc]+/(?:Frameworks/Python\\.framework/Versions/3.14/)?lib/python3.14/site-packages')\n    sys.path = [long_prefix.sub('/opt/homebrew/lib/python3.14/site-packages', p) for p in sys.path]\n    # Set the sys.executable to use the opt_prefix. Only do this if PYTHONEXECUTABLE is not\n    # explicitly set and we are not in a virtualenv:\n    if 'PYTHONEXECUTABLE' not in os.environ and sys.prefix == sys.base_prefix:\n        sys.executable = sys._base_executable = '/opt/homebrew/opt/python@3.14/bin/python3.14'\nif 'PYTHONHOME' not in os.environ:\n    cellar_prefix = re.compile(r'/opt/homebrew/Cellar/python@3.14/[0-9\\._abrc]+(?=/|$)')\n    if os.path.realpath(sys.base_prefix).startswith('/opt/homebrew/Cellar/python@3.14'):\n        new_prefix = cellar_prefix.sub('/opt/homebrew/opt/python@3.14', sys.base_prefix)\n        site.PREFIXES[:] = [new_prefix if x == sys.base_prefix else x for x in site.PREFIXES]\n        if sys.prefix == sys.base_prefix:\n            sys.prefix = new_prefix\n        sys.base_prefix = new_prefix\n    if os.path.realpath(sys.base_exec_prefix).startswith('/opt/homebrew/Cellar/python@3.14'):\n        new_exec_prefix = cellar_prefix.sub('/opt/homebrew/opt/python@3.14', sys.base_exec_prefix)\n        site.PREFIXES[:] = [new_exec_prefix if x == sys.base_exec_prefix else x for x in site.PREFIXES]\n        if sys.exec_prefix == sys.base_exec_prefix:\n            sys.exec_prefix = new_exec_prefix\n        sys.base_exec_prefix = new_exec_prefix\n# Make site.getsitepackages() return the HOMEBREW_PREFIX site-packages,\n# but only if we are outside a venv or in one with include-system-site-packages.\nif sys.base_prefix in site.PREFIXES:\n    site.PREFIXES.insert(site.PREFIXES.index(sys.base_prefix), '/opt/homebrew')\n    site.addsitedir('/opt/homebrew/lib/python3.14/site-packages')\n# Check for and add the prefix of split Python formulae.\nfor split_module in [\"tk\", \"gdbm\"]:\n    split_prefix = f\"/opt/homebrew/opt/python-{split_module}@3.14/libexec\"\n    if os.path.isdir(split_prefix):\n        sys.path.append(split_prefix)\n"
 
 
 class ToolchainReview(unittest.TestCase):
@@ -273,25 +300,12 @@ class ToolchainReview(unittest.TestCase):
     def test_python_literal_helper_loader_binds_target_imports(self):
         self.write(self.root / "loaded.py", "import external_plugin\n")
         module = self.write(self.external / "external_plugin.py", "VALUE = 1\n")
-        source = """import importlib.util, sys
-from pathlib import Path
-def _input(root, relative):
- path = root / relative
- if path.is_symlink() or path.resolve() != path or not path.is_file():
-  raise ValueError('missing or redirected input')
- return path
-def _module(root, relative, name):
- path = _input(root, relative)
- spec = importlib.util.spec_from_file_location(name, path)
- if spec is None or spec.loader is None:
-  raise ValueError('cannot load collector')
- module = importlib.util.module_from_spec(spec)
- sys.modules[name] = module
- spec.loader.exec_module(module)
- return module
-def check(root):
+        source = (
+            LOADER_SOURCE
+            + """def check(root):
  return _module(root, 'loaded.py', 'loaded')
 """
+        )
         result = invoke(self.python_request(source))
         self.assertTrue(result["ok"], result)
         self.assertIn(
@@ -312,6 +326,315 @@ def check(root):
         )
         self.assertFalse(rejected["ok"], rejected)
         self.assertIn("non-literal Python loader", rejected["error"])
+
+    def test_ca19_non_source_entries_and_loader_targets_refuse(self):
+        for name in ("gate", "app.pyz", "app.pyc"):
+            script = self.write(self.root / name, "import external_plugin\n")
+            request = self.python_request("VALUE = 1\n")
+            request["commands"][0]["subject"][1] = str(script)
+            result = invoke(request)
+            self.assertFalse(result["ok"], result)
+            self.assertIn("Python source entry", result["error"])
+        directory = self.root / "directory.py"
+        directory.mkdir()
+        self.write(directory / "__main__.py", "import external_plugin\n")
+        request["commands"][0]["subject"][1] = str(directory)
+        self.assertFalse(invoke(request)["ok"])
+        for target in ("gate", "app.pyz", "app.pyc"):
+            result = invoke(
+                self.python_request(
+                    "import runpy\nrunpy.run_path(" + repr(target) + ")\n"
+                )
+            )
+            self.assertFalse(result["ok"], result)
+            self.assertIn("Python source loader target", result["error"])
+
+    def test_ca20_opaque_modules_and_stdlib_import_by_name_refuse(self):
+        for source in (
+            "import sys\nsys.modules['importlib'].import_module('external_plugin')",
+            "import sys\nloader = sys.modules.get('importlib')\nloader.import_module('external_plugin')",
+            "import sys\nsys.modules.pop('importlib')('external_plugin')",
+            "import sys\ngetattr(sys.modules['importlib'], 'import_module')('external_plugin')",
+            "import logging.config\nlogging.config.dictConfig({'version': 1})",
+            "from logging import config\nconfig.dictConfig({'version': 1})",
+            "import logging\nlogging.config.dictConfig({'version': 1})",
+            "import pickle\npickle.loads(payload)",
+            "import shelve\nshelve.open('data')",
+            "import pydoc\npydoc.locate('external_plugin.Handler')",
+        ):
+            with self.subTest(source=source):
+                result = invoke(self.python_request(source + "\n"))
+                self.assertFalse(result["ok"], result)
+                self.assertIn("Python", result["error"])
+        result = invoke(
+            self.python_request(
+                "import sys\nprevious = sys.modules.get('fixture')\n"
+                "sys.modules.pop('fixture', None)\n"
+                "sys.modules['fixture'] = previous\n"
+                "sys.modules['alias'] = sys.modules[__name__]\n"
+            )
+        )
+        self.assertTrue(result["ok"], result)
+
+    def test_ca21_split_formula_stdlib_imports_refuse(self):
+        for module in ("tkinter", "tkinter.ttk", "dbm", "dbm.gnu"):
+            with self.subTest(module=module):
+                result = invoke(self.python_request("import " + module + "\n"))
+                self.assertFalse(result["ok"], result)
+                self.assertIn("split-formula", result["error"])
+
+    def test_ca21_reviewed_startup_hook_binds_shadowed_imports(self):
+        hook = self.write(
+            self.root / "reviewed_sitecustomize.py", REVIEWED_HOMEBREW_HOOK
+        )
+        self.assertEqual(
+            hashlib.sha256(hook.read_bytes()).hexdigest(),
+            "1a773d37457f89ca5d3b7c96541eb8e32e72e47d6c6d48b6428d81e3e7ddafff",
+        )
+        shadow = self.write(self.external / "re.py", "VALUE = 1\n")
+        analyzer = (
+            MODULE.read_text()
+            .split("const code = String.raw`\n", 1)[1]
+            .split("\n`;", 1)[0]
+        )
+        program = (
+            "import json,sys\nnamespace={}\nexec(compile("
+            + repr(analyzer)
+            + ", '<production import analyzer>', 'exec'), namespace)\n"
+            + "namespace['required']=set(); namespace['seen']=set()\n"
+            + "namespace['startup_hooks'].add(sys.argv[4])\n"
+            + "namespace['visit'](sys.argv[4],[sys.argv[5],*sys.path],sys.argv[1],[],name='sitecustomize',flags={},project=False)\n"
+            + "print(json.dumps(sorted(namespace['required'])))\n"
+        )
+        result = subprocess.run(
+            [
+                self.python,
+                "-I",
+                "-B",
+                "-c",
+                program,
+                str(self.root),
+                "[]",
+                '["python"]',
+                str(hook),
+                str(self.external),
+            ],
+            env=self.env,
+            cwd=self.base,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn(str(shadow), json.loads(result.stdout.splitlines()[-1]))
+
+    def test_ca22_loader_literals_use_command_cwd_and_symlinks_refuse(self):
+        self.write(self.root / "loaded.py", "VALUE = 1\n")
+        self.write(self.root / "sub/loaded.py", "import external_plugin\n")
+        plugin = self.write(self.external / "external_plugin.py", "VALUE = 1\n")
+        request = self.python_request("import runpy\nrunpy.run_path('loaded.py')\n")
+        request["commands"][0]["cwd"] = str(self.root / "sub")
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertIn(
+            str(plugin),
+            {
+                file
+                for requirement in result["requirements"]
+                for file in requirement["files"]
+            },
+        )
+        target = self.write(self.root / "vendor/gate/check.py", "import helper\n")
+        entry = self.root / "tools/check.py"
+        entry.parent.mkdir()
+        entry.symlink_to(target)
+        request["commands"][0]["subject"][1] = str(entry)
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("symlinked Python source", result["error"])
+
+    def test_ca23_bound_native_wrappers_do_not_skip_python(self):
+        script = self.write(self.root / "check.py", "VALUE = 1\n")
+        launcher = self.root / "launcher"
+        launcher.symlink_to("/usr/bin/true")
+        policy = {
+            "toolchains": [
+                declaration("python", "python-runtime", [self.python]),
+                {
+                    "id": "wrapper",
+                    "kind": "executable",
+                    "locator": {"mode": "path", "value": str(launcher)},
+                    "requires": ["python"],
+                    "version_command": None,
+                    "version_cwd": None,
+                    "accept": {"sha256": [], "version_contains": []},
+                },
+            ],
+            "recipes": [],
+            "preflight": [],
+            "claim_checker": {
+                "command": [str(launcher), self.python, str(script)],
+                "cwd": ".",
+                "toolchain": ["wrapper"],
+            },
+        }
+        result = invoke(
+            {
+                "op": "capture",
+                "root": str(self.root),
+                "env": self.env,
+                "policy": policy,
+                "ids": ["wrapper"],
+            }
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Python command wrapper", result["error"])
+
+    def test_ca18_plain_runtime_declarations_require_family_adapters(self):
+        for runtime, family in (
+            (self.python, "python-runtime"),
+            (shutil.which("node"), "node-toolchain"),
+        ):
+            with self.subTest(runtime=runtime):
+                if runtime is None:
+                    raise RuntimeError("Runtime family fixture requires Node")
+                tool = {
+                    "id": "runtime",
+                    "kind": "executable",
+                    "locator": {"mode": "path", "value": runtime},
+                    "requires": [],
+                    "version_command": None,
+                    "version_cwd": None,
+                    "accept": {"sha256": [], "version_contains": []},
+                }
+                request = {
+                    "op": "bound",
+                    "root": str(self.root),
+                    "env": self.env,
+                    "ids": ["runtime"],
+                    "command": [
+                        runtime,
+                        "-c" if family == "python-runtime" else "-e",
+                        "",
+                    ],
+                    "policy": {
+                        "toolchains": [tool],
+                        "recipes": [],
+                        "preflight": [],
+                        "claim_checker": {"toolchain": []},
+                    },
+                }
+                result = invoke(request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn(family, result["error"])
+                directory = self.root / family
+                directory.mkdir()
+                selected = directory / (
+                    "python3" if family == "python-runtime" else "node"
+                )
+                shutil.copyfile(runtime, selected)
+                selected.chmod(0o755)
+                alias = directory / "runtime-alias"
+                os.link(selected, alias)
+                request["env"] = {
+                    **self.env,
+                    "PATH": str(directory) + os.pathsep + self.env["PATH"],
+                }
+                request["command"][0] = str(alias)
+                tool["locator"]["value"] = str(alias)
+                result = invoke(request)
+                self.assertFalse(result["ok"], result)
+                self.assertIn(family, result["error"])
+                if family == "node-toolchain":
+                    request["env"]["NODE_OPTIONS"] = "--require /unbound/preload.js"
+                    result = invoke(request)
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn("NODE_OPTIONS", result["error"])
+
+    def test_quint_family_gate_tracks_installed_cli_and_subcommand(self):
+        package = self.external / "quint-package"
+        cli = self.write(
+            package / "dist/cli.js", "#!/usr/bin/env node\n", executable=True
+        )
+        internal = self.write(
+            package / "dist/internal.js", "#!/usr/bin/env node\n", executable=True
+        )
+        self.write(
+            package / "package.json",
+            json.dumps(
+                {
+                    "name": "@informalsystems/quint",
+                    "version": "1.0.0",
+                    "bin": {"quint": "dist/cli.js"},
+                }
+            ),
+        )
+        alias = self.root / "selected-tool"
+        alias.symlink_to(cli)
+        package_tool = {
+            "id": "package",
+            "kind": "tree",
+            "locator": {"mode": "path", "value": str(package)},
+            "requires": [],
+            "version_command": None,
+            "version_cwd": None,
+            "accept": {"sha256": [], "version_contains": []},
+        }
+        request = {
+            "op": "bound",
+            "root": str(self.root),
+            "env": self.env,
+            "ids": ["package"],
+            "command": [str(alias), "typecheck", "model.qnt"],
+            "policy": {
+                "toolchains": [package_tool],
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {"toolchain": []},
+            },
+        }
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("matching quint-backends", result["error"])
+        request["policy"]["toolchains"].append(
+            declaration(
+                "family", "quint-backends", [str(alias), "verify"], requires=["package"]
+            )
+        )
+        request["ids"] = ["family"]
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("matching quint-backends", result["error"])
+        for command in (
+            [shutil.which("node"), str(cli), "verify"],
+            [str(internal), "verify"],
+        ):
+            request["command"] = command
+            result = invoke(request)
+            self.assertFalse(result["ok"], result)
+            self.assertIn("Quint wrapper or package-internal", result["error"])
+
+    def test_rustup_hardlinks_are_recognized_by_identity(self):
+        binary = self.root / "bin/rustup"
+        binary.parent.mkdir()
+        shutil.copyfile("/usr/bin/true", binary)
+        binary.chmod(0o755)
+        cargo = binary.with_name("cargo")
+        os.link(binary, cargo)
+        request = {
+            "op": "rustup-proxy",
+            "root": str(self.root),
+            "env": self.env,
+            "command": str(cargo),
+        }
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["proxy"], result)
+        cargo.unlink()
+        shutil.copyfile("/usr/bin/true", cargo)
+        cargo.chmod(0o755)
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["proxy"], result)
 
     def test_python_sibling_loaders_and_snapshot_restore_bind_imports(self):
         self.write(self.root / "loaded.py", "import external_plugin\n")
@@ -656,6 +979,11 @@ def check(root):
 const cp=require('node:child_process'),path=require('node:path');
 const args=process.argv.slice(2);
 if(args[0]==='--version'){console.log('1.0.0');}
+else if(args[0]==='config'&&args[1]==='get'&&args[2]==='node-options'){
+ const fs=require('node:fs'),file=path.join(process.cwd(),'.npmrc');
+ const config=fs.existsSync(file)?fs.readFileSync(file,'utf8'):'';
+ console.log(/^node-options=(.*)$/m.exec(config)?.[1]??'undefined');
+}
 else if(args[0]==='exec'){
  const child=cp.spawnSync(args[1],args.slice(2),{stdio:'inherit',env:{...process.env,PATH:path.join(process.cwd(),'node_modules','.bin')+path.delimiter+process.env.PATH}});
  if(child.error)throw child.error;process.exit(child.status??1);
@@ -728,6 +1056,20 @@ else if(args[0]==='exec'){
                 [str(self.bin / "pnpm"), "exec", "tsx", "entry.ts"],
             ),
         }
+
+    def test_ca25_pnpm_node_options_refuse_before_exec_preload(self):
+        request = self.node_request()
+        hook = self.write(
+            self.external / "preload.cjs",
+            "require('node:fs').writeFileSync("
+            + json.dumps(str(self.base / "unbound-preload-executed"))
+            + ", 'executed');\n",
+        )
+        self.write(self.root / ".npmrc", "node-options=--require " + str(hook) + "\n")
+        result = invoke(request)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("pnpm-injected Node runtime selectors", result["error"])
+        self.assertFalse((self.base / "unbound-preload-executed").exists())
 
     def test_pnpm_shim_mutation_invalidates_or_rejects(self):
         request = self.node_request()
@@ -1024,26 +1366,77 @@ else if(args[0]==='exec'){
                     changed["error"],
                 )
 
+    def test_rust_commands_require_toolchain_family(self):
+        for driver, args, family in (
+            ("cargo", ["test"], "cargo-toolchain"),
+            ("rustc", ["input.rs"], "cargo-toolchain"),
+            ("cargo", ["kani"], "kani-toolchain"),
+        ):
+            with self.subTest(driver=driver, args=args):
+                command = self.root / driver
+                if not command.exists():
+                    command.symlink_to("/usr/bin/true")
+                tool = {
+                    "id": "driver",
+                    "kind": "executable",
+                    "locator": {"mode": "path", "value": str(command)},
+                    "requires": [],
+                    "version_command": None,
+                    "version_cwd": None,
+                    "accept": {"sha256": [], "version_contains": []},
+                }
+                result = invoke(
+                    {
+                        "op": "bound",
+                        "root": str(self.root),
+                        "env": self.env,
+                        "ids": ["driver"],
+                        "command": [str(command), *args],
+                        "policy": {
+                            "toolchains": [tool],
+                            "recipes": [],
+                            "preflight": [],
+                            "claim_checker": {"toolchain": []},
+                        },
+                    }
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn(family, result["error"])
+
     @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
     def test_rustup_selected_version_driver_is_bound(self):
-        directory = self.base / "rustup-bin"
-        installed = self.external / "selected-cargo"
+        self._assert_rustup_selected_driver_bound("cargo", hardlink=False)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_rustup_hardlinked_selected_drivers_are_bound(self):
+        for driver in ("cargo", "rustc"):
+            with self.subTest(driver=driver):
+                self._assert_rustup_selected_driver_bound(driver, hardlink=True)
+
+    def _assert_rustup_selected_driver_bound(self, driver, *, hardlink):
+        directory = self.base / ("rustup-bin-" + driver)
+        installed = self.external / ("selected-" + driver)
         shutil.copyfile("/usr/bin/true", installed)
         installed.chmod(0o755)
         self.write(
             directory / "rustup",
             "#!/bin/sh\nif [ \"$1\" = which ]; then printf '%s\\n' "
             + shlex.quote(str(installed))
-            + "; else printf 'cargo 1.0\\n'; fi\n",
+            + "; else printf '"
+            + driver
+            + " 1.0\\n'; fi\n",
             executable=True,
         )
-        (directory / "cargo").symlink_to("rustup")
+        if hardlink:
+            os.link(directory / "rustup", directory / driver)
+        else:
+            (directory / driver).symlink_to("rustup")
         tool = {
-            "id": "cargo",
+            "id": driver,
             "kind": "executable",
-            "locator": {"mode": "command", "value": "cargo"},
+            "locator": {"mode": "command", "value": driver},
             "requires": ["shell"],
-            "version_command": ["cargo", "--version"],
+            "version_command": [driver, "--version"],
             "version_cwd": ".",
             "accept": {"sha256": [], "version_contains": []},
         }
@@ -1060,7 +1453,7 @@ else if(args[0]==='exec'){
             "op": "capture",
             "root": str(self.root),
             "env": {**self.env, "PATH": str(directory) + os.pathsep + self.env["PATH"]},
-            "ids": ["cargo"],
+            "ids": [driver],
             "policy": {
                 "toolchains": [tool, shell],
                 "recipes": [],
@@ -1071,18 +1464,36 @@ else if(args[0]==='exec'){
         result = invoke(request)
         self.assertTrue(result["ok"], result)
         identity = next(
-            value for value in result["identities"] if value["id"] == "cargo"
+            value for value in result["identities"] if value["id"] == driver
         )
         self.assertEqual(identity["kind"], "tree")
         self.assertTrue(
-            any(file["path"] == "native/drivers/cargo-0" for file in identity["files"])
+            any(
+                file["path"] == f"native/drivers/{driver}-0"
+                for file in identity["files"]
+            )
+        )
+        files = {file["path"]: file for file in identity["files"]}
+        self.assertEqual(
+            files["selected-file"]["hash"],
+            "sha256:" + hashlib.sha256((directory / driver).read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            files[f"native/drivers/{driver}-0"]["hash"],
+            "sha256:" + hashlib.sha256(installed.read_bytes()).hexdigest(),
+        )
+        self.assertTrue(
+            any(
+                probe["command"] == [str(directory / "rustup"), "which", driver]
+                for probe in identity["discovery"]
+            )
         )
         request.update(op="optional-install", install_file=str(installed), append=True)
         changed = invoke(request)
         self.assertTrue(changed["ok"], changed)
         self.assertFalse(changed["accepted"], changed)
         self.assertIn(
-            "Installed tool selection or bytes changed: cargo", changed["error"]
+            "Installed tool selection or bytes changed: " + driver, changed["error"]
         )
 
     @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
@@ -1172,6 +1583,21 @@ else if(args[0]==='exec'){
         request["ids"] = ["main", "helper", "shell"]
         accepted = invoke(request)
         self.assertTrue(accepted["ok"], accepted)
+
+        alias = self.external / "helper-hardlink"
+        os.link(helper, alias)
+        tools[1]["locator"]["value"] = str(alias)
+        linked = invoke(request)
+        self.assertTrue(linked["ok"], linked)
+        bound = invoke({**request, "op": "bound", "command": [str(helper)]})
+        self.assertTrue(bound["ok"], bound)
+
+        copied = self.external / "helper-copy"
+        shutil.copy2(helper, copied)
+        tools[1]["locator"]["value"] = str(copied)
+        rejected_copy = invoke(request)
+        self.assertFalse(rejected_copy["ok"], rejected_copy)
+        self.assertIn(str(helper), rejected_copy["error"])
 
     @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
     def test_metadata_helper_bytes_enter_producer_identity(self):

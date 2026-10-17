@@ -462,6 +462,8 @@ export async function identifyQuint(context: AdapterContext): Promise<AdapterRes
 			)
 				throw new Error("Unknown Apalache JVM launcher selection");
 			roots.push({ label: `apalache/${selected.version}`, path: apalache });
+			if (context.effectiveEnv.APALACHE_JAR && !path.isAbsolute(context.effectiveEnv.APALACHE_JAR))
+				throw new Error("Relative APALACHE_JAR has an application-dependent working directory");
 			const selectedJar = await inputPath(
 				context.cwd,
 				context.effectiveEnv.APALACHE_JAR || path.join(apalache, "lib", "apalache.jar"),
@@ -505,7 +507,10 @@ export async function identifyQuint(context: AdapterContext): Promise<AdapterRes
 			if (context.effectiveEnv[name]) throw new Error(`Unsupported JVM startup configuration in ${name}`);
 		// Fix the discovery JVM's heap-reference mode; its default can vary with address placement.
 		const result = await probe(context, discovery, [
-			java.invoked, "-XX:-UseCompressedOops", "-XshowSettings:properties", "-version",
+			java.invoked,
+			"-XX:-UseCompressedOops",
+			"-XshowSettings:properties",
+			"-version",
 		]);
 		const settings = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(result.stderr);
 		const home = settings.match(/^\s*java\.home = (.+)\r?$/mu)?.[1]?.trim();
@@ -752,11 +757,14 @@ async function selectedLean(
 		settings = await elanSettings(settingsFile);
 	if (await exists(settingsFile)) await configurationRoot(roots, "distribution", settingsFile);
 	let override: string | undefined;
-	for (const [name, token] of [...settings.overrides].sort((a, b) => b[0].length - a[0].length))
-		if (inside(path.resolve(name), cwd)) {
-			override = token;
-			break;
-		}
+	// Elan config.rs walks upward, checking the override DB before the pin at each directory.
+	for (let cursor = await directory(cwd); ; cursor = path.dirname(cursor)) {
+		override = settings.overrides.get(cursor);
+		if (override !== undefined || (pin && cursor === path.dirname(pin))) break;
+		if (!options.toolchain && !context.effectiveEnv.ELAN_TOOLCHAIN && (await exists(path.join(cursor, "leanpkg.toml"))))
+			throw new Error("Unsupported legacy Elan leanpkg.toml selection");
+		if (path.dirname(cursor) === cursor) break;
+	}
 	const selection = options.toolchain ?? context.effectiveEnv.ELAN_TOOLCHAIN ?? override ?? pinSelection;
 	if (!selection) throw new Error("Lean adapter requires subject lean-toolchain; Elan default fallback is forbidden");
 	const installName = selection.replace(/\//gu, "--").replace(/:/gu, "---");
@@ -766,7 +774,7 @@ async function selectedLean(
 	if (!(await fs.readdir(installed)).includes(installName))
 		throw new Error(`Selected Lean version is not installed: ${selection}`);
 	const home = await directory(path.join(installed, installName));
-	const env = { ...context.effectiveEnv, ELAN_TOOLCHAIN: selection };
+	const env = options.toolchain ? { ...context.effectiveEnv, ELAN_TOOLCHAIN: selection } : { ...context.effectiveEnv };
 	const lean = await regular(
 		probeText(await probe(context, discovery, [elan, "which", "lean"], { cwd, env })).trim(),
 		true,
@@ -877,12 +885,16 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 		addResult(roots, discovery, native);
 		return { roots, packages: [], discovery, cacheNamespaces: [], sdk: native.sdk, sourceRequirements };
 	}
-	const applicationOptions = applications
-		.filter((app) => path.basename(app.subject[0]) === "lake")
-		.map((app) => ({
-			cwd: path.resolve(app.cwd, leanOptions(app.subject).directory ?? "."),
-			options: leanOptions(app.subject),
-		}));
+	const applicationOptions = await Promise.all(
+		applications
+			.filter((app) => path.basename(app.subject[0]) === "lake")
+			.map(async (app) => ({
+				cwd: await directory(
+					await inputPath(app.cwd, leanOptions(app.subject).directory ?? ".", "Lake working directory"),
+				),
+				options: leanOptions(app.subject),
+			})),
+	);
 	if (
 		applicationOptions.some(
 			(app) =>
@@ -1129,6 +1141,11 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 		}
 	distributionRoot.exclude = [...new Set(distributionExclusions)].sort(utf8Compare);
 	const hashedRoots = roots.filter((root) => root.label === "distribution" || root.label.startsWith("packages/"));
+	const toolBound = (value: string): boolean =>
+		hashedRoots.some(
+			(root) =>
+				inside(root.path, value) && !root.exclude?.some((excluded) => inside(path.resolve(root.path, excluded), value)),
+		);
 	const generatedPaths = [
 		path.join(projectRoot, ".git"),
 		...all.flatMap((pkg) => [
@@ -1145,6 +1162,7 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 	sourceRequirements.excludedPaths = excludedPaths
 		.filter((value) => inside(projectRoot, value))
 		.map((value) => path.relative(projectRoot, value).split(path.sep).join("/") || ".");
+	const sourceDirectories: string[] = [];
 	for (const pkg of all)
 		for (const [value, source] of [
 			...pkg.metadata.sourceDirectories.map((value) => [value, true] as const),
@@ -1154,14 +1172,10 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 			const stat = await fs.stat(real);
 			if (source ? !stat.isDirectory() : !stat.isDirectory() && !stat.isFile())
 				throw new Error(`Unsupported Lake ${source ? "srcDir" : "input target"}: ${value}`);
-			if (
-				hashedRoots.some(
-					(root) =>
-						inside(root.path, real) &&
-						!root.exclude?.some((excluded) => inside(path.resolve(root.path, excluded), real)),
-				)
-			)
-				continue;
+			if (source) sourceDirectories.push(real);
+			if (!source && stat.isDirectory() && toolBound(real) && excludedPaths.some((excluded) => inside(real, excluded)))
+				throw new Error(`Lake input target contains an unhashed generated namespace: ${value}`);
+			if (toolBound(real)) continue;
 			if (!inside(projectRoot, real) || excludedPaths.some((excluded) => inside(excluded, real)))
 				throw new Error(`Lake ${source ? "srcDir" : "input target"} resolves outside hashed input roots: ${value}`);
 			const relative = path.relative(projectRoot, real).split(path.sep).join("/") || ".";
@@ -1172,13 +1186,63 @@ export async function identifyLean(context: AdapterContext): Promise<AdapterResu
 				: sourceRequirements.files
 			).push(relative);
 		}
+	// Cache integrity covers generated products, never source files placed in their namespaces.
+	const requireGeneratedSources = async (value: string): Promise<void> => {
+		if (toolBound(value) || path.basename(value) === ".git") return;
+		const stat = await fs.lstat(value);
+		if (stat.isSymbolicLink()) {
+			if (/\.lean$/iu.test(value) || (await fs.stat(value)).isDirectory())
+				throw new Error(`Symlink in Lake generated source namespace: ${value}`);
+			return;
+		}
+		if (stat.isDirectory()) {
+			for (const name of (await fs.readdir(value)).sort(utf8Compare))
+				await requireGeneratedSources(path.join(value, name));
+		} else if (stat.isFile() && /\.lean$/iu.test(value)) {
+			if (!inside(projectRoot, value)) throw new Error(`Unbound Lake source in generated namespace: ${value}`);
+			sourceRequirements.files.push(path.relative(projectRoot, value).split(path.sep).join("/"));
+		}
+	};
+	for (const value of excludedPaths)
+		if (sourceDirectories.some((source) => inside(source, value)) && (await exists(value)))
+			await requireGeneratedSources(value);
 	sourceRequirements.directories = [...new Set(sourceRequirements.directories)].sort(utf8Compare);
 	sourceRequirements.inputDirectories = [...new Set(sourceRequirements.inputDirectories)].sort(utf8Compare);
 	sourceRequirements.files = [...new Set(sourceRequirements.files)].sort(utf8Compare);
-	for (const value of [...rootMetadata.initialLeanPath, ...rootMetadata.initialSourcePath]) {
-		const real = await directory(path.resolve(cwd, value));
-		if (inside(selected.home, real) || all.some((pkg) => inside(pkg.directory, real))) continue;
-		throw new Error("Lean search path selects an undeclared imported package");
+	const generatedLibraries = rootMetadata.initialLeanPath.length
+		? await Promise.all(
+				all.map(async (pkg) =>
+					(await exists(pkg.metadata.leanLibraryDirectory))
+						? canonicalToolPath(pkg.metadata.leanLibraryDirectory)
+						: path.resolve(pkg.metadata.leanLibraryDirectory),
+				),
+			)
+		: [];
+	const declaredLakeCache =
+		context.applicationContexts.length > 0 &&
+		context.applicationContexts.every((app) => app.recipe.build_cache?.system === "lake") &&
+		applications.every((app) =>
+			context.applicationContexts.some((recipe) => {
+				const subject = leanInvocation(recipe.subject);
+				return (
+					recipe.cwd === app.cwd &&
+					subject.length === app.subject.length &&
+					subject.every((token, index) => token === app.subject[index])
+				);
+			}),
+		);
+	for (const [value, library] of [
+		...rootMetadata.initialLeanPath.map((value) => [value, true] as const),
+		...rootMetadata.initialSourcePath.map((value) => [value, false] as const),
+	]) {
+		const real = await directory(await inputPath(cwd, value, "Lean search path"));
+		if (
+			toolBound(real) &&
+			!hashedRoots.some((root) => root.exclude?.some((excluded) => inside(real, path.resolve(root.path, excluded))))
+		)
+			continue;
+		if (library && declaredLakeCache && generatedLibraries.includes(real)) continue;
+		throw new Error("Lean search path selects unbound prebuilt imports outside attested installed inputs");
 	}
 	for (const pkg of all)
 		for (const args of [pkg.metadata.leanArguments, ...pkg.metadata.targetArguments.map((target) => target.lean)])

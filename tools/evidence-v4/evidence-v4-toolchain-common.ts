@@ -112,6 +112,16 @@ export async function canonicalToolPath(value: string): Promise<string> {
 	}
 }
 
+export async function isRustupProxy(command: { invoked: string; realpath: string }): Promise<boolean> {
+	if (path.basename(command.realpath).startsWith("rustup")) return true;
+	const selected = await fs.stat(command.realpath);
+	const sibling = await fs.stat(path.join(path.dirname(command.invoked), "rustup")).catch((error) => {
+		if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+		throw error;
+	});
+	return sibling !== null && selected.dev === sibling.dev && selected.ino === sibling.ino;
+}
+
 export function toolPath(value: string): string {
 	if (value === ".") return value;
 	if (

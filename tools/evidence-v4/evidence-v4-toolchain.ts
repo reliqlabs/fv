@@ -19,6 +19,7 @@ import {
 	ELFReader,
 	ToolHasher,
 	canonicalToolPath,
+	isRustupProxy,
 	inside,
 	packageRoots,
 	probeJSON,
@@ -476,6 +477,20 @@ export async function discoverPythonAdapter(context: AdapterContext): Promise<Ad
 			actualStat.dev !== selectedStat.dev ||
 			actualStat.ino !== selectedStat.ino
 		) {
+			for (const token of command.subject.slice(1)) {
+				if (token === "-m" || token === "-c" || token.endsWith(".py"))
+					throw new Error("Unsupported Python command wrapper: " + command.subject[0]);
+				if (token.startsWith("-")) continue;
+				const target = await context.resolveCommand(token, command.cwd).catch((error) => {
+					if (/^Executable (?:not found:|absent from sanitized PATH:)/u.test(error.message)) return null;
+					throw error;
+				});
+				if (target) {
+					const stat = await fs.stat(target.realpath);
+					if (stat.dev === selectedStat.dev && stat.ino === selectedStat.ino)
+						throw new Error("Unsupported Python command wrapper: " + command.subject[0]);
+				}
+			}
 			if (await context.otherCommandBound?.(command)) continue;
 			throw new Error("Unsupported Python command wrapper: " + command.subject[0]);
 		}
@@ -584,11 +599,605 @@ export async function discoverPythonAdapter(context: AdapterContext): Promise<Ad
 			});
 		} else {
 			const file = path.resolve(command.cwd, entry);
+			if (!file.endsWith(".py")) throw new Error("Unsupported Python source entry: " + file);
 			requests.push({ ...common, file, argv: [entry, ...command.subject.slice(index + 1)] });
 		}
 	}
-	const code =
-		"import ast,hashlib,importlib.machinery,json,os,pathlib,site,sys,sysconfig\nroot=os.path.realpath(sys.argv[1]); requests=json.loads(sys.argv[2]); stdlib=os.path.realpath(sysconfig.get_path('stdlib')); extensions=os.path.realpath(sysconfig.get_config_var('DESTSHARED')); startup=[]; startup_hooks=set(); required=set(); seen=set(); active=set(); import_roots=[]\ndef within(base,p): return p==base or p.startswith(base+os.sep)\nfor p in sys.path:\n if p and os.path.isdir(p) and (p in site.getsitepackages() or p==site.getusersitepackages()): startup.extend(os.path.join(p,n) for n in sorted(os.listdir(p)) if n.endswith('.pth'))\nfor n in ('site','sitecustomize','usercustomize'):\n m=sys.modules.get(n)\n if m is not None and getattr(m,'__file__',None):\n  file=os.path.realpath(m.__file__); startup.append(file)\n  if n in ('sitecustomize','usercustomize'): startup_hooks.add(file)\nvenv=os.path.join(sys.prefix,'pyvenv.cfg')\nif os.path.isfile(venv): startup.append(venv)\nstartup.extend(file for request in requests for file in request.get('startup',[]))\nstartup=set(os.path.realpath(p) for p in startup)\ndef standard_input(p):\n return (within(stdlib,p) and 'site-packages' not in os.path.relpath(p,stdlib).split(os.sep)) or within(extensions,p)\ndef external(p):\n p=os.path.realpath(p)\n if not within(root,p) and not standard_input(p) and p not in startup: required.add(p)\nclass MissingImport(RuntimeError):\n def __init__(self,name):\n  self.module=name; super().__init__('unknown Python import dependency: '+name)\ndef catches_missing_import(handler,scope):\n if handler.type is None: return False\n types=handler.type.elts if isinstance(handler.type,ast.Tuple) else [handler.type]\n return any(isinstance(value,ast.Name) and value.id not in scope and value.id in ('ImportError','ModuleNotFoundError') for value in types)\ndef resolve(name,search,parents=None):\n parts=name.split('.')\n if parts[0] in sys.builtin_module_names: return None\n selected=None\n for index,part in enumerate(parts):\n  selected=importlib.machinery.PathFinder.find_spec('.'.join(parts[:index+1]),search)\n  if selected is None and index==0 and import_roots: selected=importlib.machinery.PathFinder.find_spec(parts[0],list(reversed(import_roots)))\n  if selected is None:\n   if parts[0] in sys.stdlib_module_names: return None\n   if index==0: raise MissingImport(name)\n   raise RuntimeError('unknown Python import dependency: '+name)\n  if index==0 and parts[0] in sys.stdlib_module_names and selected.origin and standard_input(os.path.realpath(selected.origin)): return None\n  if parents is not None: parents.append(('.'.join(parts[:index+1]),selected))\n  search=selected.submodule_search_locations\n  if index<len(parts)-1 and search is None: raise RuntimeError('unknown Python package dependency: '+name)\n return selected\n\ndef dependency(name,search,cwd,argv,flags,project):\n parents=[]; spec=resolve(name,search,parents)\n for module,selected in parents:\n  if selected.origin not in (None,'built-in','frozen'):\n   external(selected.origin); visit(selected.origin,search,cwd,argv,module,flags,project)\n return spec\n\ndef visit_loaded(file,paths,cwd,argv,name,flags):\n directory=os.path.dirname(file); added=directory not in import_roots\n if added: import_roots.append(directory)\n try: visit(file,paths,cwd,argv,name,flags,True)\n finally:\n  if added: import_roots.pop()\n\ndef from_modules(spec,names,search,cwd,argv,flags,project):\n if spec is None or spec.submodule_search_locations is None: return\n for name in names:\n  if name=='*':\n   if spec.origin and spec.origin.endswith('.py'):\n    with open(spec.origin,encoding='utf-8') as stream: tree=ast.parse(stream.read())\n    for node in tree.body:\n     if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=='__all__' for target in node.targets):\n      try: exports=ast.literal_eval(node.value)\n      except (ValueError,TypeError): raise RuntimeError('unresolved Python from-import export list')\n      if not isinstance(exports,(list,tuple)) or any(not isinstance(item,str) for item in exports): raise RuntimeError('unresolved Python from-import export list')\n      from_modules(spec,exports,search,cwd,argv,flags,project)\n   continue\n  selected=importlib.machinery.PathFinder.find_spec(spec.name+'.'+name,spec.submodule_search_locations)\n  if selected is not None: dependency(spec.name+'.'+name,search,cwd,argv,flags,project)\n\nUNKNOWN=object()\nclass PathSnapshot(list):\n __slots__=()\n\nSYS=object(); PATHLIB=object(); OS=object(); OSPATH=object(); PATH_FACTORY=object(); IMPORTLIB=object(); IMPORT_MODULE=object(); BUILTIN_IMPORT=object(); BUILTINS=object(); IMPORT_UTIL=object(); SPEC_FACTORY=object(); MODULE_FACTORY=object(); PROJECT_INPUT=object(); FORBIDDEN=object(); REFLECTION=object(); RUNPY=object(); RUN_PATH=object()\nclass ProjectLocation:\n def __init__(self,file): self.file=file\nclass LoadSpec:\n def __init__(self,file): self.file=file\nclass LoadedModule: pass\nclass LiteralArgument(str): pass\nclass UnknownArgv: pass\nclass PathMethod:\n def __init__(self,receiver,method): self.receiver=receiver; self.method=method\nSAFE_SYS=('path','argv','flags','modules','version','version_info','platform','executable','prefix','base_prefix','exec_prefix','base_exec_prefix','stdout','stderr','stdin','exit','maxsize','byteorder','implementation','getdefaultencoding','getfilesystemencoding','getrecursionlimit','setrecursionlimit','exc_info','exception','warnoptions')\ndef module_value(module,name,paths,argv,flags):\n if module is SYS:\n  if name not in SAFE_SYS: raise RuntimeError('unsupported Python runtime selector: sys.'+name)\n  return {'path':paths,'argv':argv,'flags':flags}.get(name,UNKNOWN)\n if module is IMPORTLIB:\n  if name not in ('import_module','util'): raise RuntimeError('unsupported dynamic Python loader API: importlib.'+name)\n  return IMPORT_MODULE if name=='import_module' else IMPORT_UTIL\n if module is IMPORT_UTIL:\n  if name not in ('spec_from_file_location','module_from_spec'): raise RuntimeError('unsupported dynamic Python loader API: importlib.util.'+name)\n  return SPEC_FACTORY if name=='spec_from_file_location' else MODULE_FACTORY\n if module is RUNPY:\n  if name!='run_path': raise RuntimeError('unsupported dynamic Python loader API: runpy.'+name)\n  return RUN_PATH\n if module is BUILTINS:\n  if name=='__import__': return BUILTIN_IMPORT\n  if name in ('exec','eval','compile'): return FORBIDDEN\n  if name in ('getattr','setattr','delattr','vars'): return REFLECTION\n  raise RuntimeError('unsupported Python builtin API: '+name)\n if module is FORBIDDEN: raise RuntimeError('unsupported dynamic Python loader API: '+name)\n return UNKNOWN\n\ndef project_path(value,cwd):\n if value is UNKNOWN or not isinstance(value,(str,pathlib.Path)): raise RuntimeError('unresolved Python import-path mutation')\n candidate=os.path.abspath(os.path.join(cwd,str(value)))\n real=os.path.realpath(candidate)\n if not within(root,candidate) or not within(root,real): raise RuntimeError('external Python import-path mutation: '+str(value))\n current=root\n for part in os.path.relpath(candidate,root).split(os.sep):\n  if part=='.': continue\n  current=os.path.join(current,part)\n  if os.path.islink(current): raise RuntimeError('symlinked Python import-path mutation: '+current)\n return real\n\ndef loader_location(node,values,paths,cwd,argv,flags):\n def literal(value):\n  if not isinstance(value,str) or os.path.isabs(value): raise RuntimeError('unresolved Python loader location')\n  return project_path(value,root)\n def sibling(part):\n  if isinstance(part,ast.Call) and not part.keywords:\n   if expression(part.func,values,paths,cwd,argv,flags) is PATH_FACTORY and len(part.args)==1 and isinstance(part.args[0],ast.Name) and part.args[0].id=='__file__': return True\n   if isinstance(part.func,ast.Attribute) and part.func.attr=='with_name' and len(part.args)==1 and isinstance(part.args[0],ast.Constant) and isinstance(part.args[0].value,str): return sibling(part.func.value)\n  if isinstance(part,ast.Attribute) and part.attr=='parent': return sibling(part.value)\n  if isinstance(part,ast.BinOp) and isinstance(part.op,ast.Div) and isinstance(part.right,ast.Constant) and isinstance(part.right.value,str) and not os.path.isabs(part.right.value): return sibling(part.left)\n  return False\n if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='str' and node.func.id not in values and len(node.args)==1 and not node.keywords: return loader_location(node.args[0],values,paths,cwd,argv,flags)\n if isinstance(node,ast.Constant) and isinstance(node.value,str): return literal(node.value)\n value=expression(node,values,paths,cwd,argv,flags)\n if isinstance(value,ProjectLocation): return value.file\n if isinstance(node,ast.Name) and isinstance(value,LiteralArgument): return literal(value)\n if sibling(node) and isinstance(value,pathlib.Path): return project_path(str(value),root)\n if isinstance(node,ast.Subscript) and isinstance(node.value,ast.Attribute) and node.value.attr=='argv' and expression(node.value.value,values,paths,cwd,argv,flags) is SYS and isinstance(node.slice,ast.Constant) and node.slice.value==0 and '__loader_argv__' in values: return values['__loader_argv__']\n raise RuntimeError('unresolved Python loader location')\n\ndef expression(node,values,paths,cwd,argv,flags):\n if isinstance(node,ast.Constant): return node.value\n if isinstance(node,ast.Name): return values.get(node.id,UNKNOWN)\n if isinstance(node,(ast.List,ast.Tuple)):\n  items=[expression(item,values,paths,cwd,argv,flags) for item in node.elts]\n  if any(item is paths or isinstance(item,PathMethod) or any(item is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')\n  return UNKNOWN if any(item is UNKNOWN for item in items) else items\n if isinstance(node,ast.UnaryOp) and isinstance(node.op,ast.USub):\n  operand=expression(node.operand,values,paths,cwd,argv,flags)\n  return -operand if isinstance(operand,int) and not isinstance(operand,bool) else UNKNOWN\n if isinstance(node,ast.BinOp):\n  left=expression(node.left,values,paths,cwd,argv,flags); right=expression(node.right,values,paths,cwd,argv,flags)\n  if isinstance(node.op,ast.Div) and isinstance(left,pathlib.Path) and isinstance(right,(str,pathlib.Path)): return left/right\n  if isinstance(node.op,ast.Add) and isinstance(left,str) and isinstance(right,str): return left+right\n  return UNKNOWN\n if isinstance(node,ast.Attribute):\n  base=expression(node.value,values,paths,cwd,argv,flags)\n  if base is SYS and node.attr=='argv': return values.get('__argv__',argv)\n  if any(base is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,FORBIDDEN,RUNPY)): return module_value(base,node.attr,paths,argv,flags)\n  if base is paths or isinstance(base,PathSnapshot):\n   if node.attr not in ('insert','append','copy'): raise RuntimeError('unsupported Python import-path mutation: '+node.attr)\n   return PathMethod(base,node.attr)\n  if isinstance(base,LoadSpec):\n   if node.attr=='loader': return base\n   if node.attr=='exec_module': return base\n   raise RuntimeError('unsupported dynamic Python loader API: '+node.attr)\n  if base is PATHLIB and node.attr=='Path': return PATH_FACTORY\n  if base is OS and node.attr=='path': return OSPATH\n  if isinstance(base,dict) and base is flags: return base.get(node.attr,UNKNOWN)\n  if isinstance(base,pathlib.Path) and node.attr in ('parent','parents','name','stem','suffix'): return getattr(base,node.attr)\n  return UNKNOWN\n if isinstance(node,ast.Slice):\n  bounds=[None if item is None else expression(item,values,paths,cwd,argv,flags) for item in (node.lower,node.upper,node.step)]\n  if any(item is UNKNOWN or (item is not None and (not isinstance(item,int) or isinstance(item,bool))) for item in bounds) or bounds[2]==0: return UNKNOWN\n  return slice(*bounds)\n if isinstance(node,ast.Subscript):\n  base=expression(node.value,values,paths,cwd,argv,flags); index=expression(node.slice,values,paths,cwd,argv,flags)\n  if base is UNKNOWN or index is UNKNOWN: return UNKNOWN\n  if base is BUILTINS: return module_value(base,index,paths,argv,flags)\n  try:\n   value=base[index]\n   return PathSnapshot(value) if isinstance(index,slice) and (base is paths or isinstance(base,PathSnapshot)) else value\n  except (IndexError,KeyError,TypeError): return UNKNOWN\n if isinstance(node,ast.Call):\n  target=expression(node.func,values,paths,cwd,argv,flags)\n  if target is FORBIDDEN: raise RuntimeError('unsupported dynamic Python loader API')\n  if isinstance(target,PathMethod):\n   if not isinstance(node.func,ast.Attribute): raise RuntimeError('unsupported Python import-path method alias')\n   if target.method=='copy' and not node.args and not node.keywords: return PathSnapshot(target.receiver)\n   return UNKNOWN\n  if target is PROJECT_INPUT:\n   if node.keywords or len(node.args)!=2: raise RuntimeError('unresolved Python loader location')\n   base=expression(node.args[0],values,paths,cwd,argv,flags); relative=expression(node.args[1],values,paths,cwd,argv,flags)\n   if base is UNKNOWN or relative is UNKNOWN: return UNKNOWN\n   if base!=pathlib.Path(root) or not isinstance(relative,str) or os.path.isabs(relative): raise RuntimeError('unresolved Python loader location')\n   return ProjectLocation(project_path(relative,root))\n  if target is SPEC_FACTORY:\n   if node.keywords or len(node.args)!=2: raise RuntimeError('unresolved Python loader location')\n   file=loader_location(node.args[1],values,paths,cwd,argv,flags)\n   if not os.path.isfile(file): raise RuntimeError('Python loader target is absent: '+file)\n   module=expression(node.args[0],values,paths,cwd,argv,flags)\n   if not isinstance(module,str): raise RuntimeError('unresolved Python loader module name')\n   effective_argv=values.get('__argv__',argv)\n   visit_loaded(file,paths,cwd,effective_argv if isinstance(effective_argv,list) else [],module,flags)\n   return LoadSpec(file)\n  if target is RUN_PATH:\n   if len(node.args)!=1 or any(keyword.arg not in ('run_name',) for keyword in node.keywords): raise RuntimeError('unsupported dynamic Python loader API: runpy.run_path')\n   file=loader_location(node.args[0],values,paths,cwd,argv,flags)\n   if not os.path.isfile(file): raise RuntimeError('Python loader target is absent: '+file)\n   run_name=next((expression(keyword.value,values,paths,cwd,argv,flags) for keyword in node.keywords if keyword.arg=='run_name'),'<run_path>')\n   if not isinstance(run_name,str): raise RuntimeError('unresolved Python loader run name')\n   effective_argv=values.get('__argv__',argv)\n   visit_loaded(file,paths,cwd,effective_argv if isinstance(effective_argv,list) else [],run_name,flags)\n   return UNKNOWN\n  if target is MODULE_FACTORY:\n   if node.keywords or len(node.args)!=1 or not isinstance(expression(node.args[0],values,paths,cwd,argv,flags),LoadSpec): raise RuntimeError('unresolved Python loader module spec')\n   return LoadedModule()\n  if isinstance(target,LoadSpec):\n   if not isinstance(node.func,ast.Attribute) or node.func.attr!='exec_module' or node.keywords or len(node.args)!=1 or not isinstance(expression(node.args[0],values,paths,cwd,argv,flags),LoadedModule): raise RuntimeError('unsupported dynamic Python loader API')\n   return UNKNOWN\n  if target is IMPORT_MODULE or target is BUILTIN_IMPORT:\n   arguments={keyword.arg:keyword.value for keyword in node.keywords}\n   name_node=node.args[0] if node.args else arguments.get('name')\n   name=expression(name_node,values,paths,cwd,argv,flags) if name_node is not None else UNKNOWN\n   if not isinstance(name,str): raise RuntimeError('unresolved dynamic Python import')\n   if target is IMPORT_MODULE and name.startswith('.'):\n    package_node=node.args[1] if len(node.args)>1 else arguments.get('package')\n    package=expression(package_node,values,paths,cwd,argv,flags) if package_node is not None else UNKNOWN\n    if not isinstance(package,str): raise RuntimeError('unresolved dynamic Python import package')\n    level=len(name)-len(name.lstrip('.')); parts=package.split('.')\n    if level>len(parts): raise RuntimeError('unresolved dynamic Python import package')\n    name='.'.join(parts[:len(parts)-level+1])+name[level-1:]\n   if target is BUILTIN_IMPORT:\n    level_node=node.args[4] if len(node.args)>4 else arguments.get('level')\n    if level_node is not None and expression(level_node,values,paths,cwd,argv,flags)!=0: raise RuntimeError('unresolved relative dynamic Python import')\n   spec=dependency(name,paths,cwd,argv,flags,True)\n   if target is BUILTIN_IMPORT:\n    from_node=node.args[3] if len(node.args)>3 else arguments.get('fromlist')\n    names=expression(from_node,values,paths,cwd,argv,flags) if from_node is not None else []\n    if not isinstance(names,(list,tuple)) or any(not isinstance(item,str) for item in names): raise RuntimeError('unresolved dynamic Python import from-list')\n    from_modules(spec,names,paths,cwd,argv,flags,True)\n   return UNKNOWN\n  args=[expression(arg,values,paths,cwd,argv,flags) for arg in node.args]\n  keywords={keyword.arg:expression(keyword.value,values,paths,cwd,argv,flags) for keyword in node.keywords}\n  if target is REFLECTION and args and (any(args[0] is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,FORBIDDEN,paths)) or isinstance(args[0],(PathSnapshot,LoadSpec))): raise RuntimeError('unsupported reflective Python runtime selector')\n  if any(any(arg is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for arg in [*args,*keywords.values()]): raise RuntimeError('unsupported Python runtime-selector escape')\n  if any(arg is paths or isinstance(arg,(PathSnapshot,PathMethod)) for arg in args) and not (isinstance(node.func,ast.Name) and node.func.id in ('list','len','tuple') and node.func.id not in values): raise RuntimeError('unsupported Python import-path escape')\n  if any(arg is UNKNOWN for arg in args) or any(value is UNKNOWN for value in keywords.values()): return UNKNOWN\n  target=expression(node.func,values,paths,cwd,argv,flags)\n  if target is PATH_FACTORY and not keywords and len(args)<=1:\n   return pathlib.Path(args[0]) if args and isinstance(args[0],(str,pathlib.Path)) else pathlib.Path('.') if not args else UNKNOWN\n  if isinstance(node.func,ast.Name) and node.func.id=='list' and node.func.id not in values and len(args)==1 and not keywords and (args[0] is paths or isinstance(args[0],PathSnapshot)): return PathSnapshot(args[0])\n  if isinstance(node.func,ast.Name) and node.func.id=='str' and node.func.id not in values and len(args)==1 and not keywords:\n   return str(args[0]) if isinstance(args[0],(str,pathlib.Path,int)) else UNKNOWN\n  if isinstance(node.func,ast.Attribute):\n   base=expression(node.func.value,values,paths,cwd,argv,flags); method=node.func.attr\n   if (base is paths or isinstance(base,PathSnapshot)) and method=='copy' and not args and not keywords: return PathSnapshot(base)\n   if base is PATH_FACTORY and method=='cwd' and not args and not keywords: return pathlib.Path(cwd)\n   if isinstance(base,pathlib.Path):\n    if method in ('exists','is_dir','is_file') and not args and not keywords:\n     candidate=os.path.abspath(os.path.join(cwd,str(base)))\n     return getattr(pathlib.Path(project_path(candidate,cwd)),method)() if within(root,candidate) else UNKNOWN\n    if method=='resolve' and not args and set(keywords)<=set(['strict']) and isinstance(keywords.get('strict',False),bool):\n     return (base if base.is_absolute() else pathlib.Path(cwd)/base).resolve(strict=keywords.get('strict',False))\n    if method=='absolute' and not args and not keywords: return pathlib.Path(os.path.abspath(os.path.join(cwd,str(base))))\n    if method in ('joinpath','with_name','with_suffix') and not keywords and all(isinstance(arg,str) for arg in args): return getattr(base,method)(*args)\n   if base is OSPATH and not keywords and all(isinstance(arg,str) for arg in args):\n    if method=='join': return os.path.join(*args)\n    if method=='dirname' and len(args)==1: return os.path.dirname(args[0])\n    if method in ('abspath','realpath','normpath') and len(args)==1:\n     value=os.path.join(cwd,args[0]) if not os.path.isabs(args[0]) else args[0]\n     return getattr(os.path,method)(value)\n  return UNKNOWN\n if isinstance(node,ast.Compare) and len(node.ops)==1:\n  left=expression(node.left,values,paths,cwd,argv,flags); right=expression(node.comparators[0],values,paths,cwd,argv,flags)\n  if left is UNKNOWN or right is UNKNOWN: return UNKNOWN\n  if isinstance(node.ops[0],ast.Eq): return left==right\n  if isinstance(node.ops[0],ast.NotEq): return left!=right\n for child in ast.iter_child_nodes(node):\n  if isinstance(child,ast.expr):\n   value=expression(child,values,paths,cwd,argv,flags)\n   if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector escape')\n return UNKNOWN\n\ndef argv_changes(node,scope,paths,cwd,argv,flags):\n selected=scope.get('__argv__',argv)\n for part in ast.walk(node):\n  if isinstance(part,ast.Call) and isinstance(part.func,ast.Attribute) and expression(part.func.value,scope,paths,cwd,argv,flags) is selected and part.func.attr!='copy': return True\n  targets=part.targets if isinstance(part,(ast.Assign,ast.Delete)) else [part.target] if isinstance(part,(ast.AnnAssign,ast.AugAssign)) else []\n  for target in targets:\n   if isinstance(target,ast.Attribute) and target.attr=='argv' and expression(target.value,scope,paths,cwd,argv,flags) is SYS: return True\n   if isinstance(target,ast.Subscript) and expression(target.value,scope,paths,cwd,argv,flags) is selected: return True\n return False\n\ndef path_changes(node,scope,paths,cwd,argv,flags):\n for part in ast.walk(node):\n  if isinstance(part,ast.Call):\n   target=expression(part.func,scope,paths,cwd,argv,flags)\n   if isinstance(target,PathMethod) and target.method!='copy': return True\n  targets=part.targets if isinstance(part,(ast.Assign,ast.Delete)) else [part.target] if isinstance(part,(ast.AnnAssign,ast.AugAssign)) else []\n  for target in targets:\n   base=expression(target.value,scope,paths,cwd,argv,flags) if isinstance(target,(ast.Attribute,ast.Subscript)) else expression(target,scope,paths,cwd,argv,flags)\n   if base is SYS and isinstance(target,ast.Attribute) and target.attr=='path': return True\n   if base is paths or isinstance(base,PathSnapshot): return True\n return False\n\n\ndef scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__main__',flags=None,project=True):\n paths=paths if paths is not None else [os.path.abspath(p or os.getcwd()) for p in sys.path]\n cwd=cwd or os.getcwd(); argv=argv if argv is not None else list(sys.argv)\n flags=flags or dict(isolated=bool(sys.flags.isolated),safe_path=bool(getattr(sys.flags,'safe_path',False)))\n values={'__name__':name,'__import__':BUILTIN_IMPORT,'__builtins__':BUILTINS,'exec':FORBIDDEN,'eval':FORBIDDEN,'compile':FORBIDDEN,'getattr':REFLECTION,'setattr':REFLECTION,'delattr':REFLECTION,'vars':REFLECTION}\n if filename is not None: values['__file__']=filename\n tree=ast.parse(source,filename=filename or '<inline cwd='+cwd+'>')\n parents={child:parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}\n functions={node.name:node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}\n specializations={}\n for function in functions.values():\n  args=[arg.arg for arg in function.args.posonlyargs+function.args.args]\n  for call in ast.walk(function):\n   if not isinstance(call,ast.Call) or not isinstance(call.func,ast.Attribute) or call.func.attr not in ('spec_from_file_location','run_path'): continue\n   location=call.args[1] if call.func.attr=='spec_from_file_location' and len(call.args)>1 else call.args[0] if call.args else None\n   if not isinstance(location,ast.Name): continue\n   parameter=location.id; input_name=None; root_parameter=None\n   assignments=[node for node in function.body if isinstance(node,ast.Assign) and len(node.targets)==1 and isinstance(node.targets[0],ast.Name) and node.targets[0].id==parameter]\n   if assignments:\n    assignment=assignments[0].value\n    if len(assignments)!=1 or not isinstance(assignment,ast.Call) or not isinstance(assignment.func,ast.Name) or len(assignment.args)!=2 or assignment.keywords or not all(isinstance(arg,ast.Name) for arg in assignment.args): raise RuntimeError('unresolved Python loader helper location')\n    input_name=assignment.func.id; root_parameter=assignment.args[0].id; parameter=assignment.args[1].id\n    helper=functions.get(input_name)\n    if helper is None or len(helper.body)<2: raise RuntimeError('unresolved Python loader input helper')\n    helper_args=[arg.arg for arg in helper.args.args]\n    first,last=helper.body[0],helper.body[-1]\n    if len(helper_args)!=2 or not isinstance(first,ast.Assign) or len(first.targets)!=1 or not isinstance(first.targets[0],ast.Name) or not isinstance(first.value,ast.BinOp) or not isinstance(first.value.op,ast.Div) or not isinstance(first.value.left,ast.Name) or first.value.left.id!=helper_args[0] or not isinstance(first.value.right,ast.Name) or first.value.right.id!=helper_args[1] or not isinstance(last,ast.Return) or not isinstance(last.value,ast.Name) or last.value.id!=first.targets[0].id: raise RuntimeError('unresolved Python loader input helper')\n    for guard in helper.body[1:-1]:\n     if any(isinstance(part,(ast.NamedExpr,ast.Await,ast.Yield,ast.YieldFrom)) for part in ast.walk(guard)): raise RuntimeError('unresolved Python loader input helper')\n     if not isinstance(guard,ast.If) or guard.orelse or not guard.body or any(not isinstance(statement,ast.Raise) for statement in guard.body): raise RuntimeError('unresolved Python loader input helper')\n     for probe in ast.walk(guard.test):\n      if isinstance(probe,ast.Call) and (not isinstance(probe.func,ast.Attribute) or not isinstance(probe.func.value,ast.Name) or probe.func.value.id!=first.targets[0].id or probe.func.attr not in ('is_symlink','resolve','is_file') or probe.args or probe.keywords): raise RuntimeError('unresolved Python loader input helper')\n    values[input_name]=PROJECT_INPUT\n   if parameter not in args or (root_parameter is not None and root_parameter not in args): raise RuntimeError('unresolved Python loader helper parameter')\n   relative_index=args.index(parameter); cases=[]\n   for reference in ast.walk(tree):\n    if not isinstance(reference,ast.Name) or reference.id!=function.name: continue\n    parent=parents.get(reference)\n    if not isinstance(parent,ast.Call) or parent.func is not reference or parent.keywords or len(parent.args)!=len(args): raise RuntimeError('unsupported Python loader helper alias')\n    relative=parent.args[relative_index]\n    if not isinstance(relative,ast.Constant) or not isinstance(relative.value,str): raise RuntimeError('non-literal Python loader helper location')\n    case={arg:LiteralArgument(value.value) if isinstance(value,ast.Constant) and isinstance(value.value,str) else value.value if isinstance(value,ast.Constant) else UNKNOWN for arg,value in zip(args,parent.args)}\n    if root_parameter is not None:\n     root_argument=parent.args[args.index(root_parameter)]\n     if not isinstance(root_argument,ast.Name) or root_argument.id!=root_parameter: raise RuntimeError('unresolved Python loader project root')\n     case[root_parameter]=pathlib.Path(root)\n    cases.append(case)\n   if not cases: raise RuntimeError('unresolved Python loader helper call sites')\n   specializations[function]=cases\n deferred=[]\n def calls(node):\n  if isinstance(node,ast.Call): yield node\n  for child in ast.iter_child_nodes(node):\n   if not isinstance(child,ast.stmt): yield from calls(child)\n def walk(nodes,scope,search,allow_path=True):\n  for node in nodes:\n   try:\n    if not allow_path and not isinstance(node,ast.Try) and path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported non-straightline Python import-path mutation')\n    if not isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and argv_changes(node,scope,search,cwd,argv,flags): scope.pop('__loader_argv__',None)\n    for call in calls(node):\n     target=expression(call.func,scope,search,cwd,argv,flags)\n     if isinstance(target,PathMethod) and target.method!='copy' and not (isinstance(node,ast.Expr) and node.value is call): raise RuntimeError('unsupported nested Python import-path mutation')\n     expression(call,scope,search,cwd,argv,flags)\n    if isinstance(node,(ast.Import,ast.ImportFrom)):\n     names=[alias.name for alias in node.names] if isinstance(node,ast.Import) else [node.module] if node.module else [alias.name for alias in node.names]\n     standards={}\n     for module in names:\n      lookup=search\n      if isinstance(node,ast.ImportFrom) and node.level:\n       base=directory\n       for _ in range(node.level-1): base=os.path.dirname(base)\n       lookup=[base]\n      spec=dependency(module,lookup,cwd,argv,flags,project)\n      standards[module]=spec is None or spec.origin in (None,'built-in','frozen')\n      if isinstance(node,ast.ImportFrom) and node.module: from_modules(spec,[alias.name for alias in node.names],lookup,cwd,argv,flags,project)\n     if isinstance(node,ast.Import):\n      for alias in node.names: scope[alias.asname or alias.name.split('.')[0]]={'sys':SYS,'pathlib':PATHLIB,'os':OS,'os.path':OSPATH,'importlib':IMPORTLIB,'importlib.util':IMPORT_UTIL,'importlib.machinery':FORBIDDEN,'importlib.abc':FORBIDDEN,'builtins':BUILTINS,'runpy':RUNPY,'site':FORBIDDEN,'pkgutil':FORBIDDEN,'zipimport':FORBIDDEN,'imp':FORBIDDEN}.get(alias.name if alias.asname else alias.name.split('.')[0],UNKNOWN) if standards[alias.name] else UNKNOWN\n     elif node.module in ('sys','builtins','importlib','importlib.util','runpy','site','pkgutil','zipimport','imp') and standards.get(node.module,False):\n      module={'sys':SYS,'builtins':BUILTINS,'importlib':IMPORTLIB,'importlib.util':IMPORT_UTIL,'runpy':RUNPY,'site':FORBIDDEN,'pkgutil':FORBIDDEN,'zipimport':FORBIDDEN,'imp':FORBIDDEN}[node.module]\n      for alias in node.names:\n       if module is SYS and alias.name=='path': raise RuntimeError('unsupported Python import-path alias')\n       scope[alias.asname or alias.name]=module_value(module,alias.name,search,argv,flags)\n     elif node.module and node.module.startswith('importlib.') and standards.get(node.module,False):\n      raise RuntimeError('unsupported dynamic Python loader API: '+node.module)\n     elif node.module=='pathlib' and standards.get(node.module,False):\n      for alias in node.names: scope[alias.asname or alias.name]=PATH_FACTORY if alias.name=='Path' else UNKNOWN\n     else:\n      for alias in node.names: scope[alias.asname or alias.name]=UNKNOWN\n    elif isinstance(node,(ast.Assign,ast.AnnAssign)):\n     value=expression(node.value,scope,search,cwd,argv,flags) if node.value else UNKNOWN\n     targets=node.targets if isinstance(node,ast.Assign) else [node.target]\n     for target in targets:\n      if isinstance(target,ast.Name):\n       if value is search: raise RuntimeError('unsupported Python import-path alias')\n       scope[target.id]=value\n      elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)):\n       if not isinstance(target,ast.Subscript): raise RuntimeError('unsupported Python import-path escape')\n       receiver=expression(target.value,scope,search,cwd,argv,flags)\n       if receiver is not search and not isinstance(receiver,PathSnapshot): raise RuntimeError('unsupported Python import-path escape')\n       index=expression(target.slice,scope,search,cwd,argv,flags)\n       if not isinstance(index,slice) or index.start not in (None,0) or index.stop is not None or index.step not in (None,1): raise RuntimeError('unsupported Python sys.path partial subscript mutation')\n       receiver[index]=list(value)\n      elif isinstance(target,ast.Attribute) and expression(target.value,scope,search,cwd,argv,flags) is SYS:\n       if target.attr=='path': raise RuntimeError('unsupported Python sys.path assignment')\n       if target.attr=='argv':\n        scope['__argv__']=value if isinstance(value,list) else UnknownArgv()\n        scope.pop('__loader_argv__',None)\n        if isinstance(node.value,ast.List) and node.value.elts:\n         try: scope['__loader_argv__']=loader_location(node.value.elts[0],scope,search,cwd,argv,flags)\n         except RuntimeError: pass\n       elif target.attr not in SAFE_SYS: raise RuntimeError('unsupported Python runtime selector: sys.'+target.attr)\n      elif isinstance(target,ast.Subscript):\n       receiver=expression(target.value,scope,search,cwd,argv,flags)\n       if receiver is search or isinstance(receiver,PathSnapshot):\n        index=expression(target.slice,scope,search,cwd,argv,flags)\n        if not isinstance(index,slice) or index.start not in (None,0) or index.stop is not None or index.step not in (None,1): raise RuntimeError('unsupported Python sys.path partial subscript mutation')\n        if value is search or isinstance(value,PathSnapshot): restored=list(value)\n        elif isinstance(value,list): restored=[project_path(item,cwd) for item in value]\n        else: raise RuntimeError('unresolved Python sys.path slice restoration')\n        receiver[index]=restored\n       elif isinstance(receiver,list):\n        index=expression(target.slice,scope,search,cwd,argv,flags)\n        if index is UNKNOWN or value is UNKNOWN: receiver[:]=[UNKNOWN]\n        else:\n         try: receiver[index]=value\n         except (IndexError,TypeError,ValueError): receiver[:]=[UNKNOWN]\n    elif isinstance(node,ast.Expr) and isinstance(node.value,ast.Call):\n     call=node.value\n     receiver=expression(call.func.value,scope,search,cwd,argv,flags) if isinstance(call.func,ast.Attribute) else UNKNOWN\n     if isinstance(call.func,ast.Attribute) and isinstance(receiver,list):\n      args=[expression(arg,scope,search,cwd,argv,flags) for arg in call.args]\n      bounded=receiver is search or isinstance(receiver,PathSnapshot)\n      if call.keywords or any(item is UNKNOWN for item in args):\n       if bounded: raise RuntimeError('unresolved Python import-path/list mutation')\n       receiver[:]=[UNKNOWN]; continue\n      normalize=lambda item: project_path(item,cwd) if bounded else item\n      if call.func.attr=='insert' and len(args)==2 and isinstance(args[0],int) and not isinstance(args[0],bool): receiver.insert(args[0],normalize(args[1]))\n      elif call.func.attr=='append' and len(args)==1: receiver.append(normalize(args[0]))\n      elif call.func.attr=='copy' and not args: continue\n      else:\n       if bounded: raise RuntimeError('unresolved Python import-path/list mutation')\n       receiver[:]=[UNKNOWN]\n    elif isinstance(node,(ast.AugAssign,ast.Delete)):\n     for target in node.targets if isinstance(node,ast.Delete) else [node.target]:\n      if isinstance(target,ast.Attribute): expression(target,scope,search,cwd,argv,flags)\n     if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported Python import-path mutation')\n    elif isinstance(node,ast.If):\n     condition=expression(node.test,scope,search,cwd,argv,flags)\n     if isinstance(condition,bool): walk(node.body if condition else node.orelse,scope,search,allow_path)\n     else:\n      if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unresolved conditional Python import-path setup')\n      walk(node.body,dict(scope),list(search),False); walk(node.orelse,dict(scope),list(search),False)\n    elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):\n     for default in [*node.args.defaults,*node.args.kw_defaults]:\n      value=expression(default,scope,search,cwd,argv,flags) if default is not None else UNKNOWN\n      if value is search or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector default argument')\n     deferred.append((node,scope))\n    elif isinstance(node,ast.ClassDef): walk(node.body,dict(scope),search,allow_path)\n    elif isinstance(node,ast.Try):\n     if not node.handlers:\n      mutates=path_changes(node,scope,search,cwd,argv,flags)\n      if mutates:\n       restores=[]\n       for statement in node.finalbody:\n        if isinstance(statement,ast.Assign) and len(statement.targets)==1 and isinstance(statement.targets[0],ast.Subscript):\n         target=statement.targets[0]; receiver=expression(target.value,scope,search,cwd,argv,flags); index=expression(target.slice,scope,search,cwd,argv,flags); value=expression(statement.value,scope,search,cwd,argv,flags)\n         if receiver is search and isinstance(index,slice) and index.start is None and index.stop is None and index.step is None and isinstance(value,PathSnapshot) and list(value)==list(search): restores.append(statement); continue\n        if path_changes(statement,scope,search,cwd,argv,flags): raise RuntimeError('unsupported exceptional Python import-path restoration')\n       if len(restores)!=1: raise RuntimeError('unsupported exceptional Python import-path restoration')\n      walk(node.body,scope,search,mutates); walk(node.orelse,scope,search,mutates); walk(node.finalbody,scope,search,mutates)\n     else:\n      if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unresolved exceptional Python import-path setup')\n      body_scope=dict(scope); body_search=list(search)\n      try: walk(node.body,body_scope,body_search,False)\n      except MissingImport as error:\n       if len(node.body)!=1 or not isinstance(node.body[0],ast.Import) or len(node.body[0].names)!=1 or node.body[0].names[0].name!=error.module: raise RuntimeError('unsupported guarded Python import absence') from error\n       handler=next((handler for handler in node.handlers if catches_missing_import(handler,scope)),None)\n       if handler is None: raise\n       walk(handler.body,body_scope,body_search,False)\n      else:\n       for handler in node.handlers: walk(handler.body,dict(scope),list(search),False)\n       walk(node.orelse,body_scope,body_search,False)\n      walk(node.finalbody,scope,search,False)\n    elif isinstance(node,(ast.For,ast.AsyncFor,ast.While,ast.With,ast.AsyncWith)):\n     if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported block Python import-path mutation')\n     walk(node.body,dict(scope),list(search),False)\n     if hasattr(node,'orelse'): walk(node.orelse,dict(scope),list(search),False)\n   except (RuntimeError,TypeError,ValueError,OSError) as error:\n    if isinstance(error,MissingImport): raise\n    raise RuntimeError(f\"{filename or '<inline cwd='+cwd+'>'}:{getattr(node,'lineno','?')}: {error}\") from error\n walk(tree.body,values,paths)\n while deferred:\n  function,outer=deferred.pop(0); local=dict(outer)\n  for arg in function.args.posonlyargs+function.args.args+function.args.kwonlyargs: local[arg.arg]=UNKNOWN\n  if function.args.vararg: local[function.args.vararg.arg]=UNKNOWN\n  if function.args.kwarg: local[function.args.kwarg.arg]=UNKNOWN\n  for case in specializations.get(function,[{}]):\n   selected=dict(local); selected.update(case)\n   for statement in function.body:\n    if not isinstance(statement,ast.Try) and path_changes(statement,selected,paths,cwd,argv,flags): raise RuntimeError('unsupported deferred Python import-path mutation')\n   function_paths=list(paths)\n   walk(function.body,selected,function_paths,False)\n   if function_paths!=paths: raise RuntimeError('unsupported deferred Python import-path mutation')\n\nsource_inputs={}\ndef visit(file,paths=None,cwd=None,argv=None,name='__main__',flags=None,project=True):\n real=os.path.realpath(file)\n key=(real,tuple(paths or sys.path),tuple(import_roots),cwd,tuple(argv or ()),name,tuple(sorted((flags or {}).items())))\n if key in seen: return\n seen.add(key)\n if real.endswith('.py'):\n  with open(real,'rb') as stream: data=stream.read()\n  source_inputs[real]='sha256:'+hashlib.sha256(data).hexdigest()\n  # Reviewed Homebrew bootstrap paths are already selected by the isolated runtime query.\n  if not project and real in startup_hooks and hashlib.sha256(data).hexdigest() in ('1a773d37457f89ca5d3b7c96541eb8e32e72e47d6c6d48b6428d81e3e7ddafff',): return\n  if (real,name) in active: return\n  active.add((real,name))\n  try: scan(data.decode('utf-8'),os.path.dirname(real),paths,cwd,argv,real,name,flags,project)\n  finally: active.remove((real,name))\n\nfor module in list(sys.modules.values()):\n file=getattr(module,'__file__',None)\n if file: external(file)\nfor p in startup:\n if p.endswith('.py') and (p in startup_hooks or not standard_input(p)): visit(p,project=False)\n elif p.endswith('.pth'):\n  with open(p,'rb') as stream: data=stream.read()\n  source_inputs[p]='sha256:'+hashlib.sha256(data).hexdigest()\n  for line in data.decode('utf-8').splitlines():\n   if line.startswith(('import ','import'+chr(9))): scan(line,os.path.dirname(p),project=False)\nrequirements=[dict(ids=json.loads(sys.argv[3]),files=sorted(required),paths=list(sys.path),inputs=sorted(source_inputs.items()))]\nfor request in requests:\n required=set(); seen=set(); source_inputs={}; startup_search=list(request['startup_paths'])\n if not request['flags'].get('no_site',False):\n  hooks=['sitecustomize']+([] if request['flags'].get('no_user_site',False) else ['usercustomize'])\n  for name in hooks:\n   spec=importlib.machinery.PathFinder.find_spec(name,startup_search)\n   if spec is not None and spec.origin not in (None,'built-in','frozen'):\n    external(spec.origin)\n    # Bootstrap hook path setup is already reflected in the interpreter query.\n    visit(spec.origin,startup_search,request['cwd'],request['argv'],name,request['flags'],project=os.path.realpath(spec.origin) not in startup_hooks)\n paths=([] if request['flags']['safe_path'] else [os.path.dirname(request['file']) if 'file' in request else request['cwd']])+startup_search\n if 'file' in request: visit(request['file'],paths,request['cwd'],request['argv'],flags=request['flags'])\n elif 'code' in request: scan(request['code'],request['cwd'],paths,request['cwd'],request['argv'],flags=request['flags'])\n else:\n  spec=dependency(request['module'],paths,request['cwd'],request['argv'],request['flags'],True)\n  if spec is not None:\n   if spec.submodule_search_locations:\n    if spec.origin not in (None,'built-in','frozen'): external(spec.origin); visit(spec.origin,paths,request['cwd'],request['argv'],request['module'],request['flags'])\n    main=importlib.machinery.PathFinder.find_spec(request['module']+'.__main__',spec.submodule_search_locations)\n    if main is None or main.origin is None: raise RuntimeError('unknown Python module entry point: '+request['module'])\n    external(main.origin); visit(main.origin,paths,request['cwd'],[main.origin]+request['argv'][1:],'__main__',request['flags'])\n   elif spec.origin not in (None,'built-in','frozen'):\n    external(spec.origin); visit(spec.origin,paths,request['cwd'],[spec.origin]+request['argv'][1:],'__main__',request['flags'])\n requirements.append(dict(ids=request['ids'],files=sorted(required),paths=paths,inputs=sorted(source_inputs.items())))\nprint(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,extensions=extensions,startup=sorted(startup),requirements=requirements),sort_keys=True))";
+	const code = String.raw`
+import ast,hashlib,importlib.machinery,json,os,pathlib,site,sys,sysconfig
+root=os.path.realpath(sys.argv[1]); requests=json.loads(sys.argv[2]); stdlib=os.path.realpath(sysconfig.get_path('stdlib')); extensions=os.path.realpath(sysconfig.get_config_var('DESTSHARED')); startup=[]; startup_hooks=set(); required=set(); seen=set(); active=set(); import_roots=[]
+def within(base,p): return p==base or p.startswith(base+os.sep)
+for p in sys.path:
+ if p and os.path.isdir(p) and (p in site.getsitepackages() or p==site.getusersitepackages()): startup.extend(os.path.join(p,n) for n in sorted(os.listdir(p)) if n.endswith('.pth'))
+for n in ('site','sitecustomize','usercustomize'):
+ m=sys.modules.get(n)
+ if m is not None and getattr(m,'__file__',None):
+  file=os.path.realpath(m.__file__); startup.append(file)
+  if n in ('sitecustomize','usercustomize'): startup_hooks.add(file)
+venv=os.path.join(sys.prefix,'pyvenv.cfg')
+if os.path.isfile(venv): startup.append(venv)
+startup.extend(file for request in requests for file in request.get('startup',[]))
+startup=set(os.path.realpath(p) for p in startup)
+def standard_input(p):
+ return (within(stdlib,p) and 'site-packages' not in os.path.relpath(p,stdlib).split(os.sep)) or within(extensions,p)
+def external(p):
+ p=os.path.realpath(p)
+ if not within(root,p) and not standard_input(p) and p not in startup: required.add(p)
+class MissingImport(RuntimeError):
+ def __init__(self,name):
+  self.module=name; super().__init__('unknown Python import dependency: '+name)
+def catches_missing_import(handler,scope):
+ if handler.type is None: return False
+ types=handler.type.elts if isinstance(handler.type,ast.Tuple) else [handler.type]
+ return any(isinstance(value,ast.Name) and value.id not in scope and value.id in ('ImportError','ModuleNotFoundError') for value in types)
+def resolve(name,search,parents=None):
+ parts=name.split('.')
+ if parts[0] in ('tkinter','dbm'): raise RuntimeError('unsupported Python split-formula stdlib dependency: '+name)
+ if name in ('pickle','_pickle','shelve','pydoc','logging.config'): raise RuntimeError('unsupported dynamic Python loader API: '+name)
+ if parts[0] in sys.builtin_module_names: return None
+ selected=None
+ for index,part in enumerate(parts):
+  selected=importlib.machinery.PathFinder.find_spec('.'.join(parts[:index+1]),search)
+  if selected is None and index==0 and import_roots: selected=importlib.machinery.PathFinder.find_spec(parts[0],list(reversed(import_roots)))
+  if selected is None:
+   if parts[0] in sys.stdlib_module_names: return None
+   if index==0: raise MissingImport(name)
+   raise RuntimeError('unknown Python import dependency: '+name)
+  # shortcut: transitive stdlib imports are unscanned; bind split-extension distributions before claiming startup closure.
+  if index==0 and parts[0] in sys.stdlib_module_names and selected.origin and standard_input(os.path.realpath(selected.origin)): return None
+  if parents is not None: parents.append(('.'.join(parts[:index+1]),selected))
+  search=selected.submodule_search_locations
+  if index<len(parts)-1 and search is None: raise RuntimeError('unknown Python package dependency: '+name)
+ return selected
+
+def dependency(name,search,cwd,argv,flags,project):
+ parents=[]; spec=resolve(name,search,parents)
+ for module,selected in parents:
+  if selected.origin not in (None,'built-in','frozen'):
+   external(selected.origin); visit(selected.origin,search,cwd,argv,module,flags,project)
+ return spec
+
+def visit_loaded(file,paths,cwd,argv,name,flags):
+ if not file.endswith('.py'): raise RuntimeError('unsupported Python source loader target: '+file)
+ directory=os.path.dirname(file); added=directory not in import_roots
+ if added: import_roots.append(directory)
+ try: visit(file,paths,cwd,argv,name,flags,True)
+ finally:
+  if added: import_roots.pop()
+
+def from_modules(spec,names,search,cwd,argv,flags,project):
+ if spec is None or spec.submodule_search_locations is None: return
+ for name in names:
+  if name=='*':
+   if spec.origin and spec.origin.endswith('.py'):
+    with open(spec.origin,encoding='utf-8') as stream: tree=ast.parse(stream.read())
+    for node in tree.body:
+     if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=='__all__' for target in node.targets):
+      try: exports=ast.literal_eval(node.value)
+      except (ValueError,TypeError): raise RuntimeError('unresolved Python from-import export list')
+      if not isinstance(exports,(list,tuple)) or any(not isinstance(item,str) for item in exports): raise RuntimeError('unresolved Python from-import export list')
+      from_modules(spec,exports,search,cwd,argv,flags,project)
+   continue
+  selected=importlib.machinery.PathFinder.find_spec(spec.name+'.'+name,spec.submodule_search_locations)
+  if selected is not None: dependency(spec.name+'.'+name,search,cwd,argv,flags,project)
+
+UNKNOWN=object()
+class PathSnapshot(list):
+ __slots__=()
+
+SYS=object(); PATHLIB=object(); OS=object(); OSPATH=object(); PATH_FACTORY=object(); IMPORTLIB=object(); IMPORT_MODULE=object(); BUILTIN_IMPORT=object(); BUILTINS=object(); IMPORT_UTIL=object(); SPEC_FACTORY=object(); MODULE_FACTORY=object(); PROJECT_INPUT=object(); FORBIDDEN=object(); REFLECTION=object(); RUNPY=object(); RUN_PATH=object()
+SYS_MODULES=object(); MODULE_LOOKUP=object(); OPAQUE_MODULE=object(); LOGGING=object()
+class ProjectLocation:
+ def __init__(self,file): self.file=file
+class LoadSpec:
+ def __init__(self,file): self.file=file
+class LoadedModule: pass
+class LiteralArgument(str): pass
+class UnknownArgv: pass
+class PathMethod:
+ def __init__(self,receiver,method): self.receiver=receiver; self.method=method
+SAFE_SYS=('path','argv','flags','modules','version','version_info','platform','executable','prefix','base_prefix','exec_prefix','base_exec_prefix','stdout','stderr','stdin','exit','maxsize','byteorder','implementation','getdefaultencoding','getfilesystemencoding','getrecursionlimit','setrecursionlimit','exc_info','exception','warnoptions')
+def module_value(module,name,paths,argv,flags):
+ if module is LOGGING: return FORBIDDEN if name=='config' else UNKNOWN
+ if module is SYS:
+  if name not in SAFE_SYS: raise RuntimeError('unsupported Python runtime selector: sys.'+name)
+  return {'path':paths,'argv':argv,'flags':flags,'modules':SYS_MODULES}.get(name,UNKNOWN)
+ if module is IMPORTLIB:
+  if name not in ('import_module','util'): raise RuntimeError('unsupported dynamic Python loader API: importlib.'+name)
+  return IMPORT_MODULE if name=='import_module' else IMPORT_UTIL
+ if module is IMPORT_UTIL:
+  if name not in ('spec_from_file_location','module_from_spec'): raise RuntimeError('unsupported dynamic Python loader API: importlib.util.'+name)
+  return SPEC_FACTORY if name=='spec_from_file_location' else MODULE_FACTORY
+ if module is RUNPY:
+  if name!='run_path': raise RuntimeError('unsupported dynamic Python loader API: runpy.'+name)
+  return RUN_PATH
+ if module is BUILTINS:
+  if name=='__import__': return BUILTIN_IMPORT
+  if name in ('exec','eval','compile'): return FORBIDDEN
+  if name in ('getattr','setattr','delattr','vars'): return REFLECTION
+  raise RuntimeError('unsupported Python builtin API: '+name)
+ if module is FORBIDDEN: raise RuntimeError('unsupported dynamic Python loader API: '+name)
+ return UNKNOWN
+
+def project_path(value,cwd):
+ if value is UNKNOWN or not isinstance(value,(str,pathlib.Path)): raise RuntimeError('unresolved Python import-path mutation')
+ candidate=os.path.abspath(os.path.join(cwd,str(value)))
+ real=os.path.realpath(candidate)
+ if not within(root,candidate) or not within(root,real): raise RuntimeError('external Python import-path mutation: '+str(value))
+ current=root
+ for part in os.path.relpath(candidate,root).split(os.sep):
+  if part=='.': continue
+  current=os.path.join(current,part)
+  if os.path.islink(current): raise RuntimeError('symlinked Python import-path mutation: '+current)
+ return real
+
+def loader_location(node,values,paths,cwd,argv,flags):
+ def literal(value):
+  if not isinstance(value,str) or os.path.isabs(value): raise RuntimeError('unresolved Python loader location')
+  return project_path(value,cwd)
+ def sibling(part):
+  if isinstance(part,ast.Call) and not part.keywords:
+   if expression(part.func,values,paths,cwd,argv,flags) is PATH_FACTORY and len(part.args)==1 and isinstance(part.args[0],ast.Name) and part.args[0].id=='__file__': return True
+   if isinstance(part.func,ast.Attribute) and part.func.attr=='with_name' and len(part.args)==1 and isinstance(part.args[0],ast.Constant) and isinstance(part.args[0].value,str): return sibling(part.func.value)
+  if isinstance(part,ast.Attribute) and part.attr=='parent': return sibling(part.value)
+  if isinstance(part,ast.BinOp) and isinstance(part.op,ast.Div) and isinstance(part.right,ast.Constant) and isinstance(part.right.value,str) and not os.path.isabs(part.right.value): return sibling(part.left)
+  return False
+ if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='str' and node.func.id not in values and len(node.args)==1 and not node.keywords: return loader_location(node.args[0],values,paths,cwd,argv,flags)
+ if isinstance(node,ast.Constant) and isinstance(node.value,str): return literal(node.value)
+ value=expression(node,values,paths,cwd,argv,flags)
+ if isinstance(value,ProjectLocation): return value.file
+ if isinstance(node,ast.Name) and isinstance(value,LiteralArgument): return literal(value)
+ if sibling(node) and isinstance(value,pathlib.Path): return project_path(str(value),root)
+ if isinstance(node,ast.Subscript) and isinstance(node.value,ast.Attribute) and node.value.attr=='argv' and expression(node.value.value,values,paths,cwd,argv,flags) is SYS and isinstance(node.slice,ast.Constant) and node.slice.value==0 and '__loader_argv__' in values: return values['__loader_argv__']
+ raise RuntimeError('unresolved Python loader location')
+
+def expression(node,values,paths,cwd,argv,flags):
+ if isinstance(node,ast.Constant): return node.value
+ if isinstance(node,ast.Name): return values.get(node.id,UNKNOWN)
+ if isinstance(node,(ast.List,ast.Tuple)):
+  items=[expression(item,values,paths,cwd,argv,flags) for item in node.elts]
+  if any(item is paths or isinstance(item,PathMethod) or any(item is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for item in items): raise RuntimeError('unsupported Python runtime-selector escape')
+  return UNKNOWN if any(item is UNKNOWN for item in items) else items
+ if isinstance(node,ast.UnaryOp) and isinstance(node.op,ast.USub):
+  operand=expression(node.operand,values,paths,cwd,argv,flags)
+  return -operand if isinstance(operand,int) and not isinstance(operand,bool) else UNKNOWN
+ if isinstance(node,ast.BinOp):
+  left=expression(node.left,values,paths,cwd,argv,flags); right=expression(node.right,values,paths,cwd,argv,flags)
+  if isinstance(node.op,ast.Div) and isinstance(left,pathlib.Path) and isinstance(right,(str,pathlib.Path)): return left/right
+  if isinstance(node.op,ast.Add) and isinstance(left,str) and isinstance(right,str): return left+right
+  return UNKNOWN
+ if isinstance(node,ast.Attribute):
+  base=expression(node.value,values,paths,cwd,argv,flags)
+  if base is LOGGING: return module_value(base,node.attr,paths,argv,flags)
+  if base is OPAQUE_MODULE: raise RuntimeError('unsupported opaque Python module access')
+  if base is SYS_MODULES:
+   if node.attr not in ('get','pop'): raise RuntimeError('unsupported Python module registry API: '+node.attr)
+   return MODULE_LOOKUP
+  if base is SYS and node.attr=='argv': return values.get('__argv__',argv)
+  if any(base is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,FORBIDDEN,RUNPY)): return module_value(base,node.attr,paths,argv,flags)
+  if base is paths or isinstance(base,PathSnapshot):
+   if node.attr not in ('insert','append','copy'): raise RuntimeError('unsupported Python import-path mutation: '+node.attr)
+   return PathMethod(base,node.attr)
+  if isinstance(base,LoadSpec):
+   if node.attr=='loader': return base
+   if node.attr=='exec_module': return base
+   raise RuntimeError('unsupported dynamic Python loader API: '+node.attr)
+  if base is PATHLIB and node.attr=='Path': return PATH_FACTORY
+  if base is OS and node.attr=='path': return OSPATH
+  if isinstance(base,dict) and base is flags: return base.get(node.attr,UNKNOWN)
+  if isinstance(base,pathlib.Path) and node.attr in ('parent','parents','name','stem','suffix'): return getattr(base,node.attr)
+  return UNKNOWN
+ if isinstance(node,ast.Slice):
+  bounds=[None if item is None else expression(item,values,paths,cwd,argv,flags) for item in (node.lower,node.upper,node.step)]
+  if any(item is UNKNOWN or (item is not None and (not isinstance(item,int) or isinstance(item,bool))) for item in bounds) or bounds[2]==0: return UNKNOWN
+  return slice(*bounds)
+ if isinstance(node,ast.Subscript):
+  base=expression(node.value,values,paths,cwd,argv,flags); index=expression(node.slice,values,paths,cwd,argv,flags)
+  if base is SYS_MODULES: return OPAQUE_MODULE
+  if base is OPAQUE_MODULE: raise RuntimeError('unsupported opaque Python module access')
+  if base is UNKNOWN or index is UNKNOWN: return UNKNOWN
+  if base is BUILTINS: return module_value(base,index,paths,argv,flags)
+  try:
+   value=base[index]
+   return PathSnapshot(value) if isinstance(index,slice) and (base is paths or isinstance(base,PathSnapshot)) else value
+  except (IndexError,KeyError,TypeError): return UNKNOWN
+ if isinstance(node,ast.Call):
+  target=expression(node.func,values,paths,cwd,argv,flags)
+  if target is OPAQUE_MODULE: raise RuntimeError('unsupported opaque Python module call')
+  if target is MODULE_LOOKUP:
+   for argument in [*node.args,*[keyword.value for keyword in node.keywords]]: expression(argument,values,paths,cwd,argv,flags)
+   return OPAQUE_MODULE
+  if target is FORBIDDEN: raise RuntimeError('unsupported dynamic Python loader API')
+  if isinstance(target,PathMethod):
+   if not isinstance(node.func,ast.Attribute): raise RuntimeError('unsupported Python import-path method alias')
+   if target.method=='copy' and not node.args and not node.keywords: return PathSnapshot(target.receiver)
+   return UNKNOWN
+  if target is PROJECT_INPUT:
+   if node.keywords or len(node.args)!=2: raise RuntimeError('unresolved Python loader location')
+   base=expression(node.args[0],values,paths,cwd,argv,flags); relative=expression(node.args[1],values,paths,cwd,argv,flags)
+   if base is UNKNOWN or relative is UNKNOWN: return UNKNOWN
+   if base!=pathlib.Path(root) or not isinstance(relative,str) or os.path.isabs(relative): raise RuntimeError('unresolved Python loader location')
+   return ProjectLocation(project_path(relative,root))
+  if target is SPEC_FACTORY:
+   if node.keywords or len(node.args)!=2: raise RuntimeError('unresolved Python loader location')
+   file=loader_location(node.args[1],values,paths,cwd,argv,flags)
+   if not os.path.isfile(file): raise RuntimeError('Python loader target is absent: '+file)
+   module=expression(node.args[0],values,paths,cwd,argv,flags)
+   if not isinstance(module,str): raise RuntimeError('unresolved Python loader module name')
+   effective_argv=values.get('__argv__',argv)
+   visit_loaded(file,paths,cwd,effective_argv if isinstance(effective_argv,list) else [],module,flags)
+   return LoadSpec(file)
+  if target is RUN_PATH:
+   if len(node.args)!=1 or any(keyword.arg not in ('run_name',) for keyword in node.keywords): raise RuntimeError('unsupported dynamic Python loader API: runpy.run_path')
+   file=loader_location(node.args[0],values,paths,cwd,argv,flags)
+   if not os.path.isfile(file): raise RuntimeError('Python loader target is absent: '+file)
+   run_name=next((expression(keyword.value,values,paths,cwd,argv,flags) for keyword in node.keywords if keyword.arg=='run_name'),'<run_path>')
+   if not isinstance(run_name,str): raise RuntimeError('unresolved Python loader run name')
+   effective_argv=values.get('__argv__',argv)
+   visit_loaded(file,paths,cwd,effective_argv if isinstance(effective_argv,list) else [],run_name,flags)
+   return UNKNOWN
+  if target is MODULE_FACTORY:
+   if node.keywords or len(node.args)!=1 or not isinstance(expression(node.args[0],values,paths,cwd,argv,flags),LoadSpec): raise RuntimeError('unresolved Python loader module spec')
+   return LoadedModule()
+  if isinstance(target,LoadSpec):
+   if not isinstance(node.func,ast.Attribute) or node.func.attr!='exec_module' or node.keywords or len(node.args)!=1 or not isinstance(expression(node.args[0],values,paths,cwd,argv,flags),LoadedModule): raise RuntimeError('unsupported dynamic Python loader API')
+   return UNKNOWN
+  if target is IMPORT_MODULE or target is BUILTIN_IMPORT:
+   arguments={keyword.arg:keyword.value for keyword in node.keywords}
+   name_node=node.args[0] if node.args else arguments.get('name')
+   name=expression(name_node,values,paths,cwd,argv,flags) if name_node is not None else UNKNOWN
+   if not isinstance(name,str): raise RuntimeError('unresolved dynamic Python import')
+   if target is IMPORT_MODULE and name.startswith('.'):
+    package_node=node.args[1] if len(node.args)>1 else arguments.get('package')
+    package=expression(package_node,values,paths,cwd,argv,flags) if package_node is not None else UNKNOWN
+    if not isinstance(package,str): raise RuntimeError('unresolved dynamic Python import package')
+    level=len(name)-len(name.lstrip('.')); parts=package.split('.')
+    if level>len(parts): raise RuntimeError('unresolved dynamic Python import package')
+    name='.'.join(parts[:len(parts)-level+1])+name[level-1:]
+   if target is BUILTIN_IMPORT:
+    level_node=node.args[4] if len(node.args)>4 else arguments.get('level')
+    if level_node is not None and expression(level_node,values,paths,cwd,argv,flags)!=0: raise RuntimeError('unresolved relative dynamic Python import')
+   spec=dependency(name,paths,cwd,argv,flags,True)
+   if target is BUILTIN_IMPORT:
+    from_node=node.args[3] if len(node.args)>3 else arguments.get('fromlist')
+    names=expression(from_node,values,paths,cwd,argv,flags) if from_node is not None else []
+    if not isinstance(names,(list,tuple)) or any(not isinstance(item,str) for item in names): raise RuntimeError('unresolved dynamic Python import from-list')
+    from_modules(spec,names,paths,cwd,argv,flags,True)
+   return UNKNOWN
+  args=[expression(arg,values,paths,cwd,argv,flags) for arg in node.args]
+  keywords={keyword.arg:expression(keyword.value,values,paths,cwd,argv,flags) for keyword in node.keywords}
+  if target is REFLECTION and args and (any(args[0] is module for module in (SYS,SYS_MODULES,OPAQUE_MODULE,IMPORTLIB,IMPORT_UTIL,BUILTINS,FORBIDDEN,paths)) or isinstance(args[0],(PathSnapshot,LoadSpec))): raise RuntimeError('unsupported reflective Python runtime selector')
+  if any(any(arg is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)) for arg in [*args,*keywords.values()]): raise RuntimeError('unsupported Python runtime-selector escape')
+  if any(arg is SYS_MODULES or arg is MODULE_LOOKUP or arg is OPAQUE_MODULE for arg in [*args,*keywords.values()]): raise RuntimeError('unsupported opaque Python module escape')
+  if any(arg is paths or isinstance(arg,(PathSnapshot,PathMethod)) for arg in args) and not (isinstance(node.func,ast.Name) and node.func.id in ('list','len','tuple') and node.func.id not in values): raise RuntimeError('unsupported Python import-path escape')
+  if any(arg is UNKNOWN for arg in args) or any(value is UNKNOWN for value in keywords.values()): return UNKNOWN
+  target=expression(node.func,values,paths,cwd,argv,flags)
+  if target is PATH_FACTORY and not keywords and len(args)<=1:
+   return pathlib.Path(args[0]) if args and isinstance(args[0],(str,pathlib.Path)) else pathlib.Path('.') if not args else UNKNOWN
+  if isinstance(node.func,ast.Name) and node.func.id=='list' and node.func.id not in values and len(args)==1 and not keywords and (args[0] is paths or isinstance(args[0],PathSnapshot)): return PathSnapshot(args[0])
+  if isinstance(node.func,ast.Name) and node.func.id=='str' and node.func.id not in values and len(args)==1 and not keywords:
+   return str(args[0]) if isinstance(args[0],(str,pathlib.Path,int)) else UNKNOWN
+  if isinstance(node.func,ast.Attribute):
+   base=expression(node.func.value,values,paths,cwd,argv,flags); method=node.func.attr
+   if (base is paths or isinstance(base,PathSnapshot)) and method=='copy' and not args and not keywords: return PathSnapshot(base)
+   if base is PATH_FACTORY and method=='cwd' and not args and not keywords: return pathlib.Path(cwd)
+   if isinstance(base,pathlib.Path):
+    if method in ('exists','is_dir','is_file') and not args and not keywords:
+     candidate=os.path.abspath(os.path.join(cwd,str(base)))
+     return getattr(pathlib.Path(project_path(candidate,cwd)),method)() if within(root,candidate) else UNKNOWN
+    if method=='resolve' and not args and set(keywords)<=set(['strict']) and isinstance(keywords.get('strict',False),bool):
+     return (base if base.is_absolute() else pathlib.Path(cwd)/base).resolve(strict=keywords.get('strict',False))
+    if method=='absolute' and not args and not keywords: return pathlib.Path(os.path.abspath(os.path.join(cwd,str(base))))
+    if method in ('joinpath','with_name','with_suffix') and not keywords and all(isinstance(arg,str) for arg in args): return getattr(base,method)(*args)
+   if base is OSPATH and not keywords and all(isinstance(arg,str) for arg in args):
+    if method=='join': return os.path.join(*args)
+    if method=='dirname' and len(args)==1: return os.path.dirname(args[0])
+    if method in ('abspath','realpath','normpath') and len(args)==1:
+     value=os.path.join(cwd,args[0]) if not os.path.isabs(args[0]) else args[0]
+     return getattr(os.path,method)(value)
+  return UNKNOWN
+ if isinstance(node,ast.Compare) and len(node.ops)==1:
+  left=expression(node.left,values,paths,cwd,argv,flags); right=expression(node.comparators[0],values,paths,cwd,argv,flags)
+  if left is UNKNOWN or right is UNKNOWN: return UNKNOWN
+  if isinstance(node.ops[0],ast.Eq): return left==right
+  if isinstance(node.ops[0],ast.NotEq): return left!=right
+ for child in ast.iter_child_nodes(node):
+  if isinstance(child,ast.expr):
+   value=expression(child,values,paths,cwd,argv,flags)
+   if value is paths or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector escape')
+ return UNKNOWN
+
+def argv_changes(node,scope,paths,cwd,argv,flags):
+ selected=scope.get('__argv__',argv)
+ for part in ast.walk(node):
+  if isinstance(part,ast.Call) and isinstance(part.func,ast.Attribute) and expression(part.func.value,scope,paths,cwd,argv,flags) is selected and part.func.attr!='copy': return True
+  targets=part.targets if isinstance(part,(ast.Assign,ast.Delete)) else [part.target] if isinstance(part,(ast.AnnAssign,ast.AugAssign)) else []
+  for target in targets:
+   if isinstance(target,ast.Attribute) and target.attr=='argv' and expression(target.value,scope,paths,cwd,argv,flags) is SYS: return True
+   if isinstance(target,ast.Subscript) and expression(target.value,scope,paths,cwd,argv,flags) is selected: return True
+ return False
+
+def path_changes(node,scope,paths,cwd,argv,flags):
+ for part in ast.walk(node):
+  if isinstance(part,ast.Call):
+   target=expression(part.func,scope,paths,cwd,argv,flags)
+   if isinstance(target,PathMethod) and target.method!='copy': return True
+  targets=part.targets if isinstance(part,(ast.Assign,ast.Delete)) else [part.target] if isinstance(part,(ast.AnnAssign,ast.AugAssign)) else []
+  for target in targets:
+   base=expression(target.value,scope,paths,cwd,argv,flags) if isinstance(target,(ast.Attribute,ast.Subscript)) else expression(target,scope,paths,cwd,argv,flags)
+   if base is SYS and isinstance(target,ast.Attribute) and target.attr=='path': return True
+   if base is paths or isinstance(base,PathSnapshot): return True
+ return False
+
+
+def scan(source,directory,paths=None,cwd=None,argv=None,filename=None,name='__main__',flags=None,project=True):
+ paths=paths if paths is not None else [os.path.abspath(p or os.getcwd()) for p in sys.path]
+ cwd=cwd or os.getcwd(); argv=argv if argv is not None else list(sys.argv)
+ flags=flags or dict(isolated=bool(sys.flags.isolated),safe_path=bool(getattr(sys.flags,'safe_path',False)))
+ values={'__name__':name,'__import__':BUILTIN_IMPORT,'__builtins__':BUILTINS,'exec':FORBIDDEN,'eval':FORBIDDEN,'compile':FORBIDDEN,'getattr':REFLECTION,'setattr':REFLECTION,'delattr':REFLECTION,'vars':REFLECTION}
+ if filename is not None: values['__file__']=filename
+ tree=ast.parse(source,filename=filename or '<inline cwd='+cwd+'>')
+ parents={child:parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+ functions={node.name:node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}
+ specializations={}
+ # shortcut: helper roots and cross-module calls need a value-bound loader contract before cross-run reuse is sound.
+ for function in functions.values():
+  args=[arg.arg for arg in function.args.posonlyargs+function.args.args]
+  for call in ast.walk(function):
+   if not isinstance(call,ast.Call) or not isinstance(call.func,ast.Attribute) or call.func.attr not in ('spec_from_file_location','run_path'): continue
+   location=call.args[1] if call.func.attr=='spec_from_file_location' and len(call.args)>1 else call.args[0] if call.args else None
+   if not isinstance(location,ast.Name): continue
+   parameter=location.id; input_name=None; root_parameter=None
+   assignments=[node for node in function.body if isinstance(node,ast.Assign) and len(node.targets)==1 and isinstance(node.targets[0],ast.Name) and node.targets[0].id==parameter]
+   if assignments:
+    assignment=assignments[0].value
+    if len(assignments)!=1 or not isinstance(assignment,ast.Call) or not isinstance(assignment.func,ast.Name) or len(assignment.args)!=2 or assignment.keywords or not all(isinstance(arg,ast.Name) for arg in assignment.args): raise RuntimeError('unresolved Python loader helper location')
+    input_name=assignment.func.id; root_parameter=assignment.args[0].id; parameter=assignment.args[1].id
+    helper=functions.get(input_name)
+    if helper is None or len(helper.body)<2: raise RuntimeError('unresolved Python loader input helper')
+    helper_args=[arg.arg for arg in helper.args.args]
+    first,last=helper.body[0],helper.body[-1]
+    if len(helper_args)!=2 or not isinstance(first,ast.Assign) or len(first.targets)!=1 or not isinstance(first.targets[0],ast.Name) or not isinstance(first.value,ast.BinOp) or not isinstance(first.value.op,ast.Div) or not isinstance(first.value.left,ast.Name) or first.value.left.id!=helper_args[0] or not isinstance(first.value.right,ast.Name) or first.value.right.id!=helper_args[1] or not isinstance(last,ast.Return) or not isinstance(last.value,ast.Name) or last.value.id!=first.targets[0].id: raise RuntimeError('unresolved Python loader input helper')
+    for guard in helper.body[1:-1]:
+     if any(isinstance(part,(ast.NamedExpr,ast.Await,ast.Yield,ast.YieldFrom)) for part in ast.walk(guard)): raise RuntimeError('unresolved Python loader input helper')
+     if not isinstance(guard,ast.If) or guard.orelse or not guard.body or any(not isinstance(statement,ast.Raise) for statement in guard.body): raise RuntimeError('unresolved Python loader input helper')
+     for probe in ast.walk(guard.test):
+      if isinstance(probe,ast.Call) and (not isinstance(probe.func,ast.Attribute) or not isinstance(probe.func.value,ast.Name) or probe.func.value.id!=first.targets[0].id or probe.func.attr not in ('is_symlink','resolve','is_file') or probe.args or probe.keywords): raise RuntimeError('unresolved Python loader input helper')
+    values[input_name]=PROJECT_INPUT
+   if parameter not in args or (root_parameter is not None and root_parameter not in args): raise RuntimeError('unresolved Python loader helper parameter')
+   relative_index=args.index(parameter); cases=[]
+   for reference in ast.walk(tree):
+    if not isinstance(reference,ast.Name) or reference.id!=function.name: continue
+    parent=parents.get(reference)
+    if not isinstance(parent,ast.Call) or parent.func is not reference or parent.keywords or len(parent.args)!=len(args): raise RuntimeError('unsupported Python loader helper alias')
+    relative=parent.args[relative_index]
+    if not isinstance(relative,ast.Constant) or not isinstance(relative.value,str): raise RuntimeError('non-literal Python loader helper location')
+    case={arg:LiteralArgument(value.value) if isinstance(value,ast.Constant) and isinstance(value.value,str) else value.value if isinstance(value,ast.Constant) else UNKNOWN for arg,value in zip(args,parent.args)}
+    if root_parameter is not None:
+     root_argument=parent.args[args.index(root_parameter)]
+     if not isinstance(root_argument,ast.Name) or root_argument.id!=root_parameter: raise RuntimeError('unresolved Python loader project root')
+     case[root_parameter]=pathlib.Path(root)
+    cases.append(case)
+   if not cases: raise RuntimeError('unresolved Python loader helper call sites')
+   specializations[function]=cases
+ deferred=[]
+ def calls(node):
+  if isinstance(node,ast.Call): yield node
+  for child in ast.iter_child_nodes(node):
+   if not isinstance(child,ast.stmt): yield from calls(child)
+ def walk(nodes,scope,search,allow_path=True):
+  for node in nodes:
+   try:
+    if not allow_path and not isinstance(node,ast.Try) and path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported non-straightline Python import-path mutation')
+    if not isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and argv_changes(node,scope,search,cwd,argv,flags): scope.pop('__loader_argv__',None)
+    for call in calls(node):
+     target=expression(call.func,scope,search,cwd,argv,flags)
+     if isinstance(target,PathMethod) and target.method!='copy' and not (isinstance(node,ast.Expr) and node.value is call): raise RuntimeError('unsupported nested Python import-path mutation')
+     expression(call,scope,search,cwd,argv,flags)
+    if isinstance(node,(ast.Import,ast.ImportFrom)):
+     names=[alias.name for alias in node.names] if isinstance(node,ast.Import) else [node.module] if node.module else [alias.name for alias in node.names]
+     standards={}
+     for module in names:
+      lookup=search
+      if isinstance(node,ast.ImportFrom) and node.level:
+       base=directory
+       for _ in range(node.level-1): base=os.path.dirname(base)
+       lookup=[base]
+      spec=dependency(module,lookup,cwd,argv,flags,project)
+      standards[module]=spec is None or spec.origin in (None,'built-in','frozen')
+      if isinstance(node,ast.ImportFrom) and node.module: from_modules(spec,[alias.name for alias in node.names],lookup,cwd,argv,flags,project)
+     if isinstance(node,ast.Import):
+      for alias in node.names: scope[alias.asname or alias.name.split('.')[0]]={'sys':SYS,'pathlib':PATHLIB,'os':OS,'os.path':OSPATH,'importlib':IMPORTLIB,'importlib.util':IMPORT_UTIL,'importlib.machinery':FORBIDDEN,'importlib.abc':FORBIDDEN,'builtins':BUILTINS,'runpy':RUNPY,'site':FORBIDDEN,'pkgutil':FORBIDDEN,'zipimport':FORBIDDEN,'imp':FORBIDDEN,'logging':LOGGING}.get(alias.name if alias.asname else alias.name.split('.')[0],UNKNOWN) if standards[alias.name] else UNKNOWN
+     elif node.module in ('sys','builtins','importlib','importlib.util','runpy','site','pkgutil','zipimport','imp','logging') and standards.get(node.module,False):
+      module={'sys':SYS,'builtins':BUILTINS,'importlib':IMPORTLIB,'importlib.util':IMPORT_UTIL,'runpy':RUNPY,'site':FORBIDDEN,'pkgutil':FORBIDDEN,'zipimport':FORBIDDEN,'imp':FORBIDDEN,'logging':LOGGING}[node.module]
+      for alias in node.names:
+       if module is SYS and alias.name=='path': raise RuntimeError('unsupported Python import-path alias')
+       scope[alias.asname or alias.name]=module_value(module,alias.name,search,argv,flags)
+     elif node.module and node.module.startswith('importlib.') and standards.get(node.module,False):
+      raise RuntimeError('unsupported dynamic Python loader API: '+node.module)
+     elif node.module=='pathlib' and standards.get(node.module,False):
+      for alias in node.names: scope[alias.asname or alias.name]=PATH_FACTORY if alias.name=='Path' else UNKNOWN
+     else:
+      for alias in node.names: scope[alias.asname or alias.name]=UNKNOWN
+    elif isinstance(node,(ast.Assign,ast.AnnAssign)):
+     value=expression(node.value,scope,search,cwd,argv,flags) if node.value else UNKNOWN
+     targets=node.targets if isinstance(node,ast.Assign) else [node.target]
+     for target in targets:
+      if isinstance(target,ast.Name):
+       if value is search: raise RuntimeError('unsupported Python import-path alias')
+       scope[target.id]=value
+      elif value is search or isinstance(value,(PathSnapshot,PathMethod)) or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)):
+       if not isinstance(target,ast.Subscript): raise RuntimeError('unsupported Python import-path escape')
+       receiver=expression(target.value,scope,search,cwd,argv,flags)
+       if receiver is not search and not isinstance(receiver,PathSnapshot): raise RuntimeError('unsupported Python import-path escape')
+       index=expression(target.slice,scope,search,cwd,argv,flags)
+       if not isinstance(index,slice) or index.start not in (None,0) or index.stop is not None or index.step not in (None,1): raise RuntimeError('unsupported Python sys.path partial subscript mutation')
+       receiver[index]=list(value)
+      elif isinstance(target,ast.Attribute) and expression(target.value,scope,search,cwd,argv,flags) is SYS:
+       if target.attr=='path': raise RuntimeError('unsupported Python sys.path assignment')
+       if target.attr=='argv':
+        scope['__argv__']=value if isinstance(value,list) else UnknownArgv()
+        scope.pop('__loader_argv__',None)
+        if isinstance(node.value,ast.List) and node.value.elts:
+         try: scope['__loader_argv__']=loader_location(node.value.elts[0],scope,search,cwd,argv,flags)
+         except RuntimeError: pass
+       elif target.attr not in SAFE_SYS: raise RuntimeError('unsupported Python runtime selector: sys.'+target.attr)
+      elif isinstance(target,ast.Subscript):
+       receiver=expression(target.value,scope,search,cwd,argv,flags)
+       if receiver is search or isinstance(receiver,PathSnapshot):
+        index=expression(target.slice,scope,search,cwd,argv,flags)
+        if not isinstance(index,slice) or index.start not in (None,0) or index.stop is not None or index.step not in (None,1): raise RuntimeError('unsupported Python sys.path partial subscript mutation')
+        if value is search or isinstance(value,PathSnapshot): restored=list(value)
+        elif isinstance(value,list): restored=[project_path(item,cwd) for item in value]
+        else: raise RuntimeError('unresolved Python sys.path slice restoration')
+        receiver[index]=restored
+       elif isinstance(receiver,list):
+        index=expression(target.slice,scope,search,cwd,argv,flags)
+        if index is UNKNOWN or value is UNKNOWN: receiver[:]=[UNKNOWN]
+        else:
+         try: receiver[index]=value
+         except (IndexError,TypeError,ValueError): receiver[:]=[UNKNOWN]
+    elif isinstance(node,ast.Expr) and isinstance(node.value,ast.Call):
+     call=node.value
+     receiver=expression(call.func.value,scope,search,cwd,argv,flags) if isinstance(call.func,ast.Attribute) else UNKNOWN
+     if isinstance(call.func,ast.Attribute) and isinstance(receiver,list):
+      args=[expression(arg,scope,search,cwd,argv,flags) for arg in call.args]
+      bounded=receiver is search or isinstance(receiver,PathSnapshot)
+      if call.keywords or any(item is UNKNOWN for item in args):
+       if bounded: raise RuntimeError('unresolved Python import-path/list mutation')
+       receiver[:]=[UNKNOWN]; continue
+      normalize=lambda item: project_path(item,cwd) if bounded else item
+      if call.func.attr=='insert' and len(args)==2 and isinstance(args[0],int) and not isinstance(args[0],bool): receiver.insert(args[0],normalize(args[1]))
+      elif call.func.attr=='append' and len(args)==1: receiver.append(normalize(args[0]))
+      elif call.func.attr=='copy' and not args: continue
+      else:
+       if bounded: raise RuntimeError('unresolved Python import-path/list mutation')
+       receiver[:]=[UNKNOWN]
+    elif isinstance(node,(ast.AugAssign,ast.Delete)):
+     for target in node.targets if isinstance(node,ast.Delete) else [node.target]:
+      if isinstance(target,ast.Attribute): expression(target,scope,search,cwd,argv,flags)
+     if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported Python import-path mutation')
+    elif isinstance(node,ast.If):
+     condition=expression(node.test,scope,search,cwd,argv,flags)
+     if isinstance(condition,bool): walk(node.body if condition else node.orelse,scope,search,allow_path)
+     else:
+      if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unresolved conditional Python import-path setup')
+      walk(node.body,dict(scope),list(search),False); walk(node.orelse,dict(scope),list(search),False)
+    elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):
+     for default in [*node.args.defaults,*node.args.kw_defaults]:
+      value=expression(default,scope,search,cwd,argv,flags) if default is not None else UNKNOWN
+      if value is search or any(value is module for module in (SYS,IMPORTLIB,IMPORT_UTIL,BUILTINS,RUNPY,FORBIDDEN,IMPORT_MODULE,BUILTIN_IMPORT,SPEC_FACTORY,MODULE_FACTORY,RUN_PATH,PROJECT_INPUT)): raise RuntimeError('unsupported Python runtime-selector default argument')
+     deferred.append((node,scope))
+    elif isinstance(node,ast.ClassDef): walk(node.body,dict(scope),search,allow_path)
+    elif isinstance(node,ast.Try):
+     if not node.handlers:
+      mutates=path_changes(node,scope,search,cwd,argv,flags)
+      if mutates:
+       restores=[]
+       for statement in node.finalbody:
+        if isinstance(statement,ast.Assign) and len(statement.targets)==1 and isinstance(statement.targets[0],ast.Subscript):
+         target=statement.targets[0]; receiver=expression(target.value,scope,search,cwd,argv,flags); index=expression(target.slice,scope,search,cwd,argv,flags); value=expression(statement.value,scope,search,cwd,argv,flags)
+         if receiver is search and isinstance(index,slice) and index.start is None and index.stop is None and index.step is None and isinstance(value,PathSnapshot) and list(value)==list(search): restores.append(statement); continue
+        if path_changes(statement,scope,search,cwd,argv,flags): raise RuntimeError('unsupported exceptional Python import-path restoration')
+       if len(restores)!=1: raise RuntimeError('unsupported exceptional Python import-path restoration')
+      walk(node.body,scope,search,mutates); walk(node.orelse,scope,search,mutates); walk(node.finalbody,scope,search,mutates)
+     else:
+      if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unresolved exceptional Python import-path setup')
+      body_scope=dict(scope); body_search=list(search)
+      try: walk(node.body,body_scope,body_search,False)
+      except MissingImport as error:
+       if len(node.body)!=1 or not isinstance(node.body[0],ast.Import) or len(node.body[0].names)!=1 or node.body[0].names[0].name!=error.module: raise RuntimeError('unsupported guarded Python import absence') from error
+       handler=next((handler for handler in node.handlers if catches_missing_import(handler,scope)),None)
+       if handler is None: raise
+       walk(handler.body,body_scope,body_search,False)
+      else:
+       for handler in node.handlers: walk(handler.body,dict(scope),list(search),False)
+       walk(node.orelse,body_scope,body_search,False)
+      walk(node.finalbody,scope,search,False)
+    elif isinstance(node,(ast.For,ast.AsyncFor,ast.While,ast.With,ast.AsyncWith)):
+     if path_changes(node,scope,search,cwd,argv,flags): raise RuntimeError('unsupported block Python import-path mutation')
+     walk(node.body,dict(scope),list(search),False)
+     if hasattr(node,'orelse'): walk(node.orelse,dict(scope),list(search),False)
+   except (RuntimeError,TypeError,ValueError,OSError) as error:
+    if isinstance(error,MissingImport): raise
+    raise RuntimeError(f"{filename or '<inline cwd='+cwd+'>'}:{getattr(node,'lineno','?')}: {error}") from error
+ walk(tree.body,values,paths)
+ while deferred:
+  function,outer=deferred.pop(0); local=dict(outer)
+  for arg in function.args.posonlyargs+function.args.args+function.args.kwonlyargs: local[arg.arg]=UNKNOWN
+  if function.args.vararg: local[function.args.vararg.arg]=UNKNOWN
+  if function.args.kwarg: local[function.args.kwarg.arg]=UNKNOWN
+  for case in specializations.get(function,[{}]):
+   selected=dict(local); selected.update(case)
+   for statement in function.body:
+    if not isinstance(statement,ast.Try) and path_changes(statement,selected,paths,cwd,argv,flags): raise RuntimeError('unsupported deferred Python import-path mutation')
+   function_paths=list(paths)
+   walk(function.body,selected,function_paths,False)
+   if function_paths!=paths: raise RuntimeError('unsupported deferred Python import-path mutation')
+
+source_inputs={}
+def visit(file,paths=None,cwd=None,argv=None,name='__main__',flags=None,project=True):
+ real=os.path.realpath(file)
+ if os.path.abspath(file)!=real: raise RuntimeError('unsupported symlinked Python source: '+file)
+ if not real.endswith('.py'):
+  if real.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES)+('.pyc',)) and not within(root,real):
+   external(real); return
+  raise RuntimeError('unsupported Python source target: '+file)
+ key=(real,tuple(paths or sys.path),tuple(import_roots),cwd,tuple(argv or ()),name,tuple(sorted((flags or {}).items())))
+ if key in seen: return
+ seen.add(key)
+ if real.endswith('.py'):
+  with open(real,'rb') as stream: data=stream.read()
+  source_inputs[real]='sha256:'+hashlib.sha256(data).hexdigest()
+  # Only this hook's path effects are selected by the isolated runtime query.
+  if not project and real in startup_hooks and hashlib.sha256(data).hexdigest() in ('1a773d37457f89ca5d3b7c96541eb8e32e72e47d6c6d48b6428d81e3e7ddafff',):
+   for statement in ast.parse(data).body:
+    if isinstance(statement,(ast.Import,ast.ImportFrom)):
+     names=[alias.name for alias in statement.names] if isinstance(statement,ast.Import) else [statement.module]
+     for imported in names: dependency(imported,paths if paths is not None else list(sys.path),cwd,argv,flags,False)
+   return
+  if (real,name) in active: return
+  active.add((real,name))
+  try: scan(data.decode('utf-8'),os.path.dirname(real),paths,cwd,argv,real,name,flags,project)
+  finally: active.remove((real,name))
+
+for module in list(sys.modules.values()):
+ file=getattr(module,'__file__',None)
+ if file: external(file)
+for p in startup:
+ if p.endswith('.py') and (p in startup_hooks or not standard_input(p)): visit(p,project=False)
+ elif p.endswith('.pth'):
+  with open(p,'rb') as stream: data=stream.read()
+  source_inputs[p]='sha256:'+hashlib.sha256(data).hexdigest()
+  for line in data.decode('utf-8').splitlines():
+   if line.startswith(('import ','import'+chr(9))): scan(line,os.path.dirname(p),project=False)
+requirements=[dict(ids=json.loads(sys.argv[3]),files=sorted(required),paths=list(sys.path),inputs=sorted(source_inputs.items()))]
+for request in requests:
+ required=set(); seen=set(); source_inputs={}; startup_search=list(request['startup_paths'])
+ if not request['flags'].get('no_site',False):
+  hooks=['sitecustomize']+([] if request['flags'].get('no_user_site',False) else ['usercustomize'])
+  for name in hooks:
+   spec=importlib.machinery.PathFinder.find_spec(name,startup_search)
+   if spec is not None and spec.origin not in (None,'built-in','frozen'):
+    external(spec.origin)
+    # Bootstrap hook path setup is already reflected in the interpreter query.
+    visit(spec.origin,startup_search,request['cwd'],request['argv'],name,request['flags'],project=os.path.realpath(spec.origin) not in startup_hooks)
+ paths=([] if request['flags']['safe_path'] else [os.path.dirname(os.path.realpath(request['file'])) if 'file' in request else request['cwd']])+startup_search
+ if 'file' in request: visit(request['file'],paths,request['cwd'],request['argv'],flags=request['flags'])
+ elif 'code' in request: scan(request['code'],request['cwd'],paths,request['cwd'],request['argv'],flags=request['flags'])
+ else:
+  spec=dependency(request['module'],paths,request['cwd'],request['argv'],request['flags'],True)
+  if spec is not None:
+   if spec.submodule_search_locations:
+    if spec.origin not in (None,'built-in','frozen'): external(spec.origin); visit(spec.origin,paths,request['cwd'],request['argv'],request['module'],request['flags'])
+    main=importlib.machinery.PathFinder.find_spec(request['module']+'.__main__',spec.submodule_search_locations)
+    if main is None or main.origin is None: raise RuntimeError('unknown Python module entry point: '+request['module'])
+    external(main.origin); visit(main.origin,paths,request['cwd'],[main.origin]+request['argv'][1:],'__main__',request['flags'])
+   elif spec.origin not in (None,'built-in','frozen'):
+    external(spec.origin); visit(spec.origin,paths,request['cwd'],[spec.origin]+request['argv'][1:],'__main__',request['flags'])
+ requirements.append(dict(ids=request['ids'],files=sorted(required),paths=paths,inputs=sorted(source_inputs.items())))
+print(json.dumps(dict(executable=os.path.realpath(sys.executable),stdlib=stdlib,extensions=extensions,startup=sorted(startup),requirements=requirements),sort_keys=True))
+`;
 	const result = await context.probe([
 		selected.invoked,
 		"-I",
@@ -696,8 +1305,17 @@ export async function discoverNativeAdapter(
 			options = { ...options, sdk: probeText(sdk).trim() };
 		}
 
-		if (["cargo", "rustc"].includes(name) && path.basename(command.realpath).startsWith("rustup")) {
-			const rustup = await context.resolveCommand("rustup", cwd);
+		if (["cargo", "rustc"].includes(name) && (await isRustupProxy(command))) {
+			const rustup = await context
+				.resolveCommand(path.join(path.dirname(command.invoked), "rustup"), cwd)
+				.catch((error) => {
+					if (/^Executable (?:not found:|absent from sanitized PATH:)/u.test(error.message))
+						return context.resolveCommand("rustup", cwd);
+					throw error;
+				});
+			const [proxyStat, selectorStat] = await Promise.all([fs.stat(command.realpath), fs.stat(rustup.realpath)]);
+			if (proxyStat.dev !== selectorStat.dev || proxyStat.ino !== selectorStat.ino)
+				throw new Error("Rustup selector differs from the actual native proxy: " + command.invoked);
 			const probe = await context.probe([rustup.invoked, "which", name], { cwd });
 			discovery.push(probe.identity);
 			command = { invoked: command.invoked, realpath: await canonicalToolPath(probeText(probe).trim()) };
@@ -957,10 +1575,27 @@ async function selectedNodeExecution(
 	native: string[];
 }> {
 	assertNodeEnvironment(context.effectiveEnv);
+	const configured = await context.probe([launcher, "config", "get", "node-options"]);
+	if (!["", "undefined", "null"].includes(probeText(configured).trim()))
+		throw new Error("Unsupported pnpm-injected Node runtime selectors");
 	const name = context.subject[2];
-	const code = `const fs=require('node:fs'),path=require('node:path');const select=name=>{for(const directory of process.env.PATH.split(path.delimiter)){const file=path.resolve(directory,name);try{fs.accessSync(file,fs.constants.X_OK);if(fs.statSync(file).isFile())return file;}catch(error){if(!['ENOENT','ENOTDIR','EACCES'].includes(error.code))throw error;}}return null;};console.log(JSON.stringify({path:process.env.PATH,executables:Object.fromEntries([${JSON.stringify(name)},'node','dirname','sed','uname'].map(name=>[name,select(name)]))}));`;
+	const code = `const fs=require('node:fs'),path=require('node:path');const select=name=>{for(const directory of process.env.PATH.split(path.delimiter)){const file=path.resolve(directory,name);try{fs.accessSync(file,fs.constants.X_OK);if(fs.statSync(file).isFile())return file;}catch(error){if(!['ENOENT','ENOTDIR','EACCES'].includes(error.code))throw error;}}return null;};console.log(JSON.stringify({path:process.env.PATH,nodeOptions:process.env.NODE_OPTIONS??'',execArgv:process.execArgv,executables:Object.fromEntries([${JSON.stringify(name)},'node','dirname','sed','uname'].map(name=>[name,select(name)]))}));`;
 	const probe = await context.probe([launcher, "exec", process.execPath, "-e", code]);
-	const selection = probeJSON<{ path: string; executables: Record<string, string | null> }>(probe);
+	const selection = probeJSON<{
+		path: string;
+		nodeOptions: string;
+		execArgv: string[];
+		executables: Record<string, string | null>;
+	}>(probe);
+	if (
+		typeof selection.nodeOptions !== "string" ||
+		selection.nodeOptions ||
+		!Array.isArray(selection.execArgv) ||
+		selection.execArgv.length !== 2 ||
+		!["-e", "--eval"].includes(selection.execArgv[0]) ||
+		selection.execArgv[1] !== code
+	)
+		throw new Error("Unsupported pnpm-injected Node runtime selectors");
 	if (
 		typeof selection.path !== "string" ||
 		!selection.executables ||
@@ -975,7 +1610,7 @@ async function selectedNodeExecution(
 	const expected = await canonicalToolPath(path.resolve(entry, bin));
 	if (!inside(entry, expected)) throw new Error("Selected Node executable escapes its package");
 	const roots: ToolRoot[] = [{ label: "execution/shim", path: shim }],
-		discovery = [probe.identity],
+		discovery = [configured.identity, probe.identity],
 		native = [launcher, shim],
 		environment: Record<string, string> = { ...context.effectiveEnv, PATH: selection.path };
 	let node = selection.executables.node,
@@ -1262,17 +1897,27 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 	const { root, policy, session, signal } = options,
 		env = { ...options.env };
 	assertLoaderEnvironment(env);
+	assertNodeEnvironment(env);
 	const hasher = new ToolHasher(),
 		identities = new Map<string, ToolIdentity>(),
 		adapters = new Map<string, AdapterResult>(),
-		origins = new Map<string, { label: string; base: string; directory: boolean; exclude?: readonly string[] }[]>(),
+		origins = new Map<
+			string,
+			{ label: string; base: string; inode: string; directory: boolean; exclude?: readonly string[] }[]
+		>(),
 		fileMaps = new Map<string, Map<string, ToolFile>>();
 	const setOrigins = async (id: string, roots: readonly ToolRoot[], files: readonly ToolFile[]): Promise<void> => {
-		const views: { label: string; base: string; directory: boolean; exclude?: readonly string[] }[] = [];
+		const views: { label: string; base: string; inode: string; directory: boolean; exclude?: readonly string[] }[] = [];
 		for (const view of roots) {
 			const base = await canonicalToolPath(view.path),
-				stat = await fs.stat(base);
-			views.push({ label: view.label, base, directory: stat.isDirectory(), exclude: view.exclude });
+				stat = await fs.stat(base, { bigint: true });
+			views.push({
+				label: view.label,
+				base,
+				inode: `${stat.dev}:${stat.ino}`,
+				directory: stat.isDirectory(),
+				exclude: view.exclude,
+			});
 		}
 		origins.set(id, views);
 		fileMaps.set(id, new Map(files.map((file) => [file.path, file])));
@@ -1641,6 +2286,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 				throw new Error(`Tool locator kind mismatch: ${id}`);
 			if (declaration.kind === "executable") await fs.access(selected, fs.constants.X_OK);
 			roots = [{ label: ".", path: selected }];
+			// shortcut: Darwin tree child launch environments remain unmodeled; bind actual launcher context before enabling reuse.
 			if (process.platform === "linux") {
 				const linked = await linuxLinkage(context, await nativePayloads(roots));
 				if (linked.length) {
@@ -1648,10 +2294,14 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 					adapters.set(id, result);
 				}
 			} else if (process.platform === "darwin" && declaration.kind !== "tree") {
+				const invoked =
+					locator.mode === "command"
+						? (await resolveCommand(locator.value, context.cwd)).invoked
+						: path.resolve(root, locator.value);
 				const rustupDriver =
 					locator.mode !== "command-relative" &&
 					["cargo", "rustc"].includes(path.basename(locator.value)) &&
-					path.basename(selected).startsWith("rustup");
+					(await isRustupProxy({ invoked, realpath: selected }));
 				const native = await discoverNativeAdapter(
 					context,
 					rustupDriver
@@ -1746,11 +2396,13 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 				if (requirement.shared) scope.push(...ids.filter((selected) => !scope.includes(selected)));
 				for (const required of requirement.files) {
 					const real = await canonicalToolPath(required),
-						bytes = await hasher.file(real);
+						bytes = await hasher.file(real),
+						stat = await fs.stat(real, { bigint: true }),
+						inode = `${stat.dev}:${stat.ino}`;
 					let bound = false;
 					for (const selected of scope)
 						for (const view of origins.get(selected) ?? []) {
-							if (!view.directory ? view.base !== real : !inside(view.base, real)) continue;
+							if (!view.directory ? view.base !== real && view.inode !== inode : !inside(view.base, real)) continue;
 							const relative = view.directory ? path.relative(view.base, real).split(path.sep).join("/") : "";
 							if (view.exclude?.some((ex) => relative === ex || relative.startsWith(ex.replace(/\/$/u, "") + "/")))
 								continue;
@@ -1776,10 +2428,117 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 	return {
 		resolveCommand,
 		async assertCommandBound(command, cwd, ids) {
+			cwd = path.resolve(root, cwd);
 			const actual = await resolveCommand(command[0], cwd);
 			const scope = closure(ids),
 				name = path.basename(command[0]),
 				directory = path.dirname(actual.realpath);
+			const actualStat = await fs.stat(actual.realpath);
+			const sameExecutable = async (file: string): Promise<boolean> => {
+				const stat = await fs.stat(file);
+				return stat.dev === actualStat.dev && stat.ino === actualStat.ino;
+			};
+			const hasFamily = (family: string): boolean =>
+				scope.some((id) => {
+					const locator = declarations.get(id)!.locator;
+					return locator.mode === "adapter" && locator.value === family;
+				});
+			const matchesFamilyCommand = async (family: string): Promise<boolean> => {
+				for (const id of scope) {
+					const locator = declarations.get(id)!.locator;
+					if (
+						locator.mode === "adapter" &&
+						locator.value === family &&
+						locator.subject.length &&
+						(family !== "node-toolchain" || (command[1] === "exec" && command[2] === locator.subject[2])) &&
+						(await resolveCommand(locator.subject[0], path.resolve(root, locator.cwd))).realpath === actual.realpath
+					)
+						return true;
+				}
+				return false;
+			};
+			const names = [name, path.basename(actual.realpath)];
+			const quintFiles = [actual.realpath];
+			if (!names.some((value) => /^(?:Python|python(?:\d+(?:\.\d+)*)?|pypy\d*|node(?:js)?|pnpm|quint)$/u.test(value)))
+				for (const hint of ["python3", "python", "pypy3", "node", "nodejs", "pnpm", "quint"]) {
+					const selected = await resolveCommand(hint, cwd).catch((error) => {
+						if (/^Executable absent from sanitized PATH:/u.test(error.message)) return null;
+						throw error;
+					});
+					if (selected && (await sameExecutable(selected.realpath))) {
+						names.push(hint);
+						if (hint === "quint") quintFiles.push(selected.realpath);
+						break;
+					}
+				}
+			const handle = await fs.open(actual.realpath, "r"),
+				head = Buffer.alloc(256);
+			let length: number;
+			try {
+				({ bytesRead: length } = await handle.read(head, 0, head.length, 0));
+			} finally {
+				await handle.close();
+			}
+			const prefix = head.subarray(0, length).toString("utf8").split("\n", 1)[0];
+			const pythonCommand =
+				names.some((value) => /^(?:Python|python(?:\d+(?:\.\d+)*)?|pypy\d*)$/u.test(value)) ||
+				/^#!.*(?:\/| )(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)(?: |$)/u.test(prefix);
+			if (pythonCommand && !(await matchesFamilyCommand("python-runtime")))
+				throw new Error("Python command requires a python-runtime adapter");
+			for (const token of command.slice(1)) {
+				if (token.startsWith("-")) continue;
+				const candidate = path.resolve(cwd, token);
+				const stat = await fs.stat(candidate).catch((error) => {
+					if (["ENOENT", "ENOTDIR"].includes(error.code ?? "")) return null;
+					throw error;
+				});
+				if (stat?.isFile()) quintFiles.push(await canonicalToolPath(candidate));
+			}
+			let quintCommand = false;
+			for (const file of quintFiles) {
+				const packageRoot = await packageDirectory(file).catch((error) => {
+					if (/^No installed package for /u.test(error.message)) return null;
+					throw error;
+				});
+				if (!packageRoot) continue;
+				const manifest = await readPackage(packageRoot);
+				if (manifest.name !== "@informalsystems/quint") continue;
+				quintCommand = true;
+				const bin = typeof manifest.bin === "string" ? manifest.bin : manifest.bin?.quint;
+				if (typeof bin !== "string") throw new Error("Installed Quint package has no CLI declaration");
+				const cli = await canonicalToolPath(path.resolve(packageRoot, bin));
+				if (!inside(packageRoot, cli) || actual.realpath !== cli)
+					throw new Error(
+						"Unsupported Quint wrapper or package-internal command; quint-backends requires the direct installed CLI",
+					);
+				let matched = false;
+				for (const id of scope) {
+					const locator = declarations.get(id)!.locator;
+					if (
+						locator.mode === "adapter" &&
+						locator.value === "quint-backends" &&
+						locator.subject[1] === command[1] &&
+						(await resolveCommand(locator.subject[0], path.resolve(root, locator.cwd))).realpath === cli
+					)
+						matched = true;
+				}
+				if (!matched) throw new Error("Quint command requires a matching quint-backends adapter");
+			}
+			if (!quintCommand && names.some((value) => value === "quint"))
+				throw new Error("Quint command requires an installed package and matching quint-backends adapter");
+			const nodeCommand =
+				names.some((value) => /^(?:node(?:js)?|pnpm|corepack)$/u.test(value)) ||
+				/^#!.*(?:\/| )node(?: |$)/u.test(prefix);
+			if (nodeCommand) {
+				if (!quintCommand && !(await matchesFamilyCommand("node-toolchain")))
+					throw new Error("Node command requires a node-toolchain adapter");
+				if (!quintCommand && names.some((value) => /^(?:node(?:js)?)$/u.test(value)))
+					throw new Error("Unsupported direct Node command outside its selected package-manager context");
+			}
+			if (names.some((value) => value === "cargo" || value === "rustc")) {
+				const family = name === "cargo" && command[1] === "kani" ? "kani-toolchain" : "cargo-toolchain";
+				if (!hasFamily(family)) throw new Error("Rust command requires a " + family + " adapter");
+			}
 			const leanCommand =
 				["lean", "lake"].includes(name) ||
 				(name === "elan" &&
@@ -1804,11 +2563,13 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 			)
 				throw new Error("Lean/Lake command requires a lean-toolchain adapter");
 			await this.capture(ids);
-			const bytes = await hasher.file(actual.realpath);
+			const bytes = await hasher.file(actual.realpath),
+				stat = await fs.stat(actual.realpath, { bigint: true }),
+				inode = `${stat.dev}:${stat.ino}`;
 			for (const id of closure(ids))
 				for (const view of origins.get(id) ?? []) {
 					if (
-						(!view.directory && view.base !== actual.realpath) ||
+						(!view.directory && view.base !== actual.realpath && view.inode !== inode) ||
 						(view.directory && !inside(view.base, actual.realpath))
 					)
 						continue;

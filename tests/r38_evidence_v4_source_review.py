@@ -53,6 +53,10 @@ for (const request of await Bun.stdin.json()) {
       results.push({ok: true, canonical_hex: Buffer.from(model.C(value)).toString('hex')});
     } else if (request.op === 'prefix') {
       results.push({ok: true, selected: source.prefixSelects(request.path, request.prefix)});
+    } else if (request.op === 'derived') {
+      const identity = model.validateToolIdentity(request.value);
+      if (!source.derivedNativeTree(request.declaration, identity)) throw Error('invalid derived native tool identity');
+      results.push({ok: true, canonical_hex: Buffer.from(model.C(identity)).toString('hex')});
     } else if (request.op === 'requirements') {
       const closure = {files: request.bound.map((path) => ({path}))};
       await source.assertSourceRequirements(request.root, closure, request.required);
@@ -617,19 +621,31 @@ class SourceReview(unittest.TestCase):
             for relative in (
                 "lean/A.lean",
                 "lean/sub/B.lean",
-                "lean/.lake/C.lean",
+                "lean/.lake/build/C.lean",
                 "lean/notes.txt",
                 "lakefile.toml",
             ):
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text("x\n")
             bound = ["lakefile.toml", "lean/A.lean", "lean/sub/B.lean"]
-            required = {"directories": ["lean"], "files": ["lakefile.toml"]}
+            required = {
+                "directories": ["lean"],
+                "files": ["lakefile.toml"],
+                "excludedPaths": ["lean/.lake/build"],
+            }
             cases = [
                 (bound, required, None),
                 (bound[:2], required, "lean/sub/B.lean"),
                 (bound[1:], required, "lakefile.toml"),
-                (bound, {"directories": ["."], "files": []}, None),
+                (
+                    bound,
+                    {
+                        "directories": ["."],
+                        "files": [],
+                        "excludedPaths": ["lean/.lake/build"],
+                    },
+                    None,
+                ),
             ]
             results = native(
                 [
@@ -747,6 +763,148 @@ class SourceReview(unittest.TestCase):
                 ]
             )
             self.assertTrue(result["ok"], result)
+
+    def test_lake_directory_name_does_not_exclude_user_sources(self):
+        with tempfile.TemporaryDirectory(prefix="r38-lake-source-") as directory:
+            root = Path(directory).resolve()
+            (root / ".lake").mkdir()
+            (root / ".lake/User.lean").write_text("def userSource := 1")
+            request = {
+                "op": "requirements",
+                "root": str(root),
+                "bound": [],
+                "required": {"directories": ["."], "files": []},
+            }
+            missing = native([request])[0]
+            self.assertFalse(missing["ok"], missing)
+            self.assertIn("outside recipe closure: .lake/User.lean", missing["reason"])
+            request["bound"] = [".lake/User.lean"]
+            self.assertTrue(native([request])[0]["ok"])
+            request["required"]["files"] = [".lake/User.lean"]
+            request["required"]["excludedPaths"] = [".lake"]
+            request["bound"] = []
+            self.assertFalse(native([request])[0]["ok"])
+
+    def test_derived_native_identity_matches_portable_byte_and_encoding_checks(self):
+        declaration = {
+            "id": "review-tool",
+            "kind": "executable",
+            "locator": {"mode": "path", "value": "/recorded/tool"},
+            "version_command": None,
+            "version_cwd": None,
+            "requires": [],
+            "accept": {"sha256": [], "version_contains": []},
+        }
+        identity = tool_identity()
+        identity["kind"] = "tree"
+        identity["system_dependencies"]["os"] = "darwin"
+        identity["files"] = [
+            {
+                "path": "selected-file",
+                "kind": "file",
+                "hash": HASH,
+                "size": 1,
+                "executable": True,
+            },
+            {"path": "native", "kind": "directory"},
+            {"path": "native/non-system-libraries", "kind": "directory"},
+            {
+                "path": "native/non-system-libraries/%2Fopt%2Flibproof.dylib",
+                "kind": "file",
+                "hash": HASH,
+                "size": 1,
+                "executable": False,
+            },
+        ]
+        vectors = [("library", declaration, copy.deepcopy(identity), True)]
+        for label, field, replacement in (
+            ("empty-executable", ("files", 0, "size"), 0),
+            ("empty-executable-hash", ("files", 0, "hash"), schema.H(b"")),
+            ("non-executable", ("files", 0, "executable"), False),
+            ("empty-library", ("files", 3, "size"), 0),
+            ("empty-library-hash", ("files", 3, "hash"), schema.H(b"")),
+            *(
+                (
+                    "library-encoding-" + encoded,
+                    ("files", 3, "path"),
+                    "native/non-system-libraries/" + encoded,
+                )
+                for encoded in (
+                    "",
+                    "%2fopt%2Flib.dylib",
+                    "%00",
+                    "%FF",
+                    "%",
+                    "nested/lib.dylib",
+                )
+            ),
+        ):
+            vectors.append(
+                (label, declaration, changed(identity, field, replacement), False)
+            )
+        file_declaration = {**declaration, "kind": "file"}
+        empty_file = changed(identity, ("files", 0, "size"), 0)
+        empty_file["files"][0]["hash"] = schema.H(b"")
+        empty_file["files"][0]["executable"] = False
+        vectors.append(("non-executable-file", file_declaration, empty_file, True))
+        driver_declaration = {
+            **declaration,
+            "locator": {"mode": "command", "value": "cargo"},
+        }
+        driver = copy.deepcopy(identity)
+        driver["locator"] = driver_declaration["locator"]
+        driver["files"] = driver["files"][:2] + [
+            {"path": "native/drivers", "kind": "directory"},
+            {
+                "path": "native/drivers/cargo-0",
+                "kind": "file",
+                "hash": HASH,
+                "size": 1,
+                "executable": True,
+            },
+        ]
+        driver["discovery"] = [
+            {
+                "command": ["/recorded/rustup", "which", "cargo"],
+                "cwd": ".",
+                "stdout_hash": HASH,
+                "stderr_hash": HASH,
+                "exit_code": 0,
+            }
+        ]
+        vectors.append(("selected-driver", driver_declaration, driver, True))
+        for label, field, replacement in (
+            ("empty-driver", ("files", 3, "size"), 0),
+            ("non-executable-driver", ("files", 3, "executable"), False),
+            ("empty-driver-hash", ("files", 3, "hash"), schema.H(b"")),
+            ("no-selector-probe", ("discovery",), []),
+            ("failed-selector-probe", ("discovery", 0, "exit_code"), 1),
+        ):
+            vectors.append(
+                (label, driver_declaration, changed(driver, field, replacement), False)
+            )
+        for _, _, value, _ in vectors:
+            value["files"].sort(key=lambda entry: entry["path"].encode("utf-8"))
+            identify_tool(value)
+        results = native(
+            [
+                {"op": "derived", "declaration": declared, "value": value}
+                for _, declared, value, _ in vectors
+            ]
+        )
+        for (label, declared, value, accepted), result in zip(
+            vectors, results, strict=True
+        ):
+            with self.subTest(vector=label):
+                self.assertEqual(result["ok"], accepted, result)
+                if accepted:
+                    portable._tool(value, declared)
+                    self.assertEqual(
+                        bytes.fromhex(result["canonical_hex"]), schema.C(value)
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        portable._tool(value, declared)
 
 
 if __name__ == "__main__":
