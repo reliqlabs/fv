@@ -1669,15 +1669,10 @@ export class NativeSession {
 				throw failure;
 			});
 			if (killWork) await killWork;
+			// The exited direct child no longer anchors a safe group signal.
 			for (const entry of owned) {
 				if (entry.terminated_at) continue;
-				if (!(await stopped(entry.process))) {
-					await signal(entry.process, "SIGTERM");
-					const until = performance.now() + MAX_GRACE;
-					while (performance.now() < until && !(await stopped(entry.process))) await sleep(25);
-					if (!(await stopped(entry.process))) await signal(entry.process, "SIGKILL");
-				}
-				const until = performance.now() + 5000;
+				const until = performance.now() + MAX_GRACE;
 				while (performance.now() < until && !(await stopped(entry.process))) await sleep(25);
 				await terminated(entry);
 			}
