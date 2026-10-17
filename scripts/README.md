@@ -218,6 +218,16 @@ refuse. Native inventory binds the exact sysconfig-selected runtime library,
 including framework builds, without treating its surrounding directory as
 standard-library input.
 
+The v4 producer now inspects native-magic payloads in ordinary Darwin tool trees.
+Native-free trees and payloads with only absolute vendor-system load commands
+remain supported. A non-system load edge refuses with
+`Unbound native tree launch context`: tree membership and `requires` do not
+establish the child process image, inherited rpaths or launcher-modified loader
+environment. Resolving those edges needs a reviewed launch-context adapter.
+In particular, a separately bound Rust sysroot does not resolve a Verus child's
+`@rpath` dependency without the rustup launch transformation. These are producer
+discovery limits under the existing v4 closure contract, not new policy fields.
+
 ### Evidence records (`fv-evidence-run/v3`)
 
 The `fv_evidence_run` tool (`tools/evidence-run.ts`) writes one record per claim at

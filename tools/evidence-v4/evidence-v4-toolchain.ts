@@ -1575,6 +1575,23 @@ export async function discoverNativeAdapter(
 		}
 		return pending;
 	};
+	for (const file of options.unboundPayloads ?? []) {
+		const handle = await fs.open(file, "r"),
+			magic = Buffer.alloc(4);
+		try {
+			await handle.read(magic, 0, 4, 0);
+		} finally {
+			await handle.close();
+		}
+		if (!MACHO_MAGIC.includes(magic.readUInt32BE())) continue;
+		// Tree membership does not identify a child's process image or launcher-modified loader environment.
+		for (const install of (await readLoadCommands(file)).dependencies)
+			if (
+				!path.isAbsolute(install) ||
+				(!path.normalize(install).startsWith("/usr/lib/") && !path.normalize(install).startsWith("/System/Library/"))
+			)
+				throw new Error(`Unbound native tree launch context for library ${install} from ${file}`);
+	}
 	// @executable_path names the process image, which for a shebang script is its interpreter.
 	const processImage = async (file: string, depth = 0): Promise<string> => {
 		const handle = await fs.open(file, "r");
@@ -2484,8 +2501,14 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 				throw new Error(`Tool locator kind mismatch: ${id}`);
 			if (declaration.kind === "executable") await fs.access(selected, fs.constants.X_OK);
 			roots = [{ label: ".", path: selected }];
-			// shortcut: CA24 generic Darwin tree child linkage remains open for fresh provenance and reuse; bind launch contexts before qualification.
-			if (process.platform === "linux") {
+			if (process.platform === "darwin" && declaration.kind === "tree") {
+				const payloads = await nativePayloads(roots);
+				if (payloads.length) {
+					const native = await discoverNativeAdapter(context, [], { unboundPayloads: payloads });
+					result = { ...native, roots };
+					adapters.set(id, result);
+				}
+			} else if (process.platform === "linux") {
 				const linked = await linuxLinkage(context, await nativePayloads(roots));
 				if (linked.length) {
 					result = { roots, fileRequirements: [{ ids: [id], files: linked.map((value) => value.path) }] };

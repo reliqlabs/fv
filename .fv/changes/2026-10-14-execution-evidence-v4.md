@@ -225,3 +225,11 @@ The initial targeted run failed before namespace analysis because the framework'
 
 Nine targeted methods passed, including framework-library content binding and external native-distribution refusal. Actual Dossier `python-runtime` capture succeeded at `fv-stdlib-real-selection-g_3jknmo`. This is metadata acceptance, not proof evidence. Post-commit review and frozen integration regressions remain pending; CA-16/17 and the other generic boundaries remain open.
 
+## Ordinary Darwin tree refusal (2026-10-16)
+
+Classification: implementation-only, enforcing the existing native-closure contract. Ordinary Darwin tree declarations now inspect native payloads. Absolute vendor-system load commands remain admitted; non-system edges refuse because tree membership does not establish the child's launch environment or inherited rpaths. No library-search context is inferred from `requires`.
+
+Three targeted methods passed, covering external-library mutation refusal, system-only native trees and native-free script aliases. The system-image fixture first failed while copying protected file flags, before adapter execution; it now copies bytes and permission mode only. Classification: `.fv/classifications/2026-10-16-darwin-fixture.md`.
+
+Actual Dossier Go and Quint tree capture succeeded. Its Verus distribution correctly refused `rust_verify`'s `@rpath/librustc_driver-e03ed1db822dfa4c.dylib`; a separately bound sysroot does not establish rustup's child launch context. Results are retained at `fv-darwin-tree-selection-tm_8xph3`. A compatible Verus launch-context adapter needs its own reviewed contract. Post-commit review and frozen integration regressions remain pending. Installed FV and the failed Dossier owner are unchanged.
+
