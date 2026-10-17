@@ -171,7 +171,7 @@ The frozen integrated toolchain/proof/source/adoption suites passed 112 tests. A
 
 Independent reports are retained verbatim as `.fv/code-adversarial/2026-10-16-hybrid-runtime-review1.md` and `2026-10-16-hybrid-proof-source-review1.md`. Runtime review retained five known findings and found two incomplete claimed fixes, totaling two Major and five Minor findings. Proof/source review closed the seven original mechanisms and identified one Minor selector-spelling discrepancy. Runtime CA-03, CA-05 and CA-07 remain under correction; the four generic loader/tree boundaries remain open.
 
-The selector-spelling discrepancy was reproduced for terminal `/.` in the locator and Rustup probe executable. Python now uses the same non-normalizing POSIX basename behavior as TS. Both negative vectors failed before and passed after, with ordinary absolute and trailing-slash preservation cases. A separate smoke using the actual captured Cargo identity accepted the original witness and rejected both terminal-dot mutations. Confirmation review remains pending.
+The selector-spelling discrepancy was reproduced for terminal `/.` in the locator and Rustup probe executable. Python now uses the same non-normalizing POSIX basename behavior as TS. Both negative vectors failed before and passed after, with ordinary absolute and trailing-slash preservation cases. A separate smoke using the actual captured Cargo identity accepted the original witness and rejected both terminal-dot mutations. Independent confirmation review returned zero findings and closed this defect; its report is `.fv/code-adversarial/2026-10-16-hybrid-selector-parity-review2.md`.
 
 ## Fresh collection boundary repairs (2026-10-16)
 
@@ -196,3 +196,17 @@ The two negative regression methods produced 28 failed assertions against a froz
 This bounded scanner conservatively refuses unrelated solver imports/attributes. Arbitrary macro-generated selectors remain outside its closure; no generic provenance, reuse or activation qualification follows. No Dossier source, installed runtime, proof recipe or bound changed. Independent reviews cover the named literal routes and preservation corrections only.
 
 Review of `8020b89` is retained verbatim as `.fv/code-adversarial/2026-10-16-fresh-solver-review1.md`. It found no remaining named literal selector bypass but identified two Minor over-refusals: the raw `r#kissat` argument and Unicode identifiers containing a keyword spelling. Six preservation assertions failed before correction. Both pinned-solver checks now accept the exact raw identifier; declaration-keyword recognition uses Rust's Unicode identifier-continuation boundaries. The corrected suite passed 39 methods, and actual EX-002/EX-003 metadata capture still succeeded. Confirmation review of `1c15dc3` returned zero findings and closed both Minor defects; its report is `.fv/code-adversarial/2026-10-16-fresh-solver-review2.md`.
+
+## Hybrid runtime residual corrections (2026-10-16)
+
+Runtime review CA-03, CA-05 and CA-07 are implemented by FixHybridResiduals. Opaque Python selectors remain classified through container/default/return/assignment paths. The actual preferred Node runtime's options and argv are checked; only native executables and reviewed transparent shell-wrapper chains are admitted. pnpm store roots are narrowed to selected canonical symlink targets and their dependency closure while preserving the store escape boundary.
+
+Three regression methods produced 22 failed assertions against the pre-correction `2c7bd3c` adapters. The initial corrected suite passed 45 methods, but actual Dossier Python discovery then refused its module-registry snapshot/restore. The follow-up admits only literal-key snapshots, key iteration and direct two-name `.items()` iteration; values remain opaque, including after restoration. There is no module-name exception. The final suite passed 46 methods, and actual capture admitted both Dossier `mobile-node-toolchain` and `python-runtime`. This is metadata acceptance, not proof evidence or a fresh full-policy collection.
+
+Independent residual re-review remains pending. Root-value CA-16, imported-helper CA-17, transitive split-stdlib CA-21 and generic Darwin-tree CA-24 remain open, including their fresh-provenance implications. No generic reuse or activation qualification is claimed.
+
+## Final integration isolation (2026-10-16)
+
+While preparing this worktree, the collection-repair merge was accidentally executed in the installed FV checkout. That checkout was clean and its new merge had only `e36b939` and `437beea` as parents. The merge is preserved as `765025e` on `perf/evidence-collection-recovered-merge`; `git reset --keep` restored the installed checkout to `e36b939`. No Dossier record or lock was modified by that operation. Subsequent integration merges run only in `evidence-final-union`.
+
+The final integration combines the independently reviewed native/coverage and Kani corrections with the hybrid adapter changes. Full frozen-tree regression verification and the residual runtime re-review remain pending. The original Dossier owner remains blocked; this integration does not authorize recovery or promote failed evidence.
