@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -351,7 +352,8 @@ def _tool(value, declaration=None, environment=None):
                 }
                 _check(
                     declaration["locator"]["mode"] in ("command", "path")
-                    and Path(declaration["locator"]["value"]).name in driver_names,
+                    and posixpath.basename(declaration["locator"]["value"].rstrip("/"))
+                    in driver_names,
                     "derived Rustup driver differs from locator",
                 )
             for entry in drivers:
@@ -363,7 +365,8 @@ def _tool(value, declaration=None, environment=None):
                 _check(
                     any(
                         len(probe["command"]) == 3
-                        and Path(probe["command"][0]).name == "rustup"
+                        and posixpath.basename(probe["command"][0].rstrip("/"))
+                        == "rustup"
                         and probe["command"][1:] == ["which", name]
                         and probe["exit_code"] == 0
                         for probe in value["discovery"]

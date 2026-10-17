@@ -873,6 +873,23 @@ class SourceReview(unittest.TestCase):
             }
         ]
         vectors.append(("selected-driver", driver_declaration, driver, True))
+        for spelling, accepted in (
+            ("/recorded/cargo", True),
+            ("/recorded/cargo/", True),
+            ("/recorded/cargo/.", False),
+        ):
+            declared = copy.deepcopy(driver_declaration)
+            declared["locator"] = {"mode": "path", "value": spelling}
+            value = changed(driver, ("locator",), declared["locator"])
+            vectors.append(("driver-locator-" + spelling, declared, value, accepted))
+        for spelling, accepted in (
+            ("/recorded/rustup/", True),
+            ("/recorded/rustup/.", False),
+        ):
+            value = changed(driver, ("discovery", 0, "command", 0), spelling)
+            vectors.append(
+                ("selector-" + spelling, driver_declaration, value, accepted)
+            )
         for label, field, replacement in (
             ("empty-driver", ("files", 3, "size"), 0),
             ("non-executable-driver", ("files", 3, "executable"), False),

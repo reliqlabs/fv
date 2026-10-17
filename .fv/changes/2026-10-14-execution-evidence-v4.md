@@ -157,14 +157,18 @@ Classification: implementation-only, enforcing the existing provenance/refusal c
 |---|---|
 | Base CA-16, CA-17 | Open: root-by-name and imported-helper argument/target analysis remain incomplete. |
 | Base CA-18, CA-19 | Runtime-family gates and hardlink aliases are checked; unsupported Python source/loader formats refuse. |
-| Base CA-20 | Reported opaque `sys.modules` and stdlib import-by-name forms refuse; no general interpreter analysis is claimed. |
+| Base CA-20 | Partial: direct opaque-module forms refuse, but the independent review found a dictionary/container escape. |
 | Base CA-21 | Partial: reviewed startup-hook imports use actual request paths; direct split-stdlib imports refuse. Transitive split-stdlib paths remain open. |
 | Base CA-22, CA-23 | Literal loader paths use command cwd; symlinked Python source and hidden interpreter-wrapper contexts refuse. |
 | Base CA-24 | Generic Darwin tree linkage remains open. Dossier's separately retained frozen-installation disposition does not close it. |
-| Base CA-25 | pnpm effective Node options and selected child runtime options are checked and retained. |
+| Base CA-25 | Partial: pnpm configuration options are checked; the independent review found unbound options in a preferred Node wrapper. |
 | Proof CA-01..CA-04 | Quint family/subcommand gates, symlink-safe Lake `-d`, absolute Apalache JAR selection and Elan nearest-directory precedence are implemented. |
 | Source CA-12..CA-14 | Unbound prebuilt imports refuse; generated-path Lean sources remain mandatory; Rustup hardlink selection and derived-tree validation match the retained selector and Python byte checks. |
 
 The first integrated run reported two Rustup hardlink binding failures. Indexed origin checks now accept a file-root alias only when its device/inode and captured hash/size/executable bit match; an independent byte-identical copy still refuses. Both affected checks passed afterward. A duplicate type-only import introduced by integration was removed after the formatter rejected it.
 
-The frozen integrated toolchain/proof/source/adoption suites passed 112 tests. An actual temporary project returned plan READY, run PASS, one physical dispatch for claims A and B, and portable-checker exit 0. These checks do not qualify generic reuse. Independent re-review and renewed full Dossier admission remain pending; the installed producer is unchanged.
+The frozen integrated toolchain/proof/source/adoption suites passed 112 tests. An actual temporary project returned plan READY, run PASS, one physical dispatch for claims A and B, and portable-checker exit 0. These checks do not qualify generic reuse. The installed producer is unchanged.
+
+Independent reports are retained verbatim as `.fv/code-adversarial/2026-10-16-hybrid-runtime-review1.md` and `2026-10-16-hybrid-proof-source-review1.md`. Runtime review retained five known findings and found two incomplete claimed fixes, totaling two Major and five Minor findings. Proof/source review closed the seven original mechanisms and identified one Minor selector-spelling discrepancy. Runtime CA-03, CA-05 and CA-07 remain under correction; the four generic loader/tree boundaries remain open.
+
+The selector-spelling discrepancy was reproduced for terminal `/.` in the locator and Rustup probe executable. Python now uses the same non-normalizing POSIX basename behavior as TS. Both negative vectors failed before and passed after, with ordinary absolute and trailing-slash preservation cases. A separate smoke using the actual captured Cargo identity accepted the original witness and rejected both terminal-dot mutations. Confirmation review remains pending.
