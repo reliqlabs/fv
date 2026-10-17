@@ -1008,6 +1008,135 @@ class RustReview(unittest.TestCase):
         result = fixture.capture("kani", adapter="kani-toolchain")
         self.assertTrue(result["ok"], result)
 
+    def test_fresh_ca01_solver_imports_and_namespace_aliases_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.package("dependency", "dependency")
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        fixture.kani()
+        for index, source in enumerate(
+            (
+                'use kani::solver; #[solver(bin="/opt/sat")] fn proof() {}',
+                'use ::kani::solver as picked; #[picked(bin="/opt/sat")] fn proof() {}',
+                'use kani::{proof, solver as picked}; #[picked(bin="/opt/sat")] fn proof() {}',
+                'use {kani::{solver as picked}}; #[picked(bin="/opt/sat")] fn proof() {}',
+                'use kani as selected; #[selected::solver(bin="/opt/sat")] fn proof() {}',
+                'use kani::{self as selected}; #[selected::solver(bin="/opt/sat")] fn proof() {}',
+                'use {kani as selected}; #[selected::solver(bin="/opt/sat")] fn proof() {}',
+                'use kani::*; #[solver(bin="/opt/sat")] fn proof() {}',
+                'use {kani::{*}}; #[solver(bin="/opt/sat")] fn proof() {}',
+                'extern crate kani as selected; #[selected::solver(bin="/opt/sat")] fn proof() {}',
+                '#[macro_use] extern crate kani; #[solver(bin="/opt/sat")] fn proof() {}',
+                'pub use kani::solver as picked; #[picked(bin="/opt/sat")] fn proof() {}',
+                'use r#kani::{r#solver as r#picked}; #[r#picked(bin="/opt/sat")] fn proof() {}',
+                'use kani_macros::solver as picked; #[picked(bin="/opt/sat")] fn proof() {}',
+                "use kani::solver as picked; #[picked(kissat)] fn proof() {}",
+            )
+        ):
+            filename = ("src/lib.rs", "dependency/src/lib.rs", "src/proof.txt")[
+                index % 3
+            ]
+            with self.subTest(filename=filename, source=source):
+                fixture.write("src/lib.rs", 'include!("proof.txt");')
+                fixture.write("dependency/src/lib.rs", "pub fn value() -> u8 { 1 }")
+                fixture.write("src/proof.txt", "pub fn proof() {}")
+                fixture.write(
+                    filename, source.replace("fn proof()", "#[kani::proof] fn proof()")
+                )
+                self.assert_refused(
+                    fixture.capture("kani", adapter="kani-toolchain"),
+                    "Kani solver imports and namespace aliases",
+                )
+
+    def test_fresh_ca01_raw_and_unknown_solver_attributes_refuse(self):
+        fixture = CargoFixture(self)
+        fixture.package("dependency", "dependency")
+        fixture.manifest_tail('[dependencies]\ndependency={path="dependency"}')
+        fixture.lock()
+        fixture.kani()
+        for index, attribute in enumerate(
+            (
+                '#[kanitool::solver(bin="/opt/sat")]',
+                '#[cfg_attr(kani, kanitool::solver(bin=r#"/opt/sat"#))]',
+                "#[kanitool::solver(kissat)]",
+                "#[r#kanitool::r#solver(kissat)]",
+                '#[kani::r#solver(bin="/opt/sat")]',
+                '#[solver(bin="/opt/sat")]',
+                '#[selected::solver(bin="/opt/sat")]',
+                "#[selected::kani::solver(kissat)]",
+                "#[cfg_attr(kani, crate::kani::solver(kissat))]",
+                "#[kani::solver(cadical)]",
+                "#[kani::solver]",
+                '#[kani::solver = "/opt/sat"]',
+                '#[kani::solver{bin="/opt/sat"}]',
+                '#[kani::solver(kissat, bin="/opt/sat")]',
+                '#[cfg_attr(kani, unknown([]), kanitool::solver(bin="/opt/sat"))]',
+            )
+        ):
+            filename = ("src/lib.rs", "dependency/src/lib.rs", "src/proof.txt")[
+                index % 3
+            ]
+            with self.subTest(filename=filename, attribute=attribute):
+                fixture.write("src/lib.rs", 'include!("proof.txt");')
+                fixture.write("dependency/src/lib.rs", "pub fn value() -> u8 { 1 }")
+                fixture.write("src/proof.txt", "pub fn proof() {}")
+                fixture.write(
+                    filename, "#[kani::proof]\n" + attribute + "\nfn proof() {}"
+                )
+                self.assert_refused(
+                    fixture.capture("kani", adapter="kani-toolchain"),
+                    "Kani solver attribute",
+                )
+
+    def test_fresh_ca01_canonical_pinned_solver_and_benign_tokens_survive(self):
+        fixture = CargoFixture(self)
+        fixture.lock()
+        fixture.kani()
+        fixture.write(
+            "src/benign.txt",
+            r"""
+use kani::{any, proof};
+use std::fmt::{self, Debug as DebugTrait};
+#[doc = "use kani::solver as picked; #[kanitool::solver(bin=\"/opt/doc\")]"]
+pub fn solver(kani: &str, kanitool: &str) {
+    let solver = kanitool;
+    let r#use = (kani, solver);
+    let text = "use kani as picked; #[picked::solver(bin=\"/opt/string\")]";
+    let raw = r##"use kani::{solver as picked}; #[kanitool::solver(bin="/opt/raw")]"##;
+    let bytes = b"use kani::solver; #[solver(bin=\"/opt/bytes\")]";
+    let opening = '[';
+    let _ = (r#use, text, raw, bytes, opening);
+}
+pub fn call() { crate::solver("", ""); }
+// use kani::solver as picked; #[picked(bin="/opt/comment")]
+/* use kani as picked; /* nested */ #[kanitool::solver(bin="/opt/comment")] */
+""",
+        )
+        for attribute in (
+            "#[kani::solver(kissat)]",
+            "#[kani :: solver ( kissat, )]",
+            "#[cfg_attr(kani, kani::solver(kissat))]",
+            "#[cfg_attr(kani, cfg_attr(test, ::kani::solver(kissat,)))]",
+            "#[r#kani::r#solver(kissat)]",
+            "#[kani /* namespace */ :: solver(/* argument */ kissat,)]",
+        ):
+            with self.subTest(attribute=attribute):
+                fixture.write(
+                    "src/lib.rs",
+                    attribute
+                    + '\n#[kani::proof]\nfn proof() {}\ninclude!("benign.txt");',
+                )
+                result = fixture.capture("kani", adapter="kani-toolchain")
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(
+                    next(
+                        root["path"]
+                        for root in result["roots"]
+                        if root["label"] == "solver"
+                    ),
+                    str(Path(fixture.env["KANI_HOME"]) / "bin/kissat"),
+                )
+
     def test_r3_ca04_kani_manifest_overrides_refuse(self):
         for scope in ("package", "workspace"):
             for value in (

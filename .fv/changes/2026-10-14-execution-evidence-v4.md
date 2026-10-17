@@ -148,3 +148,11 @@ Classification: implementation-only. Full Dossier planning at `936b350` failed f
 The properties-discovery JVM now uses `-XX:-UseCompressedOops`. Solver invocations and proof bounds are unchanged; exact discovery-output comparison remains enforced. The paired real-JVM regression failed before the fix and passed afterward. The proof adapter suite passed 34 tests; three existing helper-byte/native-binding/pnpm-boundary regressions passed. A full direct producer plan returned READY in 409,561 ms with 69 required records and 82 physical slots. This is preflight evidence only, not a proof result or activation verdict.
 
 The earlier indexed-origin/file lookup correction remains in the installed lineage; this change also supplies its missing `ToolFile` type import. General cross-run reuse is not qualified by these checks. Dossier's host explicitly disables it while the remaining round-3 findings stay open.
+
+## Fresh Kani selector aliases (2026-10-16)
+
+Classification: implementation-only. The independent fresh-selector review's CA-01 showed that literal `kani::solver(...)` matching missed imported aliases and compiler-tool attributes. The existing source scanner now refuses solver imports/re-exports, Kani aliases/globs/`extern crate`, raw `kanitool::solver`, and unknown solver-attribute forms. Canonical `kani::solver(kissat)` remains admitted, including raw identifier spelling, comments, a trailing comma and `cfg_attr` nesting. Ordinary solver-named variables/functions and literal/comment text remain admitted.
+
+The two negative regression methods produced 28 failed assertions against a frozen copy of installed `e36b939`. The corrected Rust suite passed 38 methods, including 36 new refusal/preservation subcases across root, dependency and included source files. Actual metadata capture admitted Dossier's EX-002 Kani and EX-003 Cargo contexts; its retained Kani `solver` root matches `distribution/bin/kissat`, hash `sha256:6cbea531c356468c23872474053de41e8c281cec0d7e4189f80b3524101c9aaf`, 423416 executable bytes.
+
+This bounded scanner conservatively refuses unrelated solver imports/attributes. Arbitrary macro-generated selectors remain outside its closure; no generic provenance, reuse or activation qualification follows. No Dossier source, installed runtime, proof recipe or bound changed. Independent post-commit review remains pending.

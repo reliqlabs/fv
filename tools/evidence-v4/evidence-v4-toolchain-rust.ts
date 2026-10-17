@@ -1217,6 +1217,30 @@ function assertRustSourceIncludes(
 ): boolean {
 	let code = rustSourceCode(source);
 	if (code === null) fail("unclassified Rust source inclusion syntax in " + filename);
+	for (const match of code.matchAll(/(?<![#\w])(?:use|extern\s+crate)\b[^;]*/g)) {
+		const declaration = match[0];
+		if (
+			/\bsolver\b/.test(declaration) ||
+			(/\b(?:kani|kanitool)\b/.test(declaration) && (/\bas\b|\*/.test(declaration) || /^extern\b/.test(declaration)))
+		)
+			fail("Kani solver imports and namespace aliases are unsupported in " + filename);
+	}
+	// shortcut: generated selectors need a reviewed expansion closure; this scans literal attributes only.
+	for (const match of code.matchAll(/#\s*!?\s*\[/g)) {
+		let end = match.index! + match[0].length,
+			depth = 1;
+		while (end < code.length && depth) {
+			if (code[end] === "[") depth++;
+			else if (code[end] === "]") depth--;
+			end++;
+		}
+		if (depth) fail("unclassified Rust attribute syntax in " + filename);
+		const attribute = code
+			.slice(match.index! + match[0].length, end - 1)
+			.replace(/(^|[(,])\s*(?:::)?(?:r#)?kani\s*::\s*(?:r#)?solver\s*\(\s*kissat\s*,?\s*\)/g, "$1");
+		if (/\bsolver\b/.test(attribute))
+			fail("Kani solver attribute requires the installed pinned kissat selection in " + filename);
+	}
 	for (const match of code.matchAll(/\bkani\s*::\s*solver\s*\(([^)]*)\)/g))
 		if (!/^kissat\s*,?$/.test(match[1].trim()))
 			fail("Kani solver attribute requires the installed pinned kissat selection in " + filename);
