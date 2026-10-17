@@ -16,6 +16,7 @@ export type NativeAdapterOptions = {
 	sdk?: string;
 	flags?: readonly string[];
 	drivers?: Record<string, string | readonly string[]>;
+	unboundPayloads?: readonly string[];
 };
 export type ProbeResult = { stdout: Buffer; stderr: Buffer; code: number; identity: ToolDiscovery };
 export type AdapterResult = {

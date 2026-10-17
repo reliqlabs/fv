@@ -214,3 +214,12 @@ Root-value CA-16, imported-helper CA-17, transitive split-stdlib CA-21 and gener
 While preparing this worktree, the collection-repair merge was accidentally executed in the installed FV checkout. That checkout was clean and its new merge had only `e36b939` and `437beea` as parents. The merge is preserved as `765025e` on `perf/evidence-collection-recovered-merge`; `git reset --keep` restored the installed checkout to `e36b939`. No Dossier record or lock was modified by that operation. Subsequent integration merges run only in `evidence-final-union`.
 
 The final integration combines the independently reviewed native/coverage and Kani corrections with the hybrid adapter changes. Full frozen-tree regression verification and the residual runtime re-review remain pending. The original Dossier owner remains blocked; this integration does not authorize recovery or promote failed evidence.
+
+## Ordinary Darwin tree refusal (2026-10-16)
+
+Classification: implementation-only, enforcing the existing native-closure contract. Ordinary Darwin tree declarations now inspect native payloads. Absolute vendor-system load commands remain admitted; non-system edges refuse because tree membership does not establish the child's launch environment or inherited rpaths. No library-search context is inferred from `requires`.
+
+Three targeted methods passed, covering external-library mutation refusal, system-only native trees and native-free script aliases. The system-image fixture first failed while copying protected file flags, before adapter execution; it now copies bytes and permission mode only. Classification: `.fv/classifications/2026-10-16-darwin-fixture.md`.
+
+Actual Dossier Go and Quint tree capture succeeded. Its Verus distribution correctly refused `rust_verify`'s `@rpath/librustc_driver-e03ed1db822dfa4c.dylib`; a separately bound sysroot does not establish rustup's child launch context. Results are retained at `fv-darwin-tree-selection-tm_8xph3`. A compatible Verus launch-context adapter needs its own reviewed contract. Post-commit review and frozen integration regressions remain pending. Installed FV and the failed Dossier owner are unchanged.
+

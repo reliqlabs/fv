@@ -1583,6 +1583,192 @@ else if(args[0]==='exec'){
                     changed["error"],
                 )
 
+    def _tree_capture_request(self, directory):
+        return {
+            "op": "capture",
+            "root": str(self.root),
+            "env": self.env,
+            "ids": ["fixture"],
+            "policy": {
+                "toolchains": [
+                    {
+                        "id": "fixture",
+                        "kind": "tree",
+                        "locator": {"mode": "path", "value": str(directory)},
+                        "requires": [],
+                        "version_command": None,
+                        "version_cwd": None,
+                        "accept": {"sha256": [], "version_contains": []},
+                    }
+                ],
+                "recipes": [],
+                "preflight": [],
+                "claim_checker": {"toolchain": []},
+            },
+        }
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca24_tree_external_library_mutation_refuses_unbound_launch_context(self):
+        distribution = self.external / "distribution"
+        executable = distribution / "bin/child"
+        executable.parent.mkdir(parents=True)
+        library = self.external / "libfixture.dylib"
+        library_source = self.write(
+            self.root / "library.c", "int fixture(void) { return 0; }\n"
+        )
+        executable_source = self.write(
+            self.root / "main.c",
+            "int fixture(void); int main(void) { return fixture(); }\n",
+        )
+        for install, rpath in (
+            (str(library), None),
+            ("@loader_path/../../libfixture.dylib", None),
+            ("@executable_path/../../libfixture.dylib", None),
+            ("@rpath/libfixture.dylib", None),
+            ("@rpath/libfixture.dylib", str(self.external)),
+        ):
+            with self.subTest(install=install, rpath=rpath):
+                subprocess.run(
+                    [
+                        "/usr/bin/cc",
+                        "-dynamiclib",
+                        "-install_name",
+                        install,
+                        str(library_source),
+                        "-o",
+                        str(library),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                subprocess.run(
+                    [
+                        "/usr/bin/cc",
+                        str(executable_source),
+                        str(library),
+                        *([f"-Wl,-rpath,{rpath}"] if rpath else []),
+                        "-o",
+                        str(executable),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                request = self._tree_capture_request(distribution)
+                # A separately bound matching library cannot supply missing launch semantics.
+                request["policy"]["toolchains"][0]["requires"] = ["library"]
+                request["policy"]["toolchains"].append(
+                    {
+                        "id": "library",
+                        "kind": "file",
+                        "locator": {"mode": "path", "value": str(library)},
+                        "requires": [],
+                        "version_command": None,
+                        "version_cwd": None,
+                        "accept": {"sha256": [], "version_contains": []},
+                    }
+                )
+                for changed in (False, True):
+                    with self.subTest(changed=changed):
+                        if changed:
+                            with library.open("ab") as stream:
+                                stream.write(b"\0")
+                        result = invoke(request)
+                        self.assertFalse(result["ok"], result)
+                        self.assertIn(
+                            "Unbound native tree launch context", result["error"]
+                        )
+                        self.assertIn(install, result["error"])
+                        self.assertIn(str(executable), result["error"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca24_system_only_go_shaped_tree_preserves_all_payloads(self):
+        distribution = self.external / "distribution"
+        images = [
+            distribution / "bin/go",
+            distribution / "bin/gofmt",
+            *(
+                distribution / "pkg/tool/darwin_arm64" / name
+                for name in (
+                    "asm",
+                    "cgo",
+                    "compile",
+                    "cover",
+                    "link",
+                    "preprofile",
+                    "vet",
+                )
+            ),
+            distribution / "pkg/tool/darwin_arm64/cc",
+        ]
+        for image in images:
+            image.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy("/usr/bin/true", image)
+        request = self._tree_capture_request(distribution)
+        request["policy"]["toolchains"][0]["locator"] = {
+            "mode": "command-relative",
+            "value": str(distribution / "bin/go"),
+            "parent_levels": 1,
+            "subpath": ".",
+        }
+        request["op"] = "stability"
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["identities"], result["after"])
+        identity = next(
+            value for value in result["identities"] if value["id"] == "fixture"
+        )
+        self.assertEqual(identity["kind"], "tree")
+        files = {entry["path"] for entry in identity["files"]}
+        self.assertTrue(
+            {str(image.relative_to(distribution)) for image in images} <= files
+        )
+        inspected = {
+            probe["command"][-1]
+            for probe in identity["discovery"]
+            if len(probe["command"]) == 3 and probe["command"][1] == "-l"
+        }
+        self.assertTrue({str(image) for image in images} <= inspected)
+        self.assertFalse(
+            any(
+                probe["command"][0] in {str(image) for image in images}
+                for probe in identity["discovery"]
+            ),
+            identity["discovery"],
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca24_native_free_quint_shaped_tree_preserves_script_aliases(self):
+        package = self.external / "package"
+        cli = self.write(
+            package / "dist/src/cli.js", "#!/usr/bin/env node\n", executable=True
+        )
+        self.write(package / "package.json", '{"name":"fixture","version":"1.0.0"}\n')
+        alias = package / "quint"
+        alias.symlink_to("dist/src/cli.js")
+        request = self._tree_capture_request(package)
+        request["policy"]["toolchains"][0]["locator"] = {
+            "mode": "command-relative",
+            "value": str(cli),
+            "parent_levels": 2,
+            "subpath": ".",
+        }
+        request["op"] = "stability"
+        result = invoke(request)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["identities"], result["after"])
+        identity = next(
+            value for value in result["identities"] if value["id"] == "fixture"
+        )
+        files = {entry["path"]: entry for entry in identity["files"]}
+        self.assertEqual(files["quint"]["kind"], "symlink-file")
+        self.assertEqual(files["quint"]["resolved_path"], "dist/src/cli.js")
+        self.assertFalse(
+            any(str(package) in probe["command"] for probe in identity["discovery"]),
+            identity["discovery"],
+        )
+
     def test_rust_commands_require_toolchain_family(self):
         for driver, args, family in (
             ("cargo", ["test"], "cargo-toolchain"),
