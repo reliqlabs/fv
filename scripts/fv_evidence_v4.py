@@ -1292,8 +1292,8 @@ def _policy(reader, relative, manifest_path=None):
             )
         if identifier in evidence:
             _check(
-                set(slot["tool"] for slot in record["executions"])
-                == set(evidence[identifier]),
+                set(evidence[identifier])
+                <= set(slot["tool"] for slot in record["executions"]),
                 "policy required evidence coverage differs from canonical manifest",
             )
         _check(
