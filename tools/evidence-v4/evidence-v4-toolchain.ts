@@ -644,6 +644,7 @@ class ImportPaths(list):
 def runtime_spec(name,search):
  return importlib.machinery.BuiltinImporter.find_spec(name) or importlib.machinery.FrozenImporter.find_spec(name) or importlib.machinery.PathFinder.find_spec(name,search)
 def inventory_stdlib(search,cwd=None,argv=None,flags=None,project=True):
+ global seen,import_roots
  search=search if search is not None else sys.path
  key=(tuple(search),tuple(import_roots),cwd,tuple(argv or ()),tuple(sorted((flags or {}).items())),project)
  if key in inventory_seen: return
@@ -672,7 +673,11 @@ def inventory_stdlib(search,cwd=None,argv=None,flags=None,project=True):
   elif real.endswith('.py'):
    if within(root,real): project_stdlib_files.add(real)
    else: external(real)
-   visit(origin,ImportPaths(search),cwd,argv,name,flags,project)
+   # Hypothetical imports must not consume or alter the caller's import state.
+   previous_seen,previous_roots=seen,import_roots
+   seen=set(); import_roots=list(import_roots)
+   try: visit(origin,ImportPaths(search),cwd,argv,name,flags,project)
+   finally: seen,import_roots=previous_seen,previous_roots
   else: raise RuntimeError('unsupported selected Python stdlib source: '+real)
  stdlib_selections.append(dict(paths=search,import_roots=list(import_roots),modules=observations))
 def inventory_native_stdlib():

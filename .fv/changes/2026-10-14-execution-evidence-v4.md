@@ -223,3 +223,13 @@ The initial targeted run failed before namespace analysis because the framework'
 
 Nine targeted methods passed, including framework-library content binding and external native-distribution refusal. Actual Dossier `python-runtime` capture succeeded at `fv-stdlib-real-selection-g_3jknmo`. This is metadata acceptance, not proof evidence. Post-commit review and frozen integration regressions remain pending; CA-16/17 and the other generic boundaries remain open.
 
+## Stdlib inventory/application state correction (2026-10-16)
+
+Classification: implementation-only, enforcing the existing provenance/refusal contract. Retained review `.fv/code-adversarial/2026-10-16-stdlib-inventory-review1.md` identified CA-03: hypothetical stdlib-shadow scans consumed the application's visit cache while discarding their copied import-path effects. Each hypothetical shadow visit now has a fresh visit cache and copied loader roots; `finally` restores the caller's cache and roots. Actual sequential imports retain their own admitted path effects.
+
+The shared-state audit keeps dependency requirements and analyzed-source hashes accumulating throughout each request. The existing per-request resets of requirements, visit cache, source hashes and inventory cache remain unchanged, after prior requirements have been materialized. Stdlib selections and project-shadow source requirements still accumulate across all requests. The active recursion guard and loader-root push/pop discipline are unchanged.
+
+Three consumer-visible regressions cover unimported versus sequentially imported path-mutating shadows, changed selected external bytes changing discovery identity, inventory and application requirements retained for duplicate requests, and scoped loader roots without a fallback-root escape. Existing ordinary Dossier setup and builtin/frozen precedence tests are unchanged.
+
+The three new methods produced two missing-dependency failures against frozen final-union `f37bd8c`, then passed against the correction. The complete toolchain suite passed 59 methods. Actual Dossier `python-runtime` capture succeeded at `fv-stdlib-state-selection-jj377942`. No schema, policy, proof statement, recipe or bound changed; CA-16/17 remain open. Installed FV `e36b939`, Dossier's failed collection and its indeterminate owner remain untouched. Independent confirmation remains pending.
+
