@@ -232,3 +232,5 @@ Three Java tree/file/executable preservation assertions failed against `f37bd8c`
 
 All four new methods passed after correction, covering Java content, fat32/fat64 load edges, malformed inputs and Java/native ambiguity. Actual Go and Quint metadata capture still succeeded; Verus retained its unbound-child-context refusal. Results are at `fv-darwin-tree-selection-gfgn8181`. These are metadata checks, not proof evidence. Independent confirmation and integrated regressions remain pending.
 
+Confirmation review of `0f0a3bf` closed CA-26 with no new findings in the correction; the report is `.fv/code-adversarial/2026-10-17-native-tree-review2.md`. CA-24 retains its refusal-only closure. The carried Python boundaries and compatible Verus adapter remain separate work; large-file memory behavior was not exercised.
+
