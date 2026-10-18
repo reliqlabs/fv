@@ -244,3 +244,22 @@ All four new methods passed after correction, covering Java content, fat32/fat64
 
 Confirmation review of `0f0a3bf` closed CA-26 with no new findings in the correction; the report is `.fv/code-adversarial/2026-10-17-native-tree-review2.md`. CA-24 retains its refusal-only closure. The carried Python boundaries and compatible Verus adapter remain separate work; large-file memory behavior was not exercised.
 
+## Stdlib inventory/application state correction (2026-10-16)
+
+Classification: implementation-only, enforcing the existing provenance/refusal contract. Retained review `.fv/code-adversarial/2026-10-16-stdlib-inventory-review1.md` identified CA-03: hypothetical stdlib-shadow scans consumed the application's visit cache while discarding their copied import-path effects. Each hypothetical shadow visit now has a fresh visit cache and copied loader roots; `finally` restores the caller's cache and roots. Actual sequential imports retain their own admitted path effects.
+
+The shared-state audit keeps dependency requirements and analyzed-source hashes accumulating throughout each request. The existing per-request resets of requirements, visit cache, source hashes and inventory cache remain unchanged, after prior requirements have been materialized. Stdlib selections and project-shadow source requirements still accumulate across all requests. The active recursion guard and loader-root push/pop discipline are unchanged.
+
+Three consumer-visible regressions cover unimported versus sequentially imported path-mutating shadows, changed selected external bytes changing discovery identity, inventory and application requirements retained for duplicate requests, and scoped loader roots without a fallback-root escape. Existing ordinary Dossier setup and builtin/frozen precedence tests are unchanged.
+
+The three new methods produced two missing-dependency failures against frozen final-union `f37bd8c`, then passed against the correction. The complete toolchain suite passed 59 methods. Actual Dossier `python-runtime` capture succeeded at `fv-stdlib-state-selection-jj377942`. No schema, policy, proof statement, recipe or bound changed; CA-16/17 remain open. Installed FV `e36b939`, Dossier's failed collection and its indeterminate owner remain untouched. Independent confirmation remains pending.
+
+
+## Speculative argument-state isolation (2026-10-18)
+
+Review 2, retained as `.fv/code-adversarial/2026-10-17-stdlib-inventory-review2.md`, found that hypothetical shadow scans still shared the application's `argv` list. The actual Python invocation selected `real_plugin`, while metadata incorrectly selected `decoy_plugin`. The regression reproduced that omission before correction.
+
+Hypothetical visits now use `copy.copy(argv)`, preserving the supported argument-list type without changing the caller's list. The existing flag view remains read-only in the analyzer. All four state-boundary methods passed afterward, including the actual interpreter/metadata agreement case and its selected-byte invalidation check. Actual Dossier Python metadata capture succeeded at `fv-stdlib-argv-selection-z670oql8`. Confirmation review and integrated regression checks remain pending; no canonical evidence or activation claim changes.
+
+Confirmation review of `42e5935` closed both reported CA-03 mechanisms with no new bounded-delta findings. The full report is `.fv/code-adversarial/2026-10-18-stdlib-inventory-review3.md`. Base CA-16/17 remain open; this does not qualify general Python semantics, reuse or canonical collection.
+

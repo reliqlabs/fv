@@ -217,6 +217,9 @@ modules must be bound; unsupported external packages and native distributions
 refuse. Native inventory binds the exact sysconfig-selected runtime library,
 including framework builds, without treating its surrounding directory as
 standard-library input.
+Inventory requirements accumulate across scans. Hypothetical shadow visits use
+separate visit caches and copied loader roots, leaving sequential application
+import effects intact.
 
 The v4 producer now inspects native-magic payloads in ordinary Darwin tool trees.
 Native-free trees and payloads with only absolute vendor-system load commands
