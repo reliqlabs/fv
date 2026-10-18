@@ -136,6 +136,122 @@ export function toolPath(value: string): string {
 	return value;
 }
 
+const MACHO_THIN_MAGIC = [0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe];
+const MACHO_MAGIC = [...MACHO_THIN_MAGIC, 0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca];
+const JAVA_CONSTANT_WIDTH: Record<number, number> = {
+	3: 4,
+	4: 4,
+	7: 2,
+	8: 2,
+	9: 4,
+	10: 4,
+	11: 4,
+	12: 4,
+	15: 3,
+	16: 2,
+	17: 4,
+	18: 4,
+	19: 2,
+	20: 2,
+};
+
+function isJavaClass(bytes: Buffer): boolean {
+	let offset = 4;
+	const skip = (length: number): void => {
+		if (length > bytes.length - offset) throw new RangeError("Truncated Java class");
+		offset += length;
+	};
+	const uint = (width: 1 | 2 | 4): number => {
+		const start = offset;
+		skip(width);
+		return width === 1 ? bytes[start] : width === 2 ? bytes.readUInt16BE(start) : bytes.readUInt32BE(start);
+	};
+	try {
+		if (bytes.readUInt32BE(0) !== 0xcafebabe) return false;
+		const architectures = Math.min(bytes.readUInt32BE(4), Math.floor((bytes.length - 8) / 20));
+		for (let index = 0; index < architectures; index++) {
+			const member = bytes.readUInt32BE(16 + index * 20);
+			// An embedded native member wins even when the surrounding fat/class envelope is malformed.
+			if (member >= 8 && member <= bytes.length - 4 && MACHO_THIN_MAGIC.includes(bytes.readUInt32BE(member)))
+				return false;
+		}
+		uint(2);
+		if (uint(2) < 45) return false;
+		const count = uint(2),
+			tags = new Uint8Array(count);
+		if (count < 2) return false;
+		for (let index = 1; index < count; index++) {
+			const tag = (tags[index] = uint(1));
+			if (tag === 1) skip(uint(2));
+			else if (tag === 5 || tag === 6) {
+				skip(8);
+				if (++index >= count) return false;
+			} else {
+				const width = JAVA_CONSTANT_WIDTH[tag];
+				if (width === undefined) return false;
+				skip(width);
+			}
+		}
+		const poolIndex = (tag: number, optional = false): void => {
+			const index = uint(2);
+			if (!(optional && index === 0) && tags[index] !== tag) throw new RangeError("Invalid Java class index");
+		};
+		const attributes = (): void => {
+			const count = uint(2);
+			for (let index = 0; index < count; index++) {
+				poolIndex(1);
+				skip(uint(4));
+			}
+		};
+		uint(2);
+		poolIndex(7);
+		poolIndex(7, true);
+		const interfaces = uint(2);
+		for (let index = 0; index < interfaces; index++) poolIndex(7);
+		for (let kind = 0; kind < 2; kind++) {
+			const count = uint(2);
+			for (let index = 0; index < count; index++) {
+				uint(2);
+				poolIndex(1);
+				poolIndex(1);
+				attributes();
+			}
+		}
+		attributes();
+		return offset === bytes.length;
+	} catch (error) {
+		if (error instanceof RangeError) return false;
+		throw error;
+	}
+}
+
+export async function nativeFileKind(file: string, prefix?: Buffer): Promise<"macho" | "elf" | null> {
+	if (!prefix) {
+		const handle = await fs.open(file, "r"),
+			header = Buffer.alloc(11);
+		try {
+			const { bytesRead } = await handle.read(header, 0, header.length, 0);
+			prefix = header.subarray(0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	}
+	if (prefix.length < 4) return null;
+	const magic = prefix.readUInt32BE();
+	if (magic === 0x7f454c46) return "elf";
+	if (!MACHO_MAGIC.includes(magic)) return null;
+	// CAFEBABE is shared with Java; only a complete class-file envelope bypasses native inspection.
+	if (
+		magic === 0xcafebabe &&
+		prefix.length >= 11 &&
+		prefix.readUInt16BE(8) > 1 &&
+		prefix[10] !== 0 &&
+		isJavaClass(await fs.readFile(file))
+	)
+		return null;
+	return "macho";
+}
+
 const MACHO_DYLIB_LOAD_COMMANDS: Record<string, true> = {
 	LC_LOAD_DYLIB: true,
 	LC_LOAD_WEAK_DYLIB: true,

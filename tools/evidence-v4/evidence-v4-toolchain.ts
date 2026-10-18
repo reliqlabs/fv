@@ -23,6 +23,7 @@ import {
 	inside,
 	linkedPackageRoots,
 	packageRoots,
+	nativeFileKind,
 	probeJSON,
 	probeText,
 	parseMachOLoadCommands,
@@ -251,14 +252,7 @@ async function nativePayloads(roots: readonly ToolRoot[]): Promise<string[]> {
 		const real = await canonicalToolPath(file);
 		if (seen.has(real)) return;
 		seen.add(real);
-		const handle = await fs.open(real, "r"),
-			magic = Buffer.alloc(4);
-		try {
-			await handle.read(magic, 0, 4, 0);
-		} finally {
-			await handle.close();
-		}
-		if (MACHO_MAGIC.includes(magic.readUInt32BE()) || magic.readUInt32BE() === 0x7f454c46) files.push(real);
+		if ((await nativeFileKind(real)) !== null) files.push(real);
 	};
 	for (const root of roots) await visit(await canonicalToolPath(root.path), root, "");
 	return files;
@@ -273,7 +267,6 @@ const LINUX_SYSTEM_PREFIXES = [
 	"/usr/lib64/",
 	"/usr/libx32/",
 ];
-const MACHO_MAGIC = [0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe, 0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca];
 function linuxSystemPath(file: string): boolean {
 	return LINUX_SYSTEM_PREFIXES.some((prefix) => file.startsWith(prefix));
 }
@@ -1496,14 +1489,7 @@ export async function discoverNativeAdapter(
 		return pending;
 	};
 	for (const file of options.unboundPayloads ?? []) {
-		const handle = await fs.open(file, "r"),
-			magic = Buffer.alloc(4);
-		try {
-			await handle.read(magic, 0, 4, 0);
-		} finally {
-			await handle.close();
-		}
-		if (!MACHO_MAGIC.includes(magic.readUInt32BE())) continue;
+		if ((await nativeFileKind(file)) !== "macho") continue;
 		// Tree membership does not identify a child's process image or launcher-modified loader environment.
 		for (const install of (await readLoadCommands(file)).dependencies)
 			if (
@@ -1522,7 +1508,7 @@ export async function discoverNativeAdapter(
 		} finally {
 			await handle.close();
 		}
-		if (length >= 4 && MACHO_MAGIC.includes(head.readUInt32BE(0))) return file;
+		if ((await nativeFileKind(file, head.subarray(0, length))) === "macho") return file;
 		const prefix = head.subarray(0, length).toString("utf8");
 		if (!prefix.startsWith("#!") || depth > 2) throw new Error(`Unsupported native process image: ${file}`);
 		const tokens = prefix
@@ -1551,21 +1537,13 @@ export async function discoverNativeAdapter(
 			rpaths: inheritedRpaths,
 		});
 		if (visited.has(inputContext)) return;
-		const handle = await fs.open(real, "r");
-		let magic: Buffer;
-		try {
-			magic = Buffer.alloc(4);
-			await handle.read(magic, 0, 4, 0);
-		} finally {
-			await handle.close();
-		}
-		const word = magic.readUInt32BE(0);
-		if (process.platform === "linux" && word === 0x7f454c46) {
+		const format = await nativeFileKind(real);
+		if (process.platform === "linux" && format === "elf") {
 			visited.add(inputContext);
 			elfFiles.push(real);
 			return;
 		}
-		if (process.platform !== "darwin" || !MACHO_MAGIC.includes(word)) {
+		if (process.platform !== "darwin" || format !== "macho") {
 			visited.add(inputContext);
 			const prefix = (await fs.readFile(real)).subarray(0, 256).toString("utf8");
 			if (prefix.startsWith("#!")) {
@@ -1758,18 +1736,10 @@ async function selectedNodeExecution(
 	roots.push({ label: "execution/node", path: node });
 	native.push(node);
 	let selectedRuntime = await canonicalToolPath(node);
-	const wrappers = new Set<string>(),
-		header = Buffer.alloc(4);
+	const wrappers = new Set<string>();
 	for (;;) {
 		await fs.access(selectedRuntime, fs.constants.X_OK);
-		const handle = await fs.open(selectedRuntime, "r");
-		try {
-			if ((await handle.read(header, 0, header.length, 0)).bytesRead !== header.length)
-				throw new Error("Unsupported preferred Node runtime wrapper: " + selectedRuntime);
-		} finally {
-			await handle.close();
-		}
-		if (MACHO_MAGIC.includes(header.readUInt32BE()) || header.readUInt32BE() === 0x7f454c46) break;
+		if ((await nativeFileKind(selectedRuntime)) !== null) break;
 		if (wrappers.has(selectedRuntime)) throw new Error("Preferred Node runtime wrapper cycle");
 		wrappers.add(selectedRuntime);
 		const source = (await fs.readFile(selectedRuntime, "utf8")).replace(/\r\n/gu, "\n"),
@@ -2270,14 +2240,7 @@ export function createToolchainSession(options: ToolchainSessionOptions): Toolch
 									? await canonicalToolPath(path.resolve(root, locator.value))
 									: null;
 						if (file !== selected.realpath) continue;
-						const handle = await fs.open(file, "r"),
-							magic = Buffer.alloc(4);
-						try {
-							await handle.read(magic, 0, 4, 0);
-						} finally {
-							await handle.close();
-						}
-						if (MACHO_MAGIC.includes(magic.readUInt32BE()) || magic.readUInt32BE() === 0x7f454c46) return true;
+						if ((await nativeFileKind(file)) !== null) return true;
 					}
 				}
 				return false;

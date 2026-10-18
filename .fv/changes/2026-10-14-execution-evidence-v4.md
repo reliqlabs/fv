@@ -223,3 +223,12 @@ Three targeted methods passed, covering external-library mutation refusal, syste
 
 Actual Dossier Go and Quint tree capture succeeded. Its Verus distribution correctly refused `rust_verify`'s `@rpath/librustc_driver-e03ed1db822dfa4c.dylib`; a separately bound sysroot does not establish rustup's child launch context. Results are retained at `fv-darwin-tree-selection-tm_8xph3`. A compatible Verus launch-context adapter needs its own reviewed contract. Post-commit review and frozen integration regressions remain pending. Installed FV and the failed Dossier owner are unchanged.
 
+
+## Java and fat-Mach-O discrimination (2026-10-16)
+
+Native-tree review `.fv/code-adversarial/2026-10-16-native-tree-review1.md` identified CA-26: Java class files share `CAFEBABE` with fat Mach-O. The shared discriminator now recognizes a complete class-file envelope while giving embedded native members precedence. Truncated and unrecognized native-magic inputs still reach native inspection. No suffix exception, new probe or dependency was added.
+
+Three Java tree/file/executable preservation assertions failed against `f37bd8c`. Six additional fixture assertions wrongly treated little-endian fat containers as valid; Apple's format requires big-endian container structures, independently of member byte order. Those inputs moved to malformed/refusal coverage, with classification retained at `.fv/classifications/2026-10-16-fat-container-fixtures.md`. No production parser change was made for those fixture failures.
+
+All four new methods passed after correction, covering Java content, fat32/fat64 load edges, malformed inputs and Java/native ambiguity. Actual Go and Quint metadata capture still succeeded; Verus retained its unbound-child-context refusal. Results are at `fv-darwin-tree-selection-gfgn8181`. These are metadata checks, not proof evidence. Independent confirmation and integrated regressions remain pending.
+

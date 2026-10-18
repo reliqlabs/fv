@@ -12,6 +12,7 @@ import json
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1606,6 +1607,223 @@ else if(args[0]==='exec'){
                 "claim_checker": {"toolchain": []},
             },
         }
+
+    def _java_class_bytes(self, payload=b""):
+        # Valid public Fixture extends Object, with one opaque class attribute.
+        constants = (
+            b"\x01\x00\x07Fixture",
+            b"\x07\x00\x01",
+            b"\x01\x00\x10java/lang/Object",
+            b"\x07\x00\x03",
+            b"\x01\x00\x07payload",
+        )
+        return (
+            bytes.fromhex("cafebabe00000034")
+            + struct.pack(">H", len(constants) + 1)
+            + b"".join(constants)
+            + struct.pack(">7H", 0x21, 2, 4, 0, 0, 0, 1)
+            + struct.pack(">HI", 5, len(payload))
+            + payload
+        )
+
+    def _macho_bytes(self, install, cpu=0x0100000C):
+        def dylib(command, name):
+            text = name.encode() + b"\0"
+            size = (24 + len(text) + 7) & ~7
+            return (
+                struct.pack("<6I", command, size, 24, 0, 0x10000, 0x10000)
+                + text
+                + bytes(size - 24 - len(text))
+            )
+
+        commands = dylib(0xD, "@rpath/libfixture.dylib") + dylib(0xC, install)
+        return (
+            struct.pack(
+                "<8I",
+                0xFEEDFACF,
+                cpu,
+                3 if cpu == 0x01000007 else 0,
+                6,
+                2,
+                len(commands),
+                0,
+                0,
+            )
+            + commands
+        )
+
+    def _fat_macho_bytes(self, installs, *, wide=False, little=False):
+        endian = "<" if little else ">"
+        slices = [
+            self._macho_bytes(install, cpu)
+            for install, cpu in zip(installs, (0x0100000C, 0x01000007), strict=True)
+        ]
+        result = bytearray(0x2000 + len(slices[1]))
+        struct.pack_into(
+            endian + "II", result, 0, 0xCAFEBABF if wide else 0xCAFEBABE, 2
+        )
+        for index, (image, cpu) in enumerate(zip(slices, (0x0100000C, 0x01000007))):
+            offset = (index + 1) * 0x1000
+            fields = (cpu, 3 if cpu == 0x01000007 else 0, offset, len(image), 12)
+            struct.pack_into(
+                endian + ("IIQQII" if wide else "IIIII"),
+                result,
+                8 + index * (32 if wide else 20),
+                *fields,
+                *([0] if wide else []),
+            )
+            result[offset : offset + len(image)] = image
+        return bytes(result)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca26_java_class_tree_preserves_bound_content(self):
+        distribution = self.external / "java-data"
+        distribution.mkdir()
+        content = self._java_class_bytes()
+        images = [
+            distribution / "Fixture.class",
+            distribution / "payload",
+            distribution / "native-looking.dylib",
+        ]
+        for image in images:
+            image.write_bytes(content)
+        images[-1].chmod(0o755)
+        for kind, selected in (
+            ("tree", distribution),
+            ("file", images[0]),
+            ("executable", images[-1]),
+        ):
+            with self.subTest(kind=kind):
+                request = self._tree_capture_request(selected)
+                request["policy"]["toolchains"][0]["kind"] = kind
+                request["op"] = "stability"
+                result = invoke(request)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["identities"], result["after"])
+                identity = next(
+                    value for value in result["identities"] if value["id"] == "fixture"
+                )
+                self.assertEqual(identity["kind"], kind)
+                files = {entry["path"]: entry for entry in identity["files"]}
+                for name in (
+                    [image.name for image in images] if kind == "tree" else ["."]
+                ):
+                    self.assertEqual(
+                        files[name]["hash"],
+                        "sha256:" + hashlib.sha256(content).hexdigest(),
+                    )
+                self.assertFalse(
+                    any(
+                        probe["command"][-1] in {str(image) for image in images}
+                        for probe in identity["discovery"]
+                    ),
+                    identity["discovery"],
+                )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca26_fat_macho_tree_inspects_all_slices_and_refuses_external_edges(self):
+        distribution = self.external / "fat-images"
+        distribution.mkdir()
+        image = distribution / "data.class"
+        system = "/usr/lib/libSystem.B.dylib"
+        external = "@rpath/liboutside.dylib"
+        for wide in (False, True):
+            for installs in (
+                (system, system),
+                (system, external),
+                (external, system),
+            ):
+                with self.subTest(wide=wide, installs=installs):
+                    content = self._fat_macho_bytes(installs, wide=wide)
+                    image.write_bytes(content)
+                    request = self._tree_capture_request(distribution)
+                    request["op"] = "stability"
+                    result = invoke(request)
+                    if external in installs:
+                        self.assertFalse(result["ok"], result)
+                        self.assertIn(external, result["error"])
+                        self.assertIn(str(image), result["error"])
+                    else:
+                        self.assertTrue(result["ok"], result)
+                        self.assertEqual(result["identities"], result["after"])
+                        identity = next(
+                            value
+                            for value in result["identities"]
+                            if value["id"] == "fixture"
+                        )
+                        files = {entry["path"]: entry for entry in identity["files"]}
+                        self.assertEqual(
+                            files[image.name]["hash"],
+                            "sha256:" + hashlib.sha256(content).hexdigest(),
+                        )
+                        self.assertTrue(
+                            any(
+                                probe["command"][1:] == ["-l", str(image)]
+                                for probe in identity["discovery"]
+                            ),
+                            identity["discovery"],
+                        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca26_malformed_native_tree_payloads_remain_refused(self):
+        distribution = self.external / "malformed-images"
+        distribution.mkdir()
+        image = distribution / "payload"
+        fat = self._fat_macho_bytes(("/usr/lib/libSystem.B.dylib",) * 2)
+        cases = {
+            **{
+                f"little-endian-container-{wide}": self._fat_macho_bytes(
+                    ("/usr/lib/libSystem.B.dylib",) * 2, wide=wide, little=True
+                )
+                for wide in (False, True)
+            },
+            **{
+                f"truncated-{magic:08x}": struct.pack(">I", magic)
+                for magic in (
+                    0xFEEDFACE,
+                    0xCEFAEDFE,
+                    0xFEEDFACF,
+                    0xCFFAEDFE,
+                    0xCAFEBABE,
+                    0xBEBAFECA,
+                    0xCAFEBABF,
+                    0xBFBAFECA,
+                )
+            },
+            "empty-fat": struct.pack(">II", 0xCAFEBABE, 0),
+            "truncated-fat-table": fat[:27],
+            "truncated-fat-slice": fat[:0x1004],
+            "truncated-class-envelope": self._java_class_bytes()[:-1],
+            "invalid-class-pool-index": self._java_class_bytes()[:-6]
+            + struct.pack(">HI", 99, 0),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                image.write_bytes(content)
+                result = invoke(self._tree_capture_request(distribution))
+                self.assertFalse(result["ok"], result)
+                self.assertIn(str(image), result["error"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
+    def test_ca26_java_fat_polyglot_keeps_native_precedence(self):
+        distribution = self.external / "ambiguous-images"
+        distribution.mkdir()
+        image = distribution / "Fixture.class"
+        native = self._macho_bytes("@rpath/liboutside.dylib")
+        member = 0x1000
+        header = self._java_class_bytes()
+        content = bytearray(
+            self._java_class_bytes(bytes(member + len(native) - len(header)))
+        )
+        # The opaque Java attribute also carries a fat-table member and its native image.
+        struct.pack_into(
+            ">5I", content, 8 + 4 * 20, 0x0100000C, 0, member, len(native), 12
+        )
+        content[member:] = native
+        image.write_bytes(content)
+        result = invoke(self._tree_capture_request(distribution))
+        self.assertFalse(result["ok"], result)
+        self.assertIn(str(image), result["error"])
 
     @unittest.skipUnless(sys.platform == "darwin", "Mach-O discovery requires Darwin")
     def test_ca24_tree_external_library_mutation_refuses_unbound_launch_context(self):
