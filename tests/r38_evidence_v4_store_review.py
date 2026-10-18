@@ -597,6 +597,48 @@ class EvidenceV4StoreReview(unittest.TestCase):
                 str(snapshot.relative_to(fixture.root)),
             )
 
+    def test_history_append_tolerates_concurrent_non_history_write(self):
+        script = r"""
+const request = JSON.parse(await Bun.stdin.text());
+const { openEvidenceStore } = await import(request.modules + "/evidence-v4-store.ts");
+let store, sibling;
+store = await openEvidenceStore(request.cwd, {
+    withAppendLock: fn => {
+        const append = fn();
+        sibling = store.writeImmutableFile(".fv/evidence/v4/sibling-job-output.bin", new Uint8Array([1]));
+        return append;
+    },
+});
+let result;
+try {
+    const reference = await store.appendHistory({
+        schema_version: "fv-evidence-history/v1", kind: "execution",
+        execution_key: "sha256:" + "a".repeat(64), attempt_id: "00000000-0000-4000-8000-000000000001",
+        members: [{ claim_id: "A", slot_id: "slot-1", tool: "fixture-tool" }],
+        execution: null, claim_id: null, slot_id: null, observation: null, indeterminate_owner: null,
+        result: "ERROR",
+    });
+    await sibling;
+    result = { sequence: reference.sequence };
+} catch (error) {
+    await sibling;
+    result = { error: String(error) };
+}
+console.log(JSON.stringify(result));
+"""
+        with EvidenceV4Fixture(claims=("A",)) as fixture:
+            process = subprocess.run(
+                [fixture.bun, "--eval", script],
+                input=json.dumps(request_for(fixture)),
+                cwd=REPO,
+                env=fixture.process_environment(),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+            )
+            self.assertEqual(json.loads(process.stdout), {"sequence": 1}, process.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

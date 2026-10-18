@@ -887,11 +887,12 @@ export class Store {
 			)
 				fail("captured history is not a retained prefix");
 		}
+		// Unaccounted reads run under the append lock, which already excludes history writes; other jobs' artifact writes cannot invalidate them.
 		if (!allowUnaccounted) {
 			await this.validateAttemptAccounting(accounted, cache);
 			await this.validateObservationAccounting(events, cache);
+			if (epoch !== this.writeEpoch) fail("store changed during retained-history validation");
 		}
-		if (epoch !== this.writeEpoch) fail("store changed during retained-history validation");
 		const snapshot = freezeRecord({ view, events });
 		if (!allowUnaccounted) {
 			const validation = { snapshot, epoch, executions: cache };
