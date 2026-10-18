@@ -227,6 +227,11 @@ environment. Resolving those edges needs a reviewed launch-context adapter.
 In particular, a separately bound Rust sysroot does not resolve a Verus child's
 `@rpath` dependency without the rustup launch transformation. These are producer
 discovery limits under the existing v4 closure contract, not new policy fields.
+Shared format detection distinguishes complete Java class-file envelopes from
+fat Mach-O despite their common `CAFEBABE` prefix, regardless of filename or
+execute mode. Native members take precedence in ambiguous data. Truncated or
+unrecognized native-magic contents still require native metadata inspection;
+the discriminator adds no subprocess probe or launch-context inference.
 
 ### Evidence records (`fv-evidence-run/v3`)
 
