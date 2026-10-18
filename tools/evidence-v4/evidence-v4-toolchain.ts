@@ -605,7 +605,7 @@ export async function discoverPythonAdapter(context: AdapterContext): Promise<Ad
 		}
 	}
 	const code = String.raw`
-import ast,hashlib,importlib.machinery,json,os,pathlib,site,symtable,sys,sysconfig
+import ast,copy,hashlib,importlib.machinery,json,os,pathlib,site,symtable,sys,sysconfig
 root=os.path.realpath(sys.argv[1]); requests=json.loads(sys.argv[2]); stdlib=os.path.realpath(sysconfig.get_path('stdlib')); extensions=os.path.realpath(sysconfig.get_config_var('DESTSHARED')); startup=[]; startup_hooks=set(); required=set(); seen=set(); active=set(); import_roots=[]
 def within(base,p): return p==base or p.startswith(base+os.sep)
 for p in sys.path:
@@ -676,7 +676,7 @@ def inventory_stdlib(search,cwd=None,argv=None,flags=None,project=True):
    # Hypothetical imports must not consume or alter the caller's import state.
    previous_seen,previous_roots=seen,import_roots
    seen=set(); import_roots=list(import_roots)
-   try: visit(origin,ImportPaths(search),cwd,argv,name,flags,project)
+   try: visit(origin,ImportPaths(search),cwd,copy.copy(argv),name,flags,project)
    finally: seen,import_roots=previous_seen,previous_roots
   else: raise RuntimeError('unsupported selected Python stdlib source: '+real)
  stdlib_selections.append(dict(paths=search,import_roots=list(import_roots),modules=observations))

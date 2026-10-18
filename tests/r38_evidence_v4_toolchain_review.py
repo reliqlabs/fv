@@ -676,6 +676,45 @@ load_exercise()
                 self.assertTrue(after["ok"], after)
                 self.assertNotEqual(before["discovery"], after["discovery"])
 
+    def test_ca03_stdlib_inventory_preserves_application_arguments(self):
+        decoy = self.write(self.external / "decoy_plugin.py", "VALUE = 0\n")
+        for mutation, condition in (
+            ("sys.argv[1] = 'inventory'", "sys.argv[1] == 'actual'"),
+            ("sys.flags['safe_path'] = True", "sys.flags.safe_path == False"),
+        ):
+            with self.subTest(mutation=mutation):
+                self.write(self.root / "colorsys.py", "import sys\n" + mutation + "\n")
+                real = self.write(self.external / "real_plugin.py", "VALUE = 1\n")
+                request = self.python_request(
+                    "import sys\n"
+                    f"if {condition}:\n"
+                    " import real_plugin\n print(real_plugin.VALUE)\n"
+                    "else:\n import decoy_plugin\n print(decoy_plugin.VALUE)\n"
+                )
+                request["commands"][0]["subject"].append("actual")
+                execution = subprocess.run(
+                    request["commands"][0]["subject"],
+                    cwd=self.root,
+                    env=request["env"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(execution.stdout, "1\n")
+                before = invoke(request)
+                self.assertTrue(before["ok"], before)
+                required = {
+                    file
+                    for requirement in before["requirements"]
+                    for file in requirement["files"]
+                }
+                self.assertIn(str(real), required)
+                self.assertNotIn(str(decoy), required)
+                real.write_text("VALUE = 2\n")
+                after = invoke(request)
+                self.assertTrue(after["ok"], after)
+                self.assertNotEqual(before["discovery"], after["discovery"])
+
     def test_ca03_stdlib_inventory_requirements_survive_each_request_reset(self):
         self.write(self.root / "colorsys.py", "import first_plugin\n")
         self.write(self.root / "string.py", "import second_plugin\n")

@@ -233,3 +233,10 @@ Three consumer-visible regressions cover unimported versus sequentially imported
 
 The three new methods produced two missing-dependency failures against frozen final-union `f37bd8c`, then passed against the correction. The complete toolchain suite passed 59 methods. Actual Dossier `python-runtime` capture succeeded at `fv-stdlib-state-selection-jj377942`. No schema, policy, proof statement, recipe or bound changed; CA-16/17 remain open. Installed FV `e36b939`, Dossier's failed collection and its indeterminate owner remain untouched. Independent confirmation remains pending.
 
+
+## Speculative argument-state isolation (2026-10-18)
+
+Review 2, retained as `.fv/code-adversarial/2026-10-17-stdlib-inventory-review2.md`, found that hypothetical shadow scans still shared the application's `argv` list. The actual Python invocation selected `real_plugin`, while metadata incorrectly selected `decoy_plugin`. The regression reproduced that omission before correction.
+
+Hypothetical visits now use `copy.copy(argv)`, preserving the supported argument-list type without changing the caller's list. The existing flag view remains read-only in the analyzer. All four state-boundary methods passed afterward, including the actual interpreter/metadata agreement case and its selected-byte invalidation check. Actual Dossier Python metadata capture succeeded at `fv-stdlib-argv-selection-z670oql8`. Confirmation review and integrated regression checks remain pending; no canonical evidence or activation claim changes.
+
