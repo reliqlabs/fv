@@ -240,3 +240,5 @@ Review 2, retained as `.fv/code-adversarial/2026-10-17-stdlib-inventory-review2.
 
 Hypothetical visits now use `copy.copy(argv)`, preserving the supported argument-list type without changing the caller's list. The existing flag view remains read-only in the analyzer. All four state-boundary methods passed afterward, including the actual interpreter/metadata agreement case and its selected-byte invalidation check. Actual Dossier Python metadata capture succeeded at `fv-stdlib-argv-selection-z670oql8`. Confirmation review and integrated regression checks remain pending; no canonical evidence or activation claim changes.
 
+Confirmation review of `42e5935` closed both reported CA-03 mechanisms with no new bounded-delta findings. The full report is `.fv/code-adversarial/2026-10-18-stdlib-inventory-review3.md`. Base CA-16/17 remain open; this does not qualify general Python semantics, reuse or canonical collection.
+
