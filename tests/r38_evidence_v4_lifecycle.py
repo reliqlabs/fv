@@ -944,6 +944,54 @@ class EvidenceV4NativeOwnership(unittest.TestCase):
                     list((root / ".fv/evidence/v4/recovered-owners").glob("*.json"))
                 )
 
+    def test_scoped_indeterminate_window_recovers_only_after_recorded_groups_stop(self):
+        with EvidenceV4Fixture(claims=("A",)) as fixture:
+            self.assertEqual(fixture.run(resume=False, jobs=1)["result"], "PASS")
+            artifact_path, artifact = fixture.artifacts()[0]
+            original = artifact_path.read_bytes()
+            root = fixture.root.resolve(strict=True)
+            environment = native_environment(root)
+            with LifecycleDriver(
+                {"mode": "owner-hold", "cwd": str(root)}, environment=environment
+            ) as driver:
+                owner = driver.receive("owner")["owner"]
+                driver.send("exit")
+                driver.process.wait(timeout=TIMEOUT)
+            ownership = artifact["ownership"]
+            window_id = ownership["children"][0]["window_id"]
+            window = next(w for w in ownership["spawn_windows"] if w["window_id"] == window_id)
+            owner["owner_id"] = ownership["owner_id"]
+            owner["spawn_windows"] = [
+                dict(
+                    window,
+                    execution_key=artifact["execution_key"],
+                    attempt_id=artifact["attempt_id"],
+                    state="indeterminate",
+                )
+            ]
+            canonical = dict(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            owner_path(root).write_text(json.dumps(owner, **canonical))
+            request = {"mode": "recover", "cwd": str(root), "owner": owner}
+            child = subprocess.Popen(
+                [sys.executable, "-I", "-B", "-c", "import sys; sys.stdin.buffer.read()"],
+                stdin=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                live = copy.deepcopy(artifact)
+                live["ownership"]["children"][0]["process"] = identity(child.pid)
+                artifact_path.write_text(json.dumps(live, **canonical))
+                refused = driver_result(request, environment=environment)
+                self.assertEqual(refused["event"], "error", refused)
+                self.assertTrue(owner_path(root).exists())
+            finally:
+                child.stdin.close()
+                child.wait(timeout=TIMEOUT)
+            artifact_path.write_bytes(original)
+            recovered = driver_result(request, environment=environment)
+            self.assertTrue(recovered.get("recovered"), recovered)
+            self.assertFalse(owner_path(root).exists())
+
     def test_child_birth_identity_mismatch_never_signals_that_pid(self):
         with tempfile.TemporaryDirectory(prefix="r38-birth-") as directory:
             root = Path(directory).resolve(strict=True)

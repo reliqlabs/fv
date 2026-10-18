@@ -1822,7 +1822,8 @@ export class NativeSession {
 			ownership: {
 				schema_version: "fv-execution-ownership/v1",
 				owner_id: this.record.owner_id,
-				children: clone(owned),
+				// The receipt retains direct/hosted (leader) registrations; in-group descendants are tracked only for escape checks.
+				children: clone(owned.filter(({ process }) => process.pid === process.process_group)),
 				spawn_windows: clone(windows),
 				protocol_log: protocol && logValid ? { path: logRelative, hash: H(logBytes), size: logBytes.length } : null,
 			},
@@ -1946,6 +1947,41 @@ export async function createNativeSession(options: NativeSessionOptions): Promis
 	return new NativeSession(cwd, owner, bytes, options.signal);
 }
 
+// An indeterminate window recovers only when its execution artifact proves every registered group stopped.
+async function canRecoverWindow(cwd: string, ownerId: string, window: SpawnWindow): Promise<boolean> {
+	if (window.state === "closed") return true;
+	if (window.state !== "indeterminate" || !window.execution_key || !window.attempt_id) return false;
+	const artifactFile = path.join(
+		cwd,
+		`${BASE}/executions/${window.execution_key.slice(7)}/${window.attempt_id}/execution.json`,
+	);
+	try {
+		const artifact = parseJSON(await checkedBytes(artifactFile)) as {
+			execution_key?: string;
+			attempt_id?: string;
+			ownership?: {
+				owner_id?: string;
+				children?: { window_id?: string; terminated_at?: string | null; process?: OwnedProcess }[];
+			};
+		};
+		if (
+			artifact.execution_key !== window.execution_key ||
+			artifact.attempt_id !== window.attempt_id ||
+			artifact.ownership?.owner_id !== ownerId
+		)
+			return false;
+		const children = (artifact.ownership.children ?? []).filter((entry) => entry.window_id === window.window_id);
+		if (!children.length) return false;
+		for (const entry of children) {
+			if (!entry.terminated_at || !entry.process) return false;
+			if (!(await groupStopped(entry.process))) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export async function recoverOwner(options: RecoveryOptions): Promise<void> {
 	validateOwnerRecord(options.expectedOwner);
 	const cwd = await fs.realpath(options.cwd),
@@ -1971,8 +2007,9 @@ export async function recoverOwner(options: RecoveryOptions): Promise<void> {
 						? "live owner recovery refused"
 						: "reused owner PID recovery refused",
 				);
-			if (owner.spawn_windows.some((window) => window.state !== "closed"))
-				throw new Error("unprovable pending/gated/unregistered window recovery refused");
+			for (const window of owner.spawn_windows)
+				if (!(await canRecoverWindow(cwd, owner.owner_id, window)))
+					throw new Error("unprovable pending/gated/unregistered window recovery refused");
 			for (const child of owner.children)
 				if (!(await groupStopped(child))) throw new Error("live owned descendants recovery refused");
 		}

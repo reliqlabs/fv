@@ -400,6 +400,11 @@ class PortableReviewRegressions(unittest.TestCase):
         )
         return result
 
+    def test_in_group_descendant_pass_is_portably_assessable(self):
+        with EvidenceV4Fixture(claims=("A",)) as fixture:
+            fixture.set_control(spawn_child=True, await_child=True, child_delay_ms=500)
+            self.produce_pass(fixture)
+
     def test_canonical_tool_minimum_keeps_additional_slots_required(self):
         for missing, extra_fails in ((False, False), (False, True), (True, False)):
             with self.subTest(missing=missing, extra_fails=extra_fails):

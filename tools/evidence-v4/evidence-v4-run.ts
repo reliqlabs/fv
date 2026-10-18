@@ -368,6 +368,13 @@ class Invocation {
 			throw new Error("verified input state moved or became dirty during invocation");
 		return input;
 	}
+	// Fresh (--no-resume) runs bind tools and sources once at start and once at finish, not around every slot.
+	private currentTools(ids?: readonly string[]) {
+		return this.call.resume === false ? this.requireTools().capture(ids) : this.requireTools().revalidate(ids);
+	}
+	private async checkInput(): Promise<InputState> {
+		return this.call.resume === false ? this.requireBaseline() : this.stableInput();
+	}
 	private environmentAfter(): SanitizedEnvironment["identity"] {
 		const identity = buildEnvironment(this.loaded.policy).identity;
 		if (!equal(identity, this.requireEnvironment().identity))
@@ -549,9 +556,9 @@ class Invocation {
 			const resources = await this.requireSession().acquireResources(check.resources, env.env, this.signal);
 			try {
 				await withNativeLock(resources, async () => {
-					await tools.revalidate(check.toolchain);
+					await this.currentTools(check.toolchain);
 					this.environmentAfter();
-					await this.stableInput();
+					await this.checkInput();
 					const actual = await this.requireSession().run({
 						command: check.command,
 						cwd: await safeDirectoryPath(this.root, check.cwd),
@@ -570,9 +577,9 @@ class Invocation {
 					);
 					decodeUTF8(actual.stdout);
 					decodeUTF8(actual.stderr);
-					await tools.revalidate(check.toolchain);
+					await this.currentTools(check.toolchain);
 					this.environmentAfter();
-					await this.stableInput();
+					await this.checkInput();
 					if (actual.error || !normal(actual) || !closed(actual) || actual.termination.exit_code !== 0)
 						throw new Error(actual.error ?? `preflight ${check.id} did not complete successfully`);
 					entry.result = "PASS";
@@ -588,9 +595,9 @@ class Invocation {
 		const finalResources = await this.requireSession().tryAcquireResources(this.resources, env.env);
 		if (!finalResources) throw new Error("post-preflight resource ownership conflict");
 		await withNativeLock(finalResources, async () => {
-			await tools.revalidate();
+			await this.currentTools();
 			this.environmentAfter();
-			await this.stableInput();
+			await this.checkInput();
 		});
 		this.preflight.result = "PASS";
 		this.preflight.reason = null;
@@ -681,8 +688,8 @@ class Invocation {
 				physical.work.reason = this.cancelled() ? "cancelled-before-dispatch" : "halted-before-dispatch";
 				return;
 			}
-			await this.stableInput();
-			const toolsBefore = await this.requireTools().revalidate(recipe.toolchain);
+			await this.checkInput();
+			const toolsBefore = await this.currentTools(recipe.toolchain);
 			if (
 				!equal(descriptor.toolchain, toolsBefore) ||
 				!equal(descriptor.build_cache, await this.requireTools().buildCache(recipe))
@@ -715,7 +722,7 @@ class Invocation {
 				return;
 			}
 			physical.work.cache = "miss";
-			const before = await this.stableInput();
+			const before = await this.checkInput();
 			if (this.halted || this.cancelled()) {
 				physical.work.reason = this.cancelled() ? "cancelled-before-dispatch" : "halted-before-dispatch";
 				return;
@@ -812,12 +819,12 @@ class Invocation {
 				buildCacheAfter: BuildCacheIdentity = null;
 			if (!this.cancelled()) {
 				try {
-					toolchainAfter = await this.requireTools().revalidate(recipe.toolchain);
+					toolchainAfter = await this.currentTools(recipe.toolchain);
 					environmentAfter = this.environmentAfter();
 					buildCacheAfter = await this.requireTools().buildCache(recipe);
 					if (!equal(toolchainAfter, descriptor.toolchain) || !equal(buildCacheAfter, descriptor.build_cache))
 						throw new Error("execution toolchain or cache selection moved");
-					after = await this.stableInput();
+					after = await this.checkInput();
 				} catch (error) {
 					if (this.cancellationCause(error)) {
 						after = null;
@@ -968,9 +975,9 @@ class Invocation {
 				this.requireEnvironment().env,
 				this.signal ? AbortSignal.any([this.signal, this.observationAbort.signal]) : this.observationAbort.signal,
 			);
-			const tools = await this.requireTools().revalidate(checker.toolchain);
+			const tools = await this.currentTools(checker.toolchain);
 			this.environmentAfter();
-			const before = await this.stableInput();
+			const before = await this.checkInput();
 			const request = validateObservationRequest({
 				schema_version: "fv-claim-observation-request/v1",
 				request_id: requestId,
@@ -1087,10 +1094,10 @@ class Invocation {
 								: "invocation cancelled before observation completion metadata";
 					} else {
 						metadataStarted = true;
-						const afterTools = await this.requireTools().revalidate(checker.toolchain);
+						const afterTools = await this.currentTools(checker.toolchain);
 						this.environmentAfter();
 						if (!equal(tools, afterTools)) throw new Error("observation checker toolchain moved");
-						after = await this.stableInput();
+						after = await this.checkInput();
 						if (!response) throw new Error("observation checker did not exit normally with zero");
 						result = response.slots[0]!.result;
 						reason = response.slots[0]!.reason;

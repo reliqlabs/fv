@@ -245,6 +245,8 @@ try {
                     r"""
 const realIdentity = native.readProcessIdentity, realTable = native.review.processTable;
 const session = await native.createNativeSession({cwd: input.cwd, runId: randomUUID()});
+const admitted = new Map();
+const track = () => { for (const value of session.owner.children) admitted.set(value.pid + '/' + value.process_start_id, value); };
 const { createServer } = await import('node:net');
 let connection, canExit = false;
 const server = createServer(socket => {
@@ -271,6 +273,7 @@ native.review.setIdentity(async pid => {
   return realIdentity(pid);
 });
 native.review.setTable(owned => {
+  track();
   const rows = realTable(owned);
   if (direct?.exitCode === null && direct.signalCode === null) {
     if (session.owner.children.some(value => value.pid === member.pid)) recycled = true;
@@ -288,7 +291,7 @@ try {
   const value = await session.run({command: [input.python, '-c',
     'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10); s.recv(1)',
     String(server.address().port)], environment: input.environment, timeoutSeconds: null});
-  emit({...await finish(session, value), censused, memberPid: member.pid});
+  emit({...await finish(session, value), censused, memberPid: member.pid, admitted: [...admitted.values()]});
 } finally {
   Bun.spawn = realSpawn;
   connection?.destroy();
@@ -304,9 +307,9 @@ try {
                 )
                 self.assertTrue(result["censused"], result)
                 registrations = [
-                    entry["process"]
-                    for entry in result["ownership"]["children"]
-                    if entry["process"]["pid"] == result["memberPid"]
+                    process
+                    for process in result["admitted"]
+                    if process["pid"] == result["memberPid"]
                 ]
                 self.assertEqual(
                     len(registrations), 2 if mode == "descendant" else 1, result
@@ -375,6 +378,8 @@ emit({results});
                     r"""
 const realIdentity = native.readProcessIdentity, realTable = native.review.processTable;
 const session = await native.createNativeSession({cwd: input.cwd, runId: randomUUID()});
+const admitted = new Map();
+const track = () => { for (const value of session.owner.children) admitted.set(value.pid + '/' + value.process_start_id, value); };
 const realSpawn = Bun.spawn;
 let direct, hosted, registered = false, retired = false, censused = false;
 Bun.spawn = options => { direct = realSpawn(options); return direct; };
@@ -385,6 +390,7 @@ const reused = () => ({
   process_start_id: 'reused-after-release',
 });
 native.review.setIdentity(async pid => {
+  track();
   if (hosted?.pid === pid && retired)
     return direct.exitCode === null && direct.signalCode === null ? reused() : null;
   const current = await realIdentity(pid);
@@ -393,6 +399,7 @@ native.review.setIdentity(async pid => {
   return current;
 });
 native.review.setTable(owned => {
+  track();
   const rows = realTable(owned);
   if (hosted && registered && !session.owner.children.some(value => value.pid === hosted.pid)) retired = true;
   if (retired && direct.exitCode === null && direct.signalCode === null) {
@@ -405,7 +412,7 @@ native.review.setTable(owned => {
 try {
   const value = await session.run({command: [input.python, '-I', '-B', input.collector, input.true],
     ownershipProtocol: 'dossier-quint-private-pipes/v1', environment: input.environment, timeoutSeconds: null});
-  emit({...await finish(session, value), censused, hostedPid: hosted?.pid});
+  emit({...await finish(session, value), censused, hostedPid: hosted?.pid, admitted: [...admitted.values()]});
 } finally { Bun.spawn = realSpawn; }
 """,
                     {
@@ -421,9 +428,9 @@ try {
                 self.assertIsNone(result["error"], result)
                 self.assertIsNone(result["releaseError"], result)
                 registrations = [
-                    entry["process"]
-                    for entry in result["ownership"]["children"]
-                    if entry["process"]["pid"] == result["hostedPid"]
+                    process
+                    for process in result["admitted"]
+                    if process["pid"] == result["hostedPid"]
                 ]
                 self.assertEqual(
                     len(registrations), 2 if mode == "descendant" else 1, result
