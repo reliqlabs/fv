@@ -696,9 +696,11 @@ class Invocation {
 			)
 				throw new Error("execution toolchain or cache selection changed before dispatch");
 			this.environmentAfter();
-			physical.candidates = await this.checkpoint.run(() =>
-				store.selectCandidates(descriptor, physical.expansion.members),
-			);
+			// Fresh runs never reuse checkpoints; skipping the full-store scan avoids its O(n) cost per slot.
+			if (this.call.resume !== false)
+				physical.candidates = await this.checkpoint.run(() =>
+					store.selectCandidates(descriptor, physical.expansion.members),
+				);
 			const selected = physical.candidates.filter((candidate) => this.selectedSet.has(candidate.member.claim_id));
 			if (this.call.resume !== false && selected.every((candidate) => candidate.candidate !== null)) {
 				physical.work.cache = "hit";
