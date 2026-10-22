@@ -1636,8 +1636,13 @@ export class NativeSession {
 						const identity = await readProcessIdentity(row.pid);
 						if (!identity) continue;
 						if (owned.some((entry) => !entry.terminated_at && sameProcess(entry.process, identity))) continue;
-						if (identity.process_group !== row.pgid || identity.session_id !== group.process.session_id)
+						if (identity.process_group !== row.pgid || identity.session_id !== group.process.session_id) {
+							if (protocol && identity.parent_pid === direct!.pid) {
+								possibleHosted.add(identity.pid);
+								continue;
+							}
 							throw new Error("descendant session changed during enumeration");
+						}
 						try {
 							await requireGroupAnchor(
 								group.process,

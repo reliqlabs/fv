@@ -161,6 +161,114 @@ finally:
     "native ownership requires Bun on Darwin or Linux",
 )
 class NativeReview(unittest.TestCase):
+    def test_protocol_child_setsid_between_census_and_identity_requires_registration(self):
+        for registered in (True, False):
+            with (
+                self.subTest(registered=registered),
+                tempfile.TemporaryDirectory(prefix="r38-hosted-setsid-") as directory,
+            ):
+                root = Path(directory).resolve()
+                collector = root / "collector.py"
+                collector.write_text(
+                    """import time
+from pathlib import Path
+def await_file(name):
+    deadline = time.monotonic() + 10
+    while not Path(name).exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("session fixture did not reach " + name)
+        time.sleep(0.005)
+def enter_session():
+    await_file("setsid")
+    os.setsid()
+"""
+                    + COLLECTOR.replace(
+                        "start_new_session=True", "preexec_fn=enter_session"
+                    )
+                    .replace(
+                        "subject = sys.argv[1:]",
+                        "registered = sys.argv.pop(1) == 'registered'\nsubject = sys.argv[1:]",
+                    )
+                    .replace(
+                        '    notify("owned", child.pid)',
+                        '    await_file("notify")\n    if registered: notify("owned", child.pid)',
+                    )
+                    .replace(
+                        '    notify("released", child.pid)',
+                        '    if registered: notify("released", child.pid)',
+                    )
+                )
+                result = native(
+                    r"""
+const fs = await import('node:fs');
+const realIdentity = native.readProcessIdentity, realTable = native.review.processTable;
+const session = await native.createNativeSession({cwd: input.cwd, runId: randomUUID()});
+let snapshot, reread;
+native.review.setTable(scope => {
+  const rows = realTable(scope);
+  if (!snapshot) {
+    const row = rows.find(row =>
+      scope.some(parent => parent.pid === row.ppid && parent.process_group === row.pgid));
+    if (row) {
+      snapshot = row;
+      fs.writeFileSync(input.cwd + '/setsid', '1');
+    }
+  }
+  return rows;
+});
+native.review.setIdentity(async pid => {
+  if (snapshot?.pid === pid && !reread) {
+    const deadline = performance.now() + 10000;
+    while (true) {
+      const current = await realIdentity(pid);
+      if (current?.process_group === pid && current.session_id === pid) {
+        reread = current;
+        fs.writeFileSync(input.cwd + '/notify', '1');
+        return current;
+      }
+      if (performance.now() >= deadline) throw Error('session fixture did not call setsid');
+      await Bun.sleep(5);
+    }
+  }
+  return realIdentity(pid);
+});
+const value = await session.run({
+  command: [input.python, '-I', '-B', input.collector, input.registered ? 'registered' : 'unregistered', input.true],
+  ownershipProtocol: 'dossier-quint-private-pipes/v1', environment: input.environment, timeoutSeconds: 20});
+emit({...await finish(session, value), snapshot, reread});
+""",
+                    {
+                        "cwd": str(root),
+                        "python": str(Path(sys.executable).resolve()),
+                        "collector": str(collector),
+                        "registered": registered,
+                        "true": shutil.which("true"),
+                        "environment": native_environment(root),
+                    },
+                )
+                self.assertEqual(result["snapshot"]["pid"], result["reread"]["pid"], result)
+                self.assertEqual(
+                    result["snapshot"]["ppid"], result["reread"]["parent_pid"], result
+                )
+                self.assertNotEqual(
+                    result["snapshot"]["pgid"], result["reread"]["process_group"], result
+                )
+                self.assertEqual(result["termination"]["exit_code"], 0, result)
+                if registered:
+                    self.assertIsNone(result["error"], result)
+                    self.assertIsNone(result["releaseError"], result)
+                    self.assertEqual(len(result["ownership"]["children"]), 2, result)
+                    self.assertTrue(
+                        all(
+                            window["state"] == "closed"
+                            for window in result["ownership"]["spawn_windows"]
+                        ),
+                        result,
+                    )
+                else:
+                    self.assertIn("unresolved registration window", result["error"], result)
+                    self.assertIsNotNone(result["releaseError"], result)
+
     def test_recycled_leader_does_not_admit_foreign_descendant(self):
         self.assert_foreign_not_admitted("recycled")
 
