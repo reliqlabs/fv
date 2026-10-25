@@ -180,3 +180,7 @@ With `resume: false`, dispatch no longer runs per-slot cache selection, which re
 ## Hosted child session transition (2026-10-22)
 
 Classification: implementation-only. During descendant enumeration, a group/session change by the active ownership-protocol host's direct child now records a possible hosted PID pending private-pipe registration; unregistered children still prevent lifetime closure and other group/session changes still fail closed.
+
+## Known issue: cancellation leaves an unrecoverable owner (2026-10-25)
+
+Observed on a Dossier collection (run `60939d19`): a plain SIGTERM to the runner ended with `private ownership acknowledgement after cancellation refused; indeterminate ownership retains resource locks; native ownership is unresolved`, and the same-boot recovery path then refused the dead owner. The operator had to remove the owner's lock files by hand before the next run could start. Not fixed; the cancellation path should close its own windows or leave an owner that recovery accepts.
