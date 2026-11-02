@@ -639,6 +639,51 @@ console.log(JSON.stringify(result));
             )
             self.assertEqual(json.loads(process.stdout), {"sequence": 1}, process.stderr)
 
+    def test_history_append_base_reloads_after_foreign_append_and_failed_append(self):
+        script = r"""
+const request = JSON.parse(await Bun.stdin.text());
+const { openEvidenceStore } = await import(request.modules + "/evidence-v4-store.ts");
+const lock = fn => fn();
+const event = (attempt) => ({
+    schema_version: "fv-evidence-history/v1", kind: "execution",
+    execution_key: "sha256:" + "a".repeat(64), attempt_id: "00000000-0000-4000-8000-00000000000" + attempt,
+    members: [{ claim_id: "A", slot_id: "slot-1", tool: "fixture-tool" }],
+    execution: null, claim_id: null, slot_id: null, observation: null, indeterminate_owner: null,
+    result: "ERROR",
+});
+const a = await openEvidenceStore(request.cwd, { withAppendLock: lock });
+const b = await openEvidenceStore(request.cwd, { withAppendLock: lock });
+const sequences = [];
+let rejected = null;
+try {
+    sequences.push((await a.appendHistory(event(1))).sequence);
+    sequences.push((await b.appendHistory(event(2))).sequence);
+    sequences.push((await a.appendHistory(event(3))).sequence);
+    try { await a.appendHistory(event(3)); } catch (error) { rejected = String(error); }
+    sequences.push((await a.appendHistory(event(4))).sequence);
+    const snapshot = await a.readHistory();
+    console.log(JSON.stringify({ sequences, rejected, retained: snapshot.events.length }));
+} catch (error) {
+    console.log(JSON.stringify({ sequences, rejected, error: String(error) }));
+}
+"""
+        with EvidenceV4Fixture(claims=("A",)) as fixture:
+            process = subprocess.run(
+                [fixture.bun, "--eval", script],
+                input=json.dumps(request_for(fixture)),
+                cwd=REPO,
+                env=fixture.process_environment(),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=True,
+            )
+            result = json.loads(process.stdout)
+            self.assertEqual(result.get("sequences"), [1, 2, 3, 4], process.stderr)
+            self.assertIn("duplicate or previously indeterminate", result.get("rejected") or "")
+            self.assertEqual(result.get("retained"), 4)
+            self.assertNotIn("error", result)
+
 
 if __name__ == "__main__":
     unittest.main()

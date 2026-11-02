@@ -456,7 +456,9 @@ export class Store {
 	private writeEpoch = 0;
 	private readonly snapshotValidations = new WeakMap<HistorySnapshot, SnapshotValidation>();
 	private latestValidation: SnapshotValidation | undefined;
-	// Validated history tail reused across appends in one session; any append failure drops it.
+	// Validated history tail reused across appends in one session. Between appends the tail trusts the
+	// immutable store (entry count and head bytes are re-checked); full chain validation still runs at
+	// session start, before publication and after any failure, which drops the tail.
 	private appendBase: { head: HistoryRef | null; events: HistoryEvent[] } | null = null;
 	constructor(root: string, options: StoreOptions = {}) {
 		this.root = root;
@@ -1005,6 +1007,7 @@ export class Store {
 			return await this.loadHistory(captured, false);
 		} catch (error) {
 			this.writeEpoch++;
+			this.appendBase = null;
 			throw error;
 		}
 	}
@@ -1039,7 +1042,7 @@ export class Store {
 			await this.validateEventBindings(event, base.events);
 			const reference = await this.writeImmutableJSON(relative, event);
 			const head = { sequence: event.sequence, event_id: event.event_id, path: reference.path, hash: reference.hash };
-			base.events.push(event);
+			base.events.push(freezeRecord(validateHistoryEvent(parseJSON(C(event)))));
 			base.head = head;
 			return head;
 		} catch (error) {
