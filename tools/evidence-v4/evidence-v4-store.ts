@@ -456,6 +456,8 @@ export class Store {
 	private writeEpoch = 0;
 	private readonly snapshotValidations = new WeakMap<HistorySnapshot, SnapshotValidation>();
 	private latestValidation: SnapshotValidation | undefined;
+	// Validated history tail reused across appends in one session; any append failure drops it.
+	private appendBase: { head: HistoryRef | null; events: HistoryEvent[] } | null = null;
 	constructor(root: string, options: StoreOptions = {}) {
 		this.root = root;
 		this.options = options;
@@ -1006,14 +1008,44 @@ export class Store {
 			throw error;
 		}
 	}
-	private async appendUnlocked(input: EventInput): Promise<HistoryRef> {
+	private async loadAppendBase(): Promise<{ head: HistoryRef | null; events: HistoryEvent[] }> {
+		const base = this.appendBase;
+		if (base) {
+			let names: string[];
+			try {
+				names = await fs.readdir(await checkedPath(this.root, `${BASE}/history`));
+			} catch (error) {
+				if (errorCode(error) !== "ENOENT") throw error;
+				names = [];
+			}
+			const unchanged =
+				names.length === base.events.length &&
+				(base.head === null ||
+					(names.includes(`${String(base.head.sequence).padStart(20, "0")}.json`) &&
+						H(await readBytes(this.root, base.head.path)) === base.head.hash));
+			if (unchanged) return base;
+			this.appendBase = null;
+		}
 		const snapshot = await this.loadHistory(undefined, true);
-		const unsigned = { ...input, sequence: snapshot.events.length + 1, previous: snapshot.view.head };
-		const event = validateHistoryEvent({ ...unsigned, event_id: D("history-event", unsigned) });
-		const relative = `${BASE}/history/${String(event.sequence).padStart(20, "0")}.json`;
-		await this.validateEventBindings(event, snapshot.events);
-		const reference = await this.writeImmutableJSON(relative, event);
-		return { sequence: event.sequence, event_id: event.event_id, path: reference.path, hash: reference.hash };
+		this.appendBase = { head: snapshot.view.head, events: [...snapshot.events] };
+		return this.appendBase;
+	}
+	private async appendUnlocked(input: EventInput): Promise<HistoryRef> {
+		try {
+			const base = await this.loadAppendBase();
+			const unsigned = { ...input, sequence: base.events.length + 1, previous: base.head };
+			const event = validateHistoryEvent({ ...unsigned, event_id: D("history-event", unsigned) });
+			const relative = `${BASE}/history/${String(event.sequence).padStart(20, "0")}.json`;
+			await this.validateEventBindings(event, base.events);
+			const reference = await this.writeImmutableJSON(relative, event);
+			const head = { sequence: event.sequence, event_id: event.event_id, path: reference.path, hash: reference.hash };
+			base.events.push(event);
+			base.head = head;
+			return head;
+		} catch (error) {
+			this.appendBase = null;
+			throw error;
+		}
 	}
 	async appendHistory(input: EventInput): Promise<HistoryRef> {
 		if (!this.options.withAppendLock) fail("history append requires native owner/append mutex");
